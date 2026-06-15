@@ -1,0 +1,10 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "action", "skill": "product", "verb": "commerce.create_product", "args": { "name": "أ", "price": "10" }, "next": "step_2" },
+    { "id": "step_2", "type": "action", "skill": "product", "verb": "commerce.create_product", "args": { "name": "ب", "price": "20" }, "next": "step_1" }
+  ]
+}

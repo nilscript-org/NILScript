@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/grant.schema.json",
+  "title": "Grant descriptor (§14.1) — minted and revoked on the owner plane only",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "workspace", "audience", "scopes", "budgets"],
+  "properties": {
+    "id": { "type": "string", "minLength": 8 },
+    "workspace": { "type": "string" },
+    "audience": {
+      "enum": ["owner", "customer", "automation", "third_party"],
+      "description": "Audience class — restricts the reachable lexicon before scopes are evaluated (§6.1)."
+    },
+    "scopes": {
+      "type": "array",
+      "description": "Granted verbs or verb patterns (default-deny). Destructive verbs MUST be named explicitly — they are never matched by a pattern (§14.2).",
+      "items": { "type": "string" }
+    },
+    "budgets": {
+      "type": "object",
+      "description": "Absent budget = not granted, never unlimited (§7.2). Checks fail closed.",
+      "additionalProperties": false,
+      "properties": {
+        "actions": { "$ref": "#/$defs/window_limit" },
+        "monetary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["amount", "currency", "window"],
+          "properties": {
+            "amount": { "type": "number", "exclusiveMinimum": 0 },
+            "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+            "window": { "$ref": "#/$defs/window" }
+          }
+        },
+        "quotas": {
+          "type": "object",
+          "description": "Named resource-class quotas, e.g. {\"reports.sales\": {\"limit\": 10, \"window\": \"month\"}}.",
+          "additionalProperties": { "$ref": "#/$defs/window_limit" }
+        }
+      }
+    },
+    "origin": { "type": "string", "description": "Binding/issuer the Grant was minted for; origin can only raise tiers (§6.4)." },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "revoked": { "type": "boolean", "default": false }
+  },
+  "$defs": {
+    "window": { "enum": ["hour", "day", "month"] },
+    "window_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit", "window"],
+      "properties": {
+        "limit": { "type": "integer", "minimum": 0 },
+        "window": { "$ref": "#/$defs/window" }
+      }
+    }
+  }
+}

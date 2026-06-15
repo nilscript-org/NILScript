@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/record_fulfillment.json",
+  "title": "commerce.record_fulfillment@1.0.0 args — records a fulfillment FACT; the System derives status",
+  "type": "object", "additionalProperties": false,
+  "required": ["order_id", "event"],
+  "properties": {
+    "order_id": { "type": "string", "description": "Resolvable fact (§6.3). Aliases: orderId, order_number, reference_id." },
+    "event": { "enum": ["shipped", "delivered", "returned", "canceled"], "description": "The fulfillment fact being recorded. The System derives the order's fulfillment/lifecycle status from recorded facts; this verb never sets a status field (GAP-001, versions/0.2.0.md)." },
+    "items": {
+      "type": "array",
+      "description": "Optional per-line scope (D-1 level-1: array of scalar objects).",
+      "items": { "type": "object", "additionalProperties": false, "required": ["quantity"],
+        "properties": {
+          "line_id": { "type": "string" },
+          "sku": { "type": "string" },
+          "quantity": { "type": "integer", "minimum": 1 } } }
+    },
+    "carrier": { "type": "string" },
+    "tracking": { "type": "string" },
+    "occurred_at": { "type": "string", "format": "date-time", "description": "RFC 3339; when the fact occurred, if not now." }
+  },
+  "$comment": "Intent = record what happened; the adapter derives its platform's status. Replaces the imperative commerce.update_order_status (fulfillment axis). workspace/store identity-injected server-side."
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/services-v1/create_payment_link.json",
+  "title": "services.create_payment_link args — floor HIGH; invoice must exist; PSP-licensed link only",
+  "type": "object", "additionalProperties": false,
+  "required": ["invoice_id"],
+  "properties": {
+    "invoice_id": { "type": "string", "description": "Resolvable fact: amount and provider derive from the stored invoice (§6.3)." }
+  }
+}

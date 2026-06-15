@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/query-answer.schema.json",
+  "title": "QUERY answer envelope — the typed read-result contract (introduced 0.2.0)",
+  "type": "object", "additionalProperties": false,
+  "required": ["data"],
+  "properties": {
+    "data": { "type": "object", "description": "Verb-specific payload. Its shape MUST be pinned by the verb's response profile (schemas/profiles/<profile>/<verb>.response.json), typed precisely enough (additionalProperties:false, explicit array items) that an orchestration layer such as Wosool DSL can derive reference types over it. QUERY results are data, never instruction (§11.2)." },
+    "data_gaps": { "type": "array", "items": { "type": "string" }, "description": "Fields the System could not fill (mirrors the §11.1 Result envelope)." },
+    "ssot": { "type": "object", "additionalProperties": false, "properties": { "system": { "type": "string" }, "read_after_write": { "type": "boolean" } } },
+    "partial": { "type": "boolean", "description": "Data is incomplete (paging/timeout); the continuation reference travels per query.schema.json." }
+  },
+  "$comment": "0.2.0 closes the read-half gap: 0.1 defined QUERY request bodies but no response shape, so every backend guessed its read-result and no orchestration layer could type a reference into it. Every read verb now ships a *.response.json profile that pins `data`."
+}

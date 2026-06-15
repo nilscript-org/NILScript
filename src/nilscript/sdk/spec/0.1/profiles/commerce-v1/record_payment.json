@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/record_payment.json",
+  "title": "commerce.record_payment@1.0.0 args — floor HIGH; records a payment FACT; the System derives financial status",
+  "type": "object", "additionalProperties": false,
+  "required": ["order_id", "event"],
+  "properties": {
+    "order_id": { "type": "string", "description": "Resolvable fact (§6.3)." },
+    "event": { "enum": ["authorized", "captured", "refunded", "voided", "failed"], "description": "The payment fact. The System derives the order's financial status; this verb never sets a status field (GAP-001)." },
+    "amount": { "type": "number", "exclusiveMinimum": 0, "description": "Optional hint; the System resolves the authoritative amount from the order/payment of record (§6.3). A Speaker-declared amount never overrides it." },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$", "description": "ISO 4217." },
+    "method": { "type": "string" },
+    "reference": { "type": "string", "description": "Processor/transaction reference." },
+    "occurred_at": { "type": "string", "format": "date-time" }
+  },
+  "$comment": "Floor HIGH: asserts money moved/returned. Replaces the payment axis of commerce.update_order_status. The adapter maps the fact onto its derived financial status."
+}

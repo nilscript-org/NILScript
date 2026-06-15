@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/services-v1/send_followup.json",
+  "title": "services.send_followup args — consent must be active (resolved server-side)",
+  "type": "object", "additionalProperties": false,
+  "required": ["party_id", "message"],
+  "properties": {
+    "party_id": { "type": "string", "description": "Resolvable fact; consent state checked server-side (§6.3)." },
+    "message": { "type": "string", "minLength": 1 }
+  }
+}

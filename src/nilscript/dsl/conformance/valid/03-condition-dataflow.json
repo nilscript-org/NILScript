@@ -1,0 +1,12 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "query", "verb": "commerce.product", "args": { "sku": "SHIRT-001" }, "next": "step_2" },
+    { "id": "step_2", "type": "condition", "expression": "$.step_1.output.stock < 10", "on_true": "step_3", "on_false": "step_4" },
+    { "id": "step_3", "type": "action", "skill": "coupon", "verb": "commerce.create_coupon", "args": { "percent": "20" }, "next": null },
+    { "id": "step_4", "type": "notify", "message": { "ar": "المخزون كافٍ، ما سوّيت خصم.", "en": "Stock is fine — no discount made." }, "next": null }
+  ]
+}

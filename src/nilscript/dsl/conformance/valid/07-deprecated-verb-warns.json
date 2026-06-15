@@ -1,0 +1,10 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "action", "skill": "order_status", "verb": "commerce.update_order_status",
+      "args": { "id": "1024", "status": "shipped" }, "next": null }
+  ]
+}

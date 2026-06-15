@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/send_message.json",
+  "title": "commerce.send_message@1.0.0 args — floor HIGH; phone+text redacted from telemetry",
+  "type": "object", "additionalProperties": false,
+  "required": ["phone", "text"],
+  "properties": {
+    "phone": { "type": "string", "description": "Resolvable fact: normalized E.164 + consent check server-side. Aliases: mobile, msisdn, to." },
+    "text": { "type": "string", "minLength": 1 }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/delete_product.json",
+  "title": "commerce.delete_product@1.0.0 args — DESTRUCTIVE (floor HIGH; Grant must name this verb explicitly)",
+  "type": "object", "additionalProperties": false,
+  "required": ["product_id"],
+  "properties": {
+    "product_id": { "type": "string", "description": "Resolvable fact (§6.3)." },
+    "reason": { "type": "string", "description": "Audited; SHOULD be required by workspace rule." }
+  }
+}

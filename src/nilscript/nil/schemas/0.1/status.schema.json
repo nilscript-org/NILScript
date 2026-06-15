@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/status.schema.json",
+  "title": "STATUS body — Speaker→System carries only `proposal`; System→Speaker adds `state`",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["proposal"],
+  "properties": {
+    "proposal": { "type": "string" },
+    "state": {
+      "enum": [
+        "proposed", "pending_approval", "approved", "rejected", "modified",
+        "expired", "executing", "executed", "failed_retryable",
+        "failed_terminal", "suspended"
+      ]
+    },
+    "replayed": {
+      "type": "boolean",
+      "description": "True when this outcome is an idempotent replay of a prior COMMIT (§7.1)."
+    }
+  }
+}

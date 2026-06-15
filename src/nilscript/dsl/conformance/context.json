@@ -1,0 +1,114 @@
+{
+  "$comment": "Shared validation context for the conformance corpus. An implementation under test loads THIS as the world a program is validated against — the skill registry (V4/V5) and per-workspace grant scopes (V4), plus query response shapes (V5 output-reference typing, 0.2). The contract version is THIS file's `conformance` field and the bound profiles, NEVER a schema $id (nilscript keeps $id on /0.1/ across releases; the release lives in versions/ + verb semver). Mirrors wosool-cloud/.../skills/ + nilscript/sdk/grants.py::scope_allows.",
+  "conformance": "0.2",
+  "skills": {
+    "product": {
+      "required_verbs": ["commerce.create_product"],
+      "hint_schema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "price": { "type": "string" },
+          "description": { "type": "string" },
+          "category": { "type": "string" },
+          "sku": { "type": "string" },
+          "quantity": { "type": "string" },
+          "sale_price": { "type": "string" }
+        },
+        "required": ["name", "price"],
+        "additionalProperties": false
+      }
+    },
+    "coupon": {
+      "required_verbs": ["commerce.create_coupon"],
+      "hint_schema": {
+        "type": "object",
+        "properties": { "percent": { "type": "string" }, "code": { "type": "string" } },
+        "required": ["percent"],
+        "additionalProperties": false
+      }
+    },
+    "refund": {
+      "$comment": "0.2: NIL arg is the abstract refund_target {type,id} (southbound). The DSL HINT stays simple — the skill's to_proposes maps the hint onto refund_target. Hints != NIL args.",
+      "required_verbs": ["commerce.process_refund"],
+      "hint_schema": {
+        "type": "object",
+        "properties": { "order": { "type": "string" }, "amount": { "type": "string" } },
+        "required": ["order"],
+        "additionalProperties": false
+      }
+    },
+    "record_fulfillment": {
+      "$comment": "0.2: replaces the fulfillment axis of update_order_status. Records a fact; the System derives status.",
+      "required_verbs": ["commerce.record_fulfillment"],
+      "hint_schema": {
+        "type": "object",
+        "properties": { "order": { "type": "string" }, "event": { "type": "string" } },
+        "required": ["order", "event"],
+        "additionalProperties": false
+      }
+    },
+    "record_payment": {
+      "$comment": "0.2: replaces the financial axis of update_order_status. Floor HIGH.",
+      "required_verbs": ["commerce.record_payment"],
+      "hint_schema": {
+        "type": "object",
+        "properties": { "order": { "type": "string" }, "event": { "type": "string" }, "amount": { "type": "string" } },
+        "required": ["order", "event"],
+        "additionalProperties": false
+      }
+    },
+    "order_status": {
+      "$comment": "0.2: DEPRECATED (one-MINOR overlap; removed 0.3.0). Still admissible but a conformant validator MUST emit V4_DEPRECATED_VERB (WARNING) and the program still admits. Replacement: record_fulfillment / record_payment.",
+      "deprecated": true,
+      "required_verbs": ["commerce.update_order_status"],
+      "hint_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "status": { "type": "string" } },
+        "required": ["id", "status"],
+        "additionalProperties": false
+      }
+    },
+    "invoice": {
+      "required_verbs": ["services.create_invoice"],
+      "hint_schema": {
+        "type": "object",
+        "properties": { "customer": { "type": "string" }, "amount": { "type": "string" } },
+        "required": ["customer", "amount"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "query_skills": {
+    "list_clients": {
+      "$comment": "0.2: read verb with a TYPED response profile (nilscript services-v1/list_clients.response.json). `response_schema` describes the shape of a query node's `output`, so V5 can type $.step.output.clients[0].id and reject unknown-field / array-as-object references.",
+      "required_verbs": ["services.list_clients"],
+      "hint_schema": {
+        "type": "object",
+        "properties": { "name": { "type": "string" } },
+        "additionalProperties": false
+      },
+      "response_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["clients"],
+        "properties": {
+          "clients": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "name"],
+              "properties": { "id": { "type": "string" }, "name": { "type": "string" } }
+            }
+          }
+        }
+      }
+    }
+  },
+  "read_verbs": ["commerce.product", "commerce.products", "services.list_clients"],
+  "workspaces": {
+    "ws_demo": { "scopes": ["commerce.*", "services.create_invoice", "services.list_clients"] },
+    "ws_limited": { "scopes": ["commerce.create_product"] }
+  }
+}

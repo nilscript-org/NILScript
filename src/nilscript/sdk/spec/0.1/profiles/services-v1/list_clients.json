@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/services-v1/list_clients.json",
+  "title": "services.list_clients@1.0.0 args — read-only QUERY; no side effects",
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string", "description": "Optional name filter; locale-folded match (§6.3 rule 5)." }
+  },
+  "$comment": "Closes ADR-0001 (a live read verb that had no profile). First consumer of the 0.2.0 typed QUERY response contract; response shape pinned in list_clients.response.json."
+}

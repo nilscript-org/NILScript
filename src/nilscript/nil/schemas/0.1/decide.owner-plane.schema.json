@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/decide.owner-plane.schema.json",
+  "title": "DECIDE body (OWNER PLANE ONLY — never exposed to Speakers)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["proposal", "approved", "actor"],
+  "properties": {
+    "proposal": { "type": "string" },
+    "approved": { "type": "boolean" },
+    "actor": {
+      "type": "string",
+      "pattern": "^owner:",
+      "description": "Decision actor + channel, e.g. owner:whatsapp:+9665… or owner:dashboard:<session>. Recorded verbatim in the audit trail (§10)."
+    },
+    "modification": {
+      "type": "object",
+      "description": "approve-with-modification (§7.4): replacement values, keys restricted to the verb's `modifiable` facts. Triggers re-resolve + re-preview + re-tier; if tier rises, the proposal re-parks. Only meaningful when approved=true."
+    },
+    "reason": { "type": "string", "description": "Optional rejection/approval note, audited." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "approved": { "const": false } }, "required": ["approved"] },
+      "then": { "properties": { "modification": false } }
+    }
+  ]
+}

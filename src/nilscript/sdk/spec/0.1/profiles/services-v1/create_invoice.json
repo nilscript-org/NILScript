@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/services-v1/create_invoice.json",
+  "title": "services.create_invoice args — floor HIGH; VAT computed by the System",
+  "type": "object", "additionalProperties": false,
+  "required": ["party_id", "amount", "currency"],
+  "properties": {
+    "party_id": { "type": "string", "description": "Resolvable fact (§6.3)." },
+    "amount": { "type": "number", "exclusiveMinimum": 0 },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+    "description": { "type": "string" }
+  },
+  "$comment": "VAT is a server-computed fact; a Speaker-declared VAT value is rejected."
+}

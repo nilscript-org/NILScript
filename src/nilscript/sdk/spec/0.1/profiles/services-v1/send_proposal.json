@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/services-v1/send_proposal.json",
+  "title": "services.send_proposal args — amount is read from the stored draft, never from args",
+  "type": "object", "additionalProperties": false,
+  "required": ["biz_proposal_id"],
+  "properties": {
+    "biz_proposal_id": { "type": "string", "description": "Resolvable fact: the stored draft is the source of party, title, amount, currency (§6.3)." },
+    "channel": { "enum": ["whatsapp", "email"] }
+  }
+}

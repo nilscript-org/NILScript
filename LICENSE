@@ -1,0 +1,32 @@
+# Licensing
+
+nilscript bundles a neutral standard (text + machine-readable schemas) and an
+optional Python SDK. Two licenses apply, split by artifact class — this follows
+common open-specification practice (spec text freely citable with attribution;
+machine artifacts and code freely embeddable in implementations).
+
+## CC BY 4.0 — specification text
+Human-readable normative and explanatory prose:
+- `src/nilscript/nil/versions/**` (NIL specification text)
+- `src/nilscript/nil/registry/**` (profile registry prose)
+- `src/nilscript/nil/examples/**`
+- `src/nilscript/dsl/*.md` (DSL specification text)
+- `src/nilscript/docs/**`
+
+Full text: https://creativecommons.org/licenses/by/4.0/
+
+## Apache License 2.0 — schemas, conformance vectors, and code
+Machine-readable artifacts and implementation code:
+- `src/nilscript/nil/schemas/**` (JSON Schemas)
+- `src/nilscript/dsl/schema/**` (DSL JSON Schema)
+- `src/nilscript/dsl/conformance/**` (conformance test vectors)
+- `src/nilscript/sdk/**` (Python SDK) and `src/nilscript/__init__.py`
+- `tests/**`
+
+Full text: https://www.apache.org/licenses/LICENSE-2.0
+
+---
+SPDX summary: `CC-BY-4.0 AND Apache-2.0`. Each file's class is determined by the
+directory rules above. The schema `$id` values retain their historical hosts
+(`nil-spec.org`, `wosool.ai/dsl`) by design — they are stable identifiers, not a
+statement of provenance or ownership.

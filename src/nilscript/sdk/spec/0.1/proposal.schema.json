@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/proposal.schema.json",
+  "title": "PROPOSAL body (System→Speaker) — previewed proposal or Refusal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome"],
+  "properties": {
+    "outcome": { "enum": ["proposal", "refusal"] },
+    "id": { "type": "string", "minLength": 8 },
+    "verb": { "type": "string", "pattern": "^[a-z]+\\.[a-z_]+$" },
+    "tier": { "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"] },
+    "preview": {
+      "type": "object",
+      "description": "Locale-keyed natural-language preview of ALL material facts, rendered from resolved values only. Primary workspace locale REQUIRED; RTL for ar.",
+      "minProperties": 1,
+      "patternProperties": { "^[a-z]{2}(-[A-Z]{2})?$": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "resolved": {
+      "type": "object",
+      "description": "Server-resolved material facts (amounts, parties, entities) the preview was rendered from."
+    },
+    "modifiable": {
+      "type": "array",
+      "description": "Facts the Owner may modify in a DECIDE (§7.4), per the Profile.",
+      "items": { "type": "string" }
+    },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "code": {
+      "enum": [
+        "MALFORMED", "UNKNOWN_PERFORMATIVE", "UNKNOWN_VERB", "SCOPE_DENIED",
+        "CAPABILITY_DENIED", "POLICY_DENIED", "INVALID_ARGS", "UNRESOLVED",
+        "AMBIGUOUS", "BUDGET_EXHAUSTED", "QUOTA_EXHAUSTED", "SUSPENDED",
+        "EXPIRED", "RATE_LIMITED", "UPSTREAM_UNAVAILABLE"
+      ]
+    },
+    "message": { "type": "string" },
+    "field": { "type": "string", "description": "The arg that failed resolution/validation, when applicable." },
+    "candidates": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "source": { "type": "string", "description": "Which authoritative tier produced this candidate." }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "proposal" } } },
+      "then": {
+        "required": ["id", "verb", "tier", "preview", "expires_at"],
+        "properties": { "code": false, "candidates": false }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "refusal" } } },
+      "then": {
+        "required": ["code"],
+        "properties": { "tier": false, "preview": false, "expires_at": false }
+      }
+    },
+    {
+      "if": { "properties": { "code": { "const": "AMBIGUOUS" } }, "required": ["code"] },
+      "then": { "required": ["candidates"] }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_limited",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "action", "skill": "coupon", "verb": "commerce.create_coupon", "args": { "percent": "10" }, "next": null }
+  ]
+}

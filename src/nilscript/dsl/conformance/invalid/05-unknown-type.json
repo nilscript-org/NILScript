@@ -1,0 +1,9 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "loop", "items": "$.step_0.output.x", "body": "step_2", "next": null }
+  ]
+}

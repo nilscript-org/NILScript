@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/services-v1/create_client.json",
+  "title": "services.create_client args",
+  "type": "object", "additionalProperties": false,
+  "required": ["name", "phone"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "phone": { "type": "string", "description": "Normalized to E.164 server-side (resolvable fact)." },
+    "email": { "type": "string", "format": "email" }
+  }
+}

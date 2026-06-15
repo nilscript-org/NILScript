@@ -1,0 +1,12 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "action", "skill": "refund", "verb": "commerce.process_refund", "args": { "order": "123" }, "next": "step_2" },
+    { "id": "step_2", "type": "await_approval", "proposal": "$.step_1.output.proposal_id", "timeout_seconds": 86400, "on_approved": "step_3", "on_rejected": "step_4", "on_timeout": "step_4" },
+    { "id": "step_3", "type": "notify", "message": { "ar": "تم تنفيذ الاسترجاع.", "en": "The refund was carried out." }, "next": null },
+    { "id": "step_4", "type": "notify", "message": { "ar": "ما تم تنفيذ الاسترجاع.", "en": "The refund was not carried out." }, "next": null }
+  ]
+}

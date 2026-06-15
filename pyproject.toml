@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nilscript"
+version = "0.2.0"
+description = "Network Intent Layer (NIL) + the nilscript DSL — the neutral standard for connecting systems to agents."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0 AND CC-BY-4.0"
+license-files = ["LICENSE"]
+authors = [{ name = "nilscript" }]
+keywords = ["nil", "nilscript", "agents", "intent", "standard", "dsl", "schema"]
+
+# Core is data (JSON schemas + docs). No runtime dependencies — the heavy parts
+# live behind the optional [sdk] extra (pydantic[email] / uvicorn[standard] style).
+dependencies = []
+
+[project.optional-dependencies]
+sdk = ["httpx>=0.27", "pydantic>=2.0"]
+dev = [
+  "nilscript[sdk]",
+  "pytest",
+  "pytest-asyncio>=0.24",
+  "respx",
+  "jsonschema",
+]
+
+[project.urls]
+Homepage = "https://nilscript.org"
+Source = "https://github.com/nilscript-org/nilscript"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nilscript = [
+  "py.typed",
+  "nil/**/*.json",
+  "nil/**/*.md",
+  "dsl/**/*.json",
+  "dsl/**/*.md",
+  "docs/**/*.md",
+  "sdk/py.typed",
+  "sdk/**/*.json",
+  "sdk/**/*.md",
+]

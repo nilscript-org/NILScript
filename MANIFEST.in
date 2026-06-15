@@ -1,0 +1,9 @@
+# Ensure the neutral standard (JSON + docs) ships in the sdist as well as the wheel.
+# Without this the build can succeed yet produce an artifact empty of nil/ and dsl/.
+include LICENSE README.md
+include src/nilscript/py.typed src/nilscript/sdk/py.typed
+recursive-include src/nilscript/nil *.json *.md
+recursive-include src/nilscript/dsl *.json *.md
+recursive-include src/nilscript/docs *.md
+recursive-include src/nilscript/sdk *.json *.md
+global-exclude __pycache__ *.py[cod]

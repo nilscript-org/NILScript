@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/propose.schema.json",
+  "title": "PROPOSE body",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verb",
+    "args"
+  ],
+  "properties": {
+    "verb": {
+      "type": "string",
+      "pattern": "^[a-z]+\\.[a-z_]+$"
+    },
+    "args": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/services-v1/draft_proposal.json",
+  "title": "services.draft_proposal args",
+  "type": "object", "additionalProperties": false,
+  "required": ["party_id", "title", "amount", "currency"],
+  "properties": {
+    "party_id": { "type": "string", "description": "Resolvable fact: must exist (§6.3)." },
+    "title": { "type": "string", "minLength": 1 },
+    "amount": { "type": "number", "exclusiveMinimum": 0 },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+    "body": { "type": "string" }
+  }
+}

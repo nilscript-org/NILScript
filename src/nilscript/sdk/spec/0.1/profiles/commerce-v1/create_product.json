@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/create_product.json",
+  "title": "commerce.create_product@1.2.0 args",
+  "type": "object", "additionalProperties": false,
+  "required": ["name"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "category": { "type": "string", "description": "Resolvable fact: name or id; resolved server-side (§6.3)." },
+    "images": { "type": "array", "items": { "type": "string", "format": "uri" } },
+    "price": { "type": "number", "exclusiveMinimum": 0, "description": "Flat single-variant sugar (D-1). Mutually exclusive with `variants` (see oneOf)." },
+    "sku": { "type": "string" },
+    "sale_price": { "type": "number", "exclusiveMinimum": 0 },
+    "quantity": { "type": "integer", "minimum": 0 },
+    "options": {
+      "type": "array",
+      "description": "Single-variant option matrix. D-1 DEEPEST APPLICATION: array→object→array→object (level 2). No level beyond this is admissible anywhere in the standard.",
+      "items": { "type": "object", "additionalProperties": false,
+        "required": ["name", "display_type", "values"],
+        "properties": {
+          "name": { "type": "string" },
+          "display_type": { "enum": ["text", "color", "image"] },
+          "values": { "type": "array", "items": { "type": "object", "additionalProperties": false,
+            "required": ["name"],
+            "properties": { "name": { "type": "string" }, "price": { "type": "number" }, "quantity": { "type": "integer", "minimum": 0 }, "color_code": { "type": "string" } } } }
+        } }
+    },
+    "variants": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Explicit decomposition for platforms that split product/variant (GAP-003). D-1 level-2: array of objects, each containing at most one flat array (option_values). Mutually exclusive with the flat price/sku/sale_price/quantity/options.",
+      "items": { "type": "object", "additionalProperties": false, "required": ["price"],
+        "properties": {
+          "sku": { "type": "string" },
+          "price": { "type": "number", "exclusiveMinimum": 0 },
+          "sale_price": { "type": "number", "exclusiveMinimum": 0 },
+          "quantity": { "type": "integer", "minimum": 0 },
+          "option_values": { "type": "array",
+            "description": "Flat {name,value} pairs that identify this variant (keeps a variant at D-1 level 2).",
+            "items": { "type": "object", "additionalProperties": false, "required": ["name", "value"],
+              "properties": { "name": { "type": "string" }, "value": { "type": "string" } } } } } }
+    }
+  },
+  "oneOf": [
+    { "title": "flat single-variant", "required": ["price"], "not": { "required": ["variants"] } },
+    { "title": "decomposed variants", "required": ["variants"], "not": { "anyOf": [ {"required":["price"]}, {"required":["sku"]}, {"required":["sale_price"]}, {"required":["quantity"]}, {"required":["options"]} ] } }
+  ],
+  "$comment": "@1.2.0: adds optional variants[] decomposition (GAP-003). Flat fields remain the single-variant sugar; oneOf keeps the two shapes mutually exclusive. product_type identity-injected; workspace/store never appear here. Aliases: price ← amount, list_price."
+}

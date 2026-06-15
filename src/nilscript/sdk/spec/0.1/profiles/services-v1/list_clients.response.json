@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/services-v1/list_clients.response.json",
+  "title": "services.list_clients@1.0.0 QUERY answer — typed (conforms to query-answer.schema.json)",
+  "type": "object", "additionalProperties": false,
+  "required": ["data"],
+  "properties": {
+    "data": {
+      "type": "object", "additionalProperties": false,
+      "required": ["clients"],
+      "properties": {
+        "clients": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["id", "name"],
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "data_gaps": { "type": "array", "items": { "type": "string" } },
+    "ssot": { "type": "object", "additionalProperties": false, "properties": { "system": { "type": "string" }, "read_after_write": { "type": "boolean" } } },
+    "partial": { "type": "boolean" }
+  },
+  "$comment": "data.clients[] is a D-1 level-1 array of scalar objects, typed so an orchestration layer derives $.read.output.clients[0].id : string and $...name : string. Rows missing id or name are dropped by the System, never emitted as partial objects."
+}

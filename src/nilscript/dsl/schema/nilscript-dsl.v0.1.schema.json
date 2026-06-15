@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wosool.ai/dsl/v0.1/wosool-dsl.schema.json",
+  "title": "Wosool DSL v0.1",
+  "description": "A declarative, LLM-native commerce orchestration program: an acyclic graph of typed nodes that compiles to NIL sentences. This schema is the V1 (structural) gate only; reference integrity, acyclicity, skill whitelist, argument typing, and reachability are enforced by the WosoolDSLValidator passes V2-V6 (see ../03-VALIDATION-AND-TYPES.md).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["wosool", "workspace", "entry", "pipeline"],
+  "properties": {
+    "wosool": { "const": "0.1", "description": "Language version. Required and explicit." },
+    "workspace": { "type": "string", "minLength": 1, "description": "Tenant id; gates the grant-scope whitelist. Carries no secret." },
+    "locale": { "type": "string", "pattern": "^[a-z]{2}(-[A-Z]{2})?$", "default": "ar", "description": "Default preview/reply locale. Arabic-first." },
+    "entry": { "$ref": "#/$defs/nodeId", "description": "Start node id; must be a defined node (V2)." },
+    "on_error": { "$ref": "#/$defs/programErrorPolicy", "default": "halt" },
+    "pipeline": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "description": "The node set. Declaration order; execution order is the topological sort (V3).",
+      "items": { "$ref": "#/$defs/node" }
+    }
+  },
+  "$defs": {
+    "nodeId": {
+      "type": "string",
+      "pattern": "^step_[0-9]+$",
+      "description": "Strict step_N identifier (charter constraint)."
+    },
+    "nilVerb": {
+      "type": "string",
+      "pattern": "^[a-z]+\\.[a-z_]+$",
+      "description": "NIL verb: <profile>.<operation>, e.g. commerce.create_product."
+    },
+    "skillName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z_]*$",
+      "description": "A registered skill name; existence + grant are checked at V4."
+    },
+    "reference": {
+      "type": "string",
+      "pattern": "^\\$\\.(step_[0-9]+|item|input)(\\.[A-Za-z_][A-Za-z0-9_]*|\\[[0-9]+\\])+$",
+      "description": "A Reference Path: $.step_k.output.field / $.item.field / $.input.field. Selection only — no filters/functions/wildcards."
+    },
+    "literalOrRef": {
+      "description": "An arg hint: a string literal (numbers arrive as strings), a primitive, or a data reference. args are HINTS the business OS re-resolves authoritatively.",
+      "anyOf": [
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "boolean" },
+        { "type": "null" }
+      ]
+    },
+    "bilingualMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ar"],
+      "properties": {
+        "ar": { "type": "string", "minLength": 1 },
+        "en": { "type": "string" }
+      },
+      "description": "Arabic-first bilingual merchant-facing text; inline references allowed in values."
+    },
+    "args": {
+      "type": "object",
+      "description": "Hint bag; validated against the skill's hint_schema at V5. Values are literals or references.",
+      "additionalProperties": { "$ref": "#/$defs/literalOrRef" }
+    },
+    "retryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_attempts"],
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "backoff": { "enum": ["exponential", "fixed"], "default": "exponential" },
+        "initial_seconds": { "type": "number", "minimum": 0, "default": 2 }
+      }
+    },
+    "nodeErrorPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action"],
+      "properties": {
+        "action": { "enum": ["halt", "continue", "route", "compensate"] },
+        "to": { "$ref": "#/$defs/nodeId" }
+      },
+      "description": "If action is 'route', 'to' is required (cross-checked at V2)."
+    },
+    "programErrorPolicy": { "enum": ["halt", "continue", "compensate"] },
+
+    "node": {
+      "type": "object",
+      "required": ["id", "type"],
+      "oneOf": [
+        { "$ref": "#/$defs/actionNode" },
+        { "$ref": "#/$defs/queryNode" },
+        { "$ref": "#/$defs/conditionNode" },
+        { "$ref": "#/$defs/parallelNode" },
+        { "$ref": "#/$defs/foreachNode" },
+        { "$ref": "#/$defs/awaitApprovalNode" },
+        { "$ref": "#/$defs/waitNode" },
+        { "$ref": "#/$defs/notifyNode" }
+      ]
+    },
+
+    "actionNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "skill", "verb", "args"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nodeId" },
+        "type": { "const": "action" },
+        "skill": { "$ref": "#/$defs/skillName" },
+        "verb": { "$ref": "#/$defs/nilVerb" },
+        "args": { "$ref": "#/$defs/args" },
+        "next": { "anyOf": [{ "$ref": "#/$defs/nodeId" }, { "type": "null" }] },
+        "retry_policy": { "$ref": "#/$defs/retryPolicy" },
+        "on_error": { "$ref": "#/$defs/nodeErrorPolicy" }
+      }
+    },
+
+    "queryNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "verb"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nodeId" },
+        "type": { "const": "query" },
+        "verb": { "$ref": "#/$defs/nilVerb" },
+        "args": { "$ref": "#/$defs/args" },
+        "next": { "anyOf": [{ "$ref": "#/$defs/nodeId" }, { "type": "null" }] },
+        "retry_policy": { "$ref": "#/$defs/retryPolicy" },
+        "on_error": { "$ref": "#/$defs/nodeErrorPolicy" }
+      }
+    },
+
+    "conditionNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "expression", "on_true"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nodeId" },
+        "type": { "const": "condition" },
+        "expression": { "type": "string", "minLength": 1, "description": "CEL-style boolean guard; total, side-effect-free (validated at V5)." },
+        "on_true": { "$ref": "#/$defs/branchTarget" },
+        "on_false": { "$ref": "#/$defs/branchTarget" },
+        "next": { "anyOf": [{ "$ref": "#/$defs/nodeId" }, { "type": "null" }] }
+      }
+    },
+
+    "branchTarget": {
+      "anyOf": [
+        { "$ref": "#/$defs/nodeId" },
+        { "type": "array", "items": { "$ref": "#/$defs/node" }, "minItems": 1 }
+      ],
+      "description": "A node id, or an inline array of nodes (sugar for a small branch)."
+    },
+
+    "parallelNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "branches"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nodeId" },
+        "type": { "const": "parallel" },
+        "branches": { "type": "array", "minItems": 2, "maxItems": 64, "items": { "$ref": "#/$defs/nodeId" } },
+        "join": { "enum": ["all", "any"], "default": "all" },
+        "next": { "anyOf": [{ "$ref": "#/$defs/nodeId" }, { "type": "null" }] }
+      }
+    },
+
+    "foreachNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "items", "as", "body", "max_items"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nodeId" },
+        "type": { "const": "foreach" },
+        "items": { "$ref": "#/$defs/reference" },
+        "as": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "body": { "$ref": "#/$defs/nodeId" },
+        "max_items": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Required hard cap — no unbounded iteration (totality)." },
+        "next": { "anyOf": [{ "$ref": "#/$defs/nodeId" }, { "type": "null" }] }
+      }
+    },
+
+    "awaitApprovalNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "proposal", "on_approved"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nodeId" },
+        "type": { "const": "await_approval" },
+        "proposal": { "anyOf": [{ "$ref": "#/$defs/reference" }, { "type": "string" }] },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "default": 86400 },
+        "on_approved": { "$ref": "#/$defs/nodeId" },
+        "on_rejected": { "$ref": "#/$defs/nodeId" },
+        "on_timeout": { "$ref": "#/$defs/nodeId" }
+      }
+    },
+
+    "waitNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "seconds"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nodeId" },
+        "type": { "const": "wait" },
+        "seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "Fixed literal duration (no expressions — a wait must preview as a fixed duration)." },
+        "next": { "anyOf": [{ "$ref": "#/$defs/nodeId" }, { "type": "null" }] }
+      }
+    },
+
+    "notifyNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "message"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nodeId" },
+        "type": { "const": "notify" },
+        "message": { "$ref": "#/$defs/bilingualMessage" },
+        "next": { "anyOf": [{ "$ref": "#/$defs/nodeId" }, { "type": "null" }] }
+      }
+    }
+  }
+}

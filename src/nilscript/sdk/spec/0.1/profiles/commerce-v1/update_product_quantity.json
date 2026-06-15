@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/update_product_quantity.json",
+  "title": "commerce.update_product_quantity@1.0.0 args",
+  "type": "object", "additionalProperties": false,
+  "required": ["product_id", "quantity"],
+  "properties": {
+    "product_id": { "type": "string", "description": "Resolvable fact (§6.3)." },
+    "quantity": { "type": "integer", "minimum": 0 },
+    "mode": { "enum": ["set", "increment", "decrement"], "default": "set" }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/envelope.schema.json",
+  "title": "NIL Sentence Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "nil",
+    "id",
+    "performative",
+    "grant",
+    "workspace",
+    "ts",
+    "body"
+  ],
+  "properties": {
+    "nil": {
+      "const": "0.1"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 8
+    },
+    "performative": {
+      "enum": [
+        "PROPOSE",
+        "PROPOSAL",
+        "COMMIT",
+        "STATUS",
+        "QUERY",
+        "EVENT"
+      ]
+    },
+    "grant": {
+      "type": "string"
+    },
+    "workspace": {
+      "type": "string"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "trace": {
+      "type": "string"
+    },
+    "body": {
+      "type": "object"
+    }
+  },
+  "$comment": "DECIDE is deliberately absent: it is not a Speaker performative and has its own owner-plane schema."
+}

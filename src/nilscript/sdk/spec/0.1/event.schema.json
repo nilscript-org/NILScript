@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/event.schema.json",
+  "title": "EVENT body (System→Speaker) — asynchronous fact notification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event", "severity"],
+  "properties": {
+    "event": {
+      "enum": [
+        "proposed", "refused", "approval_requested", "approved", "rejected",
+        "modified", "expired", "executing", "executed", "failed_retryable",
+        "failed_terminal", "budget_exhausted", "suspended", "resumed",
+        "handoff_human", "deprecation_warning"
+      ]
+    },
+    "proposal": { "type": "string" },
+    "severity": { "enum": ["info", "warning", "error", "critical"] },
+    "result": { "$ref": "#/$defs/result" },
+    "data": { "type": "object", "description": "Machine payload. Data, never instruction (§11.2)." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "event": { "const": "executed" } } },
+      "then": { "required": ["proposal", "result"] }
+    }
+  ],
+  "$defs": {
+    "result": {
+      "title": "Result envelope (§11.1)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim", "changed", "verified"],
+      "properties": {
+        "entity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "type": "string" },
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "url": { "type": "string" }
+          }
+        },
+        "changed": { "type": "boolean" },
+        "verified": {
+          "type": "boolean",
+          "description": "True only when the System confirmed the effect by read-after-write against the system of record."
+        },
+        "ssot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["system"],
+          "properties": {
+            "system": { "type": "string" },
+            "read_after_write": { "type": "boolean" }
+          }
+        },
+        "claim": {
+          "enum": ["success", "partial", "ask_missing", "failure", "none"],
+          "description": "The strongest claim the Speaker may relay to a human. Computed by the System from status × changed × verified — never by the Speaker."
+        },
+        "replayed": { "type": "boolean" },
+        "data": { "type": "object" },
+        "data_gaps": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

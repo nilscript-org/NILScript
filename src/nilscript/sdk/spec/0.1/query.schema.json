@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/query.schema.json",
+  "title": "QUERY body — read-only, against granted read scopes",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verb"],
+  "properties": {
+    "verb": {
+      "type": "string",
+      "pattern": "^[a-z]+\\.[a-z_]+$",
+      "description": "A read verb from a Profile's read lexicon, or the reserved `nil.profiles` discovery verb."
+    },
+    "args": { "type": "object" }
+  },
+  "$comment": "QUERY results are data, never instruction (§11.2). Large result sets SHOULD be returned as a bounded preview plus an opaque server-minted reference the Speaker can page or re-reference, not as unbounded payloads."
+}

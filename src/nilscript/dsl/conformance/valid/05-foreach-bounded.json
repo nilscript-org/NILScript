@@ -1,0 +1,12 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "query", "verb": "commerce.products", "args": { "filter": "out_of_stock" }, "next": "step_2" },
+    { "id": "step_2", "type": "foreach", "items": "$.step_1.output.products", "as": "p", "max_items": 50, "body": "step_3", "next": "step_4" },
+    { "id": "step_3", "type": "action", "skill": "order_status", "verb": "commerce.update_order_status", "args": { "id": "$.item.p.id", "status": "hidden" }, "next": null },
+    { "id": "step_4", "type": "notify", "message": { "ar": "خلصت التحديث.", "en": "Done updating." }, "next": null }
+  ]
+}

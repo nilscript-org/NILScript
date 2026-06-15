@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/create_coupon.json",
+  "title": "commerce.create_coupon@1.0.0 args",
+  "type": "object", "additionalProperties": false,
+  "required": ["code", "discount_type", "discount_value"],
+  "properties": {
+    "code": { "type": "string", "minLength": 2 },
+    "discount_type": { "enum": ["percentage", "fixed"] },
+    "discount_value": { "type": "number", "exclusiveMinimum": 0, "description": "Checked against the workspace discount limit (§6.4 amount thresholds)." },
+    "expiry_date": { "type": "string", "format": "date" },
+    "usage_limit": { "type": "integer", "minimum": 1 }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "parallel", "branches": ["step_2", "step_3"], "join": "all", "next": "step_4" },
+    { "id": "step_2", "type": "action", "skill": "coupon", "verb": "commerce.create_coupon", "args": { "percent": "10" }, "next": null },
+    { "id": "step_3", "type": "action", "skill": "product", "verb": "commerce.create_product", "args": { "name": "بنطلون", "price": "120" }, "next": null },
+    { "id": "step_4", "type": "notify", "message": { "ar": "تم تجهيز طلبيك للمعاينة.", "en": "Both items are ready to preview." }, "next": null }
+  ]
+}

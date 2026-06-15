@@ -1,0 +1,11 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    { "id": "step_1", "type": "query", "verb": "services.list_clients", "args": {}, "next": "step_2" },
+    { "id": "step_2", "type": "action", "skill": "invoice", "verb": "services.create_invoice",
+      "args": { "customer": "$.step_1.output.clients[0].id", "amount": "100" }, "next": null }
+  ]
+}

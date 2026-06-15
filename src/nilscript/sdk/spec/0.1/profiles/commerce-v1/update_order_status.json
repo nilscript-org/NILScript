@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/update_order_status.json",
+  "title": "commerce.update_order_status@1.0.0 args — DEPRECATED in 0.2.0, removed in 0.3.0",
+  "deprecated": true,
+  "type": "object", "additionalProperties": false,
+  "required": ["order_id", "status"],
+  "properties": {
+    "order_id": { "type": "string", "description": "Resolvable fact (§6.3). Aliases: orderId, order_number, reference_id." },
+    "status": { "type": "string", "description": "DEPRECATED. Calibration (18 platforms; 17/18) showed order status is a DERIVED fact, not a settable field (GAP-001). Use commerce.record_fulfillment / commerce.record_payment." }
+  },
+  "$comment": "DEPRECATED 0.2.0 with one-MINOR overlap (VERSIONING). The reference implementation (wosool-cloud) emits an EVENT deprecation warning when this verb is used. Removed in 0.3.0. Replacement: record_fulfillment (fulfillment axis) + record_payment (financial axis)."
+}

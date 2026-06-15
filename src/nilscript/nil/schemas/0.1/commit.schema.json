@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/commit.schema.json",
+  "title": "COMMIT body",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "proposal",
+    "idempotency_key"
+  ],
+  "properties": {
+    "proposal": {
+      "type": "string"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 8
+    }
+  }
+}

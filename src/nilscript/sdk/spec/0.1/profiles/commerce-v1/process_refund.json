@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/process_refund.json",
+  "title": "commerce.process_refund@2.0.0 args — floor HIGH; amount resolved from the target of record, never from args",
+  "type": "object", "additionalProperties": false,
+  "required": ["refund_target"],
+  "properties": {
+    "refund_target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "id"],
+      "description": "The unit being refunded, named abstractly (D-1 level-1 object). Each System accepts the type(s) it natively models and refuses the rest with UNRESOLVED/INVALID_ARGS — never a transport error.",
+      "properties": {
+        "type": { "enum": ["order", "invoice", "payment"], "description": "order = order-native stores; invoice = billing systems; payment = payment processors. Calibration: the refund unit is platform-dependent (GAP-002)." },
+        "id": { "type": "string", "description": "Resolvable fact (§6.3) for the chosen type." }
+      }
+    },
+    "reason": { "type": "string" }
+  },
+  "$comment": "v2.0.0 (breaking): order_id replaced by the abstract refund_target object. The refundable amount is read from the target of record; a Speaker-declared amount is ignored (§6.3). Partial refunds are an Owner modification at DECIDE (§7.4)."
+}

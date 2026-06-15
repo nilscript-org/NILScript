@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/update_product.json",
+  "title": "commerce.update_product@1.0.0 args",
+  "type": "object", "additionalProperties": false,
+  "required": ["product_id", "updates"],
+  "properties": {
+    "product_id": { "type": "string", "description": "Resolvable fact: id, name, 1-indexed position, or server-minted reference (§6.3)." },
+    "updates": { "type": "object", "additionalProperties": false, "minProperties": 1,
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "price": { "type": "number", "exclusiveMinimum": 0 },
+        "sale_price": { "type": "number", "exclusiveMinimum": 0 },
+        "is_available": { "type": "boolean" },
+        "category": { "type": "string", "description": "Resolvable fact: name→id server-side." }
+      } }
+  },
+  "$comment": "Aliases: product_id ← productId."
+}

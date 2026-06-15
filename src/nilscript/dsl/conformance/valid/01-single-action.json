@@ -1,0 +1,16 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    {
+      "id": "step_1",
+      "type": "action",
+      "skill": "product",
+      "verb": "commerce.create_product",
+      "args": { "name": "قميص قطن", "price": "89" },
+      "next": null
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "$comment": "The verdict contract. For each program, a conforming WosoolDSLValidator MUST produce the given `result`, and for FAIL cases MUST emit AT LEAST every listed diagnostic `code` (a superset is allowed — an implementation may detect more). For OK cases, listed `codes` are non-blocking WARNING diagnostics the validator MUST still emit (e.g. deprecation). `pass` names the validator stage (V1–V6) the case is designed to exercise; `severity`/`location`/`message` are NOT asserted (mirrors AWS ValidateStateMachineDefinition: branch on result + codes, not exact wording).",
+  "conformance": "0.2",
+  "context": "context.json",
+  "cases": {
+    "valid/01-single-action.json":     { "result": "OK", "diagnostics": [] },
+    "valid/02-parallel-batch.json":    { "result": "OK", "diagnostics": [] },
+    "valid/03-condition-dataflow.json":{ "result": "OK", "diagnostics": [] },
+    "valid/04-approval-gate.json":     { "result": "OK", "diagnostics": [] },
+    "valid/05-foreach-bounded.json":   { "result": "OK", "diagnostics": [] },
+    "valid/06-query-output-ref.json":  { "result": "OK", "diagnostics": [], "$note": "0.2 keystone (positive): $.step_1.output.clients[0].id resolves against list_clients.response_schema (array→object→string)." },
+    "valid/07-deprecated-verb-warns.json": { "result": "OK", "pass": "V4", "codes": ["V4_DEPRECATED_VERB"], "$note": "0.2: update_order_status is deprecated — admits, but the validator MUST emit a non-blocking deprecation warning (observable, not silent)." },
+
+    "invalid/01-cycle.json":              { "result": "FAIL", "pass": "V3", "codes": ["V3_CYCLE"] },
+    "invalid/02-scope-denied.json":       { "result": "FAIL", "pass": "V4", "codes": ["V4_SCOPE_DENIED"] },
+    "invalid/03-dangling-ref.json":       { "result": "FAIL", "pass": "V2", "codes": ["V2_DANGLING_REF"] },
+    "invalid/04-forward-ref.json":        { "result": "FAIL", "pass": "V6", "codes": ["V6_FORWARD_REF"] },
+    "invalid/05-unknown-type.json":       { "result": "FAIL", "pass": "V1", "codes": ["V1_SCHEMA"] },
+    "invalid/06-missing-required-arg.json":{ "result": "FAIL", "pass": "V5", "codes": ["V5_ARG_MISSING"] },
+    "invalid/07-unreachable-node.json":   { "result": "FAIL", "pass": "V6", "codes": ["V6_UNREACHABLE"] },
+    "invalid/08-unknown-skill.json":      { "result": "FAIL", "pass": "V4", "codes": ["V4_UNKNOWN_SKILL"] },
+    "invalid/09-query-output-unknown-field.json": { "result": "FAIL", "pass": "V5", "codes": ["V5_OUTPUT_FIELD_UNKNOWN"], "$note": "0.2 keystone (negative A): $.step_1.output.clients[0].price names a field absent from list_clients.response_schema (clients items are {id,name}). Typed-by-name, not in name only." },
+    "invalid/10-query-output-shape-mismatch.json":{ "result": "FAIL", "pass": "V5", "codes": ["V5_PATH_SHAPE_MISMATCH"], "$note": "0.2 keystone (negative B): $.step_1.output.clients.id treats the clients ARRAY as an object (missing index). Array/object confusion is a static error." }
+  }
+}
