@@ -9,11 +9,11 @@
 [![CI](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml/badge.svg)](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml)
 [![tests](https://img.shields.io/badge/tests-160%20passing-2ea44f)](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)](https://www.python.org/)
-[![spec](https://img.shields.io/badge/NIL%20spec-v0.2-5b5bd6)](src/nilscript/nil/versions/0.2.0.md)
+[![spec](https://img.shields.io/badge/NIL%20spec-v0.2-5b5bd6)](https://github.com/nilscript-org/nilscript-protocol/blob/main/nil/0.2.0.md)
 [![license](https://img.shields.io/badge/license-Apache--2.0%20AND%20CC--BY--4.0-444)](LICENSE)
 [![conformance](https://img.shields.io/badge/conformance-harness%20shipped-2ea44f)](docs/contributing-an-adapter.md)
 
-[Quickstart](#quickstart) · [Commands](#command-tour) · [How it works](#how-it-works) · [Build an adapter](docs/contributing-an-adapter.md) · [Spec](src/nilscript/nil/versions/0.2.0.md) · [Status](#where-it-stands)
+[Quickstart](#quickstart) · [Commands](#command-tour) · [How it works](#how-it-works) · [Build an adapter](docs/contributing-an-adapter.md) · [Spec](https://github.com/nilscript-org/nilscript-protocol/blob/main/nil/0.2.0.md) · [Status](#where-it-stands)
 
 </div>
 
@@ -113,7 +113,7 @@ OpenAPI / JSON-Schema model).
 
 ## Where it stands
 
-- ✅ **Spec v0.2** released (`nil/versions/0.1.0.md`, `0.2.0.md`); SEQRD-PC / ROLLBACK in the toolkit.
+- ✅ **Spec v0.2** released (the NIL spec in [nilscript-protocol](https://github.com/nilscript-org/nilscript-protocol/tree/main/nil)); SEQRD-PC / ROLLBACK in the toolkit.
 - ✅ **Conformance harness shipped** — offline proof + live `conformance-test` + `manifest validate`.
 - ✅ **160 tests** green; one **live proof** (a real customer + invoice into a live ERPNext, from the standard alone).
 - ✅ **First Official Verified Adapter** (PocketBase) standalone and green.

@@ -2,7 +2,7 @@
 
 NIL is implementation-independent; this registry lists implementations with published
 conformance reports (see
-[versions/0.1.0-conformance-checklist.md](versions/0.1.0-conformance-checklist.md)).
+[the conformance checklist](https://github.com/nilscript-org/nilscript-protocol/blob/main/nil/0.1.0-conformance-checklist.md)).
 
 | Name | Role | Conformance target | Notes |
 |---|---|---|---|
