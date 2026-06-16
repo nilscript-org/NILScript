@@ -45,6 +45,9 @@ Source = "https://github.com/nilscript-org/nilscript"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# The standard's own suite lives in tests/. Example adapters under examples/ ship their own
+# conformance proof (run from the example dir with PYTHONPATH=src), so they are not collected here.
+testpaths = ["tests"]
 
 [tool.setuptools]
 include-package-data = true
