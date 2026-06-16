@@ -211,7 +211,7 @@ Two repos under `nilscript-org`, sharing **one docs domain** so mindshare/SEO st
 
 ### 7.2 Migrating the already-published `nilscript` package (honest)
 
-The name `nilscript` is **already live on PyPI** as the spec data + adapter toolkit (`0.2.0`, with a broken `0.2.1` and a fixed `0.2.2` built locally). The pivot makes the package *also* a runtime. Handle it cleanly:
+The name `nilscript` is **already live on PyPI** (`0.2.0`) as the spec data + adapter toolkit. This release unifies everything at **`0.3.0`** — the package becomes *also* a runtime. Handle it cleanly:
 
 - **Additive, not a rename.** The `run` command + `nilscript.kernel` module are **added**; the bundled schemas + toolkit stay. `pip install nilscript` keeps working and *gains* `nilscript run`. No name burn.
 - **Version — `0.3.0` (signed off, §10).** `0.2.x` stays for the pre-extraction fixes; `0.3.0` is the standalone kernel. CHANGELOG headline: "NILScript is now a runnable kernel."

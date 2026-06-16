@@ -36,7 +36,7 @@ A new ledger entry kind, `attestation`, binding an adapter run to the spec it ra
   "payload": {
     "adapter": "nilscript-org/pocketbase-nil-adapter",
     "adapter_commit": "<git sha>",
-    "kernel_version": "0.2.1",
+    "kernel_version": "0.3.0",
     "spec_hash": "<compute_spec_hash(...)>",     // the spec the gates ran against
     "gates": {
       "offline": {"passed": 16, "failed": 0},

@@ -28,7 +28,7 @@ body:
     id: kernel_version
     attributes:
       label: Minimum kernel version it conforms to
-      placeholder: "nilscript >= 0.2.1"
+      placeholder: "nilscript >= 0.3.0"
     validations:
       required: true
   - type: checkboxes

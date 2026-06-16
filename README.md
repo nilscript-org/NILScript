@@ -30,7 +30,7 @@
 ## Quickstart
 
 ```bash
-# pip install nilscript works on PyPI; for the latest 0.2.1 (with the [cli] fix) install from source until it ships:
+# pip install nilscript works on PyPI; for the latest 0.3.0 (with the [cli] fix) install from source until it ships:
 pip install "nilscript[cli] @ git+https://github.com/nilscript-org/nilscript.git"
 
 nilscript verbs                                  # the verb catalog from the standard

@@ -43,7 +43,7 @@ _GAP_RE = re.compile(r"GAP-\d+")
 
 def spec_root() -> Path:
     """Filesystem path to the bundled standard, e.g. `.../nilscript/sdk/spec/0.1`."""
-    return Path(str(files("nilscript.sdk") / "spec" / SPEC_VERSION))
+    return Path(str(files("nilscript") / "sdk" / "spec" / SPEC_VERSION))
 
 
 def load_core_schema(filename: str) -> dict[str, Any]:

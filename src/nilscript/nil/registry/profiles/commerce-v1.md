@@ -21,7 +21,7 @@ non-conformant. Conformance is demonstrated per Annex B of the spec.
 | `commerce.create_coupon@1.0.0` | HIGH | — | explicit_request | discount bounds checked vs workspace policy | discount, expiry | code, discount, expiry | — | IRREVERSIBLE (default) |
 | `commerce.process_refund@2.0.0` | HIGH | **HIGH** | explicit_request | refund_target {order\|invoice\|payment, id}; **amount from the target of record** (never args) | amount (≤ resolved target total) | target, amount, customer | — | IRREVERSIBLE (default) |
 
-## Reversibility tiers (ROLLBACK, 0.2.1)
+## Reversibility tiers (ROLLBACK, 0.3.0)
 
 Each write verb declares a **reversibility** keyword (+ optional `compensation` block) consumed by
 the `ROLLBACK` performative (see [backend-conformance.md §7](../../../docs/backend-conformance.md)).

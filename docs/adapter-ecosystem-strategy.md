@@ -114,7 +114,7 @@ The template repo is essentially **"`nilscript scaffold-shim` output, frozen, wi
 - **Adapter repos:** `<service>-nil-adapter` (e.g. `pocketbase-nil-adapter`, `salla-nil-adapter`, `supabase-nil-adapter`). Python package inside stays `<service>_nil_adapter`.
 - **Badges:** `Official Verified Adapter` (core-team owned, CI-green) vs `Community` (listed, conformance-green, not yet adopted).
 - **Registry:** maintain `IMPLEMENTATIONS.md` in the core as the index of known adapters (official + community) with their conformance status and last-verified kernel version.
-- **Versioning:** an adapter pins the **minimum kernel version** it conforms to (e.g. `nilscript>=0.2.1`); its own version is independent.
+- **Versioning:** an adapter pins the **minimum kernel version** it conforms to (e.g. `nilscript>=0.3.0`); its own version is independent.
 
 ---
 
