@@ -13,7 +13,7 @@ Repurpose the name **`nilscript`** so it refers to a **lightweight, installable,
 | Name | What it is | Where it lives | Installable? |
 | --- | --- | --- | --- |
 | **NILScript** | The **kernel software** — a local runtime gateway that parses a `plan.nil.json` DSL program, validates it, walks the graph, and drives a mounted **adapter** via NIL (PROPOSE→COMMIT/QUERY/ROLLBACK). Headless, **no dashboard** (LiteLLM-style). | `nilscript` package (pip / later npm) + `nilscript-org/nilscript` repo | **Yes** — `pip install nilscript`, then `nilscript run`. |
-| **NILScript Protocol** | The **specification** — NIL wire contract, the DSL grammar, SEQRD-PC, the constitution. | **Docs only** (docs site + `docs/`/`nil/versions/*` in the repo). **Not** a separate pip/npm package. | **No** — it's reading material. |
+| **NILScript Protocol** | The **constitution prose** — NIL wire-contract narrative, the DSL grammar guides, SEQRD-PC, `GOVERNANCE`/`VERSIONING`. | **New repo `nilscript-protocol`** + the docs site, on the shared `nilscript.org` domain. **Not** a pip/npm package. *(The machine-readable JSON schemas stay in the kernel — see §7.1.)* | **No** — it's reading material. |
 
 **Why software-first wins (the viral thesis):** developers run code, they don't read specs. `pip install nilscript && nilscript run` is a <60-second time-to-value loop; a spec is "I'll read it later" (they don't). The spec stays as the *authority layer* embedded in the kernel's docs — enterprise dignity without splitting the package footprint. This mirrors LiteLLM (headless proxy, viral) and Langfuse (the OSS engine drives the cloud upsell), and MCP / JSON Schema (spec is docs, not a package you `pip install`).
 
@@ -172,29 +172,51 @@ Result: one DSL engine, two executors. A plan validated/previewed locally behave
 - [ ] **Tests:** port the DSL conformance corpus (`dsl/conformance/{valid,invalid}/*.json`) to drive the kernel; add executor tests against the in-memory `FakeSystem` (the one the adapters already ship) so `nilscript run` is provable with **no live backend**.
 - [ ] **DoD:** `pip install -e ".[cli]"` then `nilscript run examples/<plan>.nil.json --adapter-url <fake>` runs a multi-step plan end-to-end (incl. a compensate path) in a clean env — green.
 
-### Phase 2 — Migrate the docs & positioning (docs-first)
-- [ ] Reframe the README around `pip install nilscript && nilscript run` as the **primary** onboarding (the §[saas-grade-content-plan] hero), kernel-first.
-- [ ] Move the spec to a clear **"NILScript Protocol"** reference section (NIL + DSL + SEQRD-PC) — embedded, not a separate package. Keep `nil/versions/*` as the canonical source the docs render.
-- [ ] Update the adapter docs to frame adapters as **kernel plugins** ("build an adapter, then `nilscript run --adapter-url`").
+### Phase 2 — Split the protocol repo & migrate docs (docs-first)
+- [ ] **Create `nilscript-org/nilscript-protocol`** and migrate the **constitution prose** into it — NIL version narratives, DSL guides (`dsl/01–11`), SEQRD-PC design, `GOVERNANCE.md`, `VERSIONING.md`, the spec docs (§7.1). Leave the **JSON schemas + conformance vectors in the kernel** (they ship in the wheel).
+- [ ] Stand up the docs site on the **shared `nilscript.org` domain** (`/protocol` or `docs.`); render/link the schemas *from* the kernel (single source — no fork).
+- [ ] Reframe the kernel README around `pip install nilscript && nilscript run` as the **primary**, kernel-first onboarding; link out to the protocol site for the constitution.
+- [ ] Frame adapters as **kernel plugins** ("build an adapter, then `nilscript run --adapter-url`").
 - [ ] Wosool Cloud page: "local headless now; connect for durable + dashboarded execution."
 
 ### Phase 3 — Lock
 - [ ] Make `wosool-cloud` **depend on the published `nilscript.kernel`** for the DSL engine (delete the vendored copy → single source of truth). The cloud keeps only `TemporalExecutor` + activities + worker/gateway/store.
+- [ ] Finalize the repo split: prose lives only in `nilscript-protocol`; the kernel repo links out; verify no schema is duplicated across repos (the kernel is the only home for machine artifacts).
 - [ ] Full verification: kernel suite green; conformance corpus green; cloud still green against the imported kernel; a clean-env smoke (`pip install`, run a plan).
-- [ ] Freeze on a clean commit; cut the kernel release (see §7); update IMPLEMENTATIONS / topics.
+- [ ] Freeze on a clean commit; cut the kernel **`0.3.0`** release (§7.2); update IMPLEMENTATIONS / topics; redirect old spec paths to the protocol site.
 
 **Critical path:** Phase 1 gates everything. Phase 2 (docs) can start drafting in parallel once the CLI shape is fixed. Phase 3 (cloud re-point) is last to avoid destabilizing the cloud mid-extraction.
 
 ---
 
-## 7. Migrating the *already-published* `nilscript` package (honest)
+## 7. Two-repo structure & package migration (SIGNED OFF — two-repo split)
 
-The name `nilscript` is **already live on PyPI** as the spec + adapter toolkit (`0.2.0`, and a broken `0.2.1`/fixed `0.2.2` in flight). The pivot changes what the package *is* (now also a runtime). Handle it cleanly:
+### 7.1 The repo split — prose vs. machine artifacts
 
-- **It's additive, not a rename.** The kernel `run` command and `nilscript.kernel` module are **added** to the existing package; the spec data + toolkit stay. So `pip install nilscript` keeps working and *gains* `nilscript run`. No name burn.
-- **Version:** ship the kernel as a clear **minor** bump (e.g. `0.3.0`) with a CHANGELOG headline "NILScript is now a runnable kernel." (Per the earlier decision the current fix is `0.2.x`; the kernel is the next minor.) Reconcile the version line at Phase 3, not now.
-- **Spec stays docs-only:** never publish a `nilscript-spec` package. The spec is rendered in docs from `nil/versions/*`.
-- **The `[cli]/sdk` decoupling already done** (kernel needs the SDK's `NilClient`, so `run` will pull `nilscript[sdk]` — document the extra clearly).
+Two repos under `nilscript-org`, sharing **one docs domain** so mindshare/SEO stays consolidated:
+
+| Repo | Owns | Rationale |
+| --- | --- | --- |
+| **`nilscript-protocol`** (NEW) | The **constitution prose** — NIL version narratives, DSL guides (`dsl/01–11`), SEQRD-PC design, `GOVERNANCE.md`, `VERSIONING.md`, the rendered spec + the docs-site source. | The authority/reading layer; slow-moving; citable. Matches OpenAPI / JSON-Schema / MCP (a spec repo alongside implementation repos). |
+| **`nilscript`** (existing → kernel) | The **kernel software** + the **canonical machine-readable artifacts** (`nil/schemas/*`, `dsl/schema/*`, conformance vectors) + SDK + CLI. | The schemas ship in the wheel and are read offline via `importlib.resources` — they are the *enforced contract = code*, not docs. |
+
+**The seam is prose vs. machine artifacts, not "docs vs. code".** Moving the JSON schemas out would force the kernel to vendor them (submodule/build-copy) → drift, violating the single-source rule. So:
+- The **protocol site renders/links** the schemas *from* the kernel (one source for the machine contract).
+- The **kernel README links out** to the protocol site for the constitution.
+- **No `pip install nilscript-spec`** — a spec *repo* is not a spec *package*. (Consistent with the software-first thesis: a docs repo is not an installable package.)
+
+**Shared domain:** the protocol repo publishes to `nilscript.org` (e.g. `/protocol` or `docs.nilscript.org`) — same brand, two repos behind it. Viral consolidation *and* a clean governance home for the constitution.
+
+**When:** the split happens in **Phase 2/3 — after `nilscript run` works**, never before (don't reorganize repos around an unproven kernel).
+
+### 7.2 Migrating the already-published `nilscript` package (honest)
+
+The name `nilscript` is **already live on PyPI** as the spec data + adapter toolkit (`0.2.0`, with a broken `0.2.1` and a fixed `0.2.2` built locally). The pivot makes the package *also* a runtime. Handle it cleanly:
+
+- **Additive, not a rename.** The `run` command + `nilscript.kernel` module are **added**; the bundled schemas + toolkit stay. `pip install nilscript` keeps working and *gains* `nilscript run`. No name burn.
+- **Version — `0.3.0` (signed off, §10).** `0.2.x` stays for the pre-extraction fixes; `0.3.0` is the standalone kernel. CHANGELOG headline: "NILScript is now a runnable kernel."
+- **Spec stays repo/docs-only:** never a `nilscript-spec` package. The prose moves to `nilscript-protocol`; the schemas stay bundled in `nilscript`.
+- **`[cli]/sdk` decoupling done** — `run` pulls `nilscript[sdk]` (for `NilClient`); document the extra clearly.
 
 ---
 
@@ -218,13 +240,17 @@ The name `nilscript` is **already live on PyPI** as the spec + adapter toolkit (
 
 ---
 
-## 10. Open decisions (for sign-off)
+## 10. Decisions — SIGNED OFF (2026-06-16)
 
-1. **Adapter mount v1:** HTTP `--adapter-url` only (recommended), or also subprocess-spawn `--adapter <path>`?
-2. **Local durability v1:** none (recommended) vs. an optional append-only `--journal` (no replay)?
-3. **Kernel version:** ship as `0.3.0` (recommended) after the `0.2.x` fix lands?
-4. **Cloud re-point timing:** make `wosool-cloud` import `nilscript.kernel` in Phase 3 (recommended) or keep vendored until later?
-5. **npm/TS port:** explicitly out of scope for v1? (recommended yes — Python first.)
+All five locked at the recommended defaults, plus the two-repo split (§7.1):
+
+1. **Adapter mount v1 — HTTP `--adapter-url` only.** ✅ No subprocess/plugin loaders in v1; universally compatible with any-language backend (Hermes, PocketBase, ERPNext) out of the box.
+2. **Local durability v1 — none / best-effort.** ✅ A local crash mid-run is a hard drop *by design*; crash-resiliency, persistence, and recovery are the paid Wosool Cloud (`TemporalExecutor`) — durability is the business moat.
+3. **Kernel version — ship as `0.3.0`.** ✅ `0.2.x` reserved for pre-extraction fixes; `0.3.0` cleanly marks the decoupled standalone kernel.
+4. **Cloud re-point — Phase 3.** ✅ `wosool-cloud` imports the published `nilscript.kernel` as single source of truth — validator + guard evaluator update local dev and the enterprise cloud simultaneously.
+5. **npm/TS port — out of scope for v1.** ✅ Python engine stable, proven, and viral first; TS port follows community demand (Next.js-native edge).
+
+**Repo structure (signed off):** new `nilscript-protocol` (constitution prose) + existing `nilscript` (kernel + machine-readable schemas), shared `nilscript.org` domain; split executed in Phase 2/3 (§7.1).
 
 ---
 
