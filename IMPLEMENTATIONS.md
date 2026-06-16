@@ -13,3 +13,9 @@ conformance reports (see
 To be listed: open a PR adding your implementation with a completed implementation report
 (checklist statuses + the `examples/` exchanges executed against your System, logs attached).
 The 1.0 release requires two independent interoperable implementations.
+
+**Building an adapter** (a shim that makes a backend speak NIL)? Start from the
+[nil-adapter-template](https://github.com/nilscript-org/nil-adapter-template), fill three files,
+prove the [three conformance gates](docs/contributing-an-adapter.md), then open an **Adapter
+submission** issue to request 🟢 Official Verified status. Signed certificates are on the
+[attestation roadmap](docs/attestation-design.md).

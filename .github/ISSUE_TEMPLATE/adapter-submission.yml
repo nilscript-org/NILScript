@@ -1,0 +1,69 @@
+name: "Adapter submission — request Official Verified status"
+description: Submit a conformant NIL adapter for review and adoption into nilscript-org.
+title: "[adapter] <service>-nil-adapter"
+labels: ["adapter-submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for building a NIL adapter! Before submitting, read
+        [docs/contributing-an-adapter.md](https://github.com/nilscript-org/nilscript/blob/main/docs/contributing-an-adapter.md).
+        Adoption requires the three conformance gates **green in your CI** *and* a maintainer security review.
+  - type: input
+    id: repo
+    attributes:
+      label: Adapter repository URL
+      description: Your public repo, built from nil-adapter-template.
+      placeholder: https://github.com/<you>/<service>-nil-adapter
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Backend / service
+      placeholder: "e.g. Supabase, Salla, Medusa"
+    validations:
+      required: true
+  - type: input
+    id: kernel_version
+    attributes:
+      label: Minimum kernel version it conforms to
+      placeholder: "nilscript >= 0.3.0"
+    validations:
+      required: true
+  - type: checkboxes
+    id: gates
+    attributes:
+      label: Conformance gates (all must be green before review)
+      options:
+        - label: "Offline proof — `pytest` is green (every active write verb reaches `executed`; rollback-honesty holds)"
+          required: true
+        - label: "Live proof — `nilscript conformance-test` green per verb, across all three reversibility tiers"
+          required: true
+        - label: "Manifest honesty — `nilscript manifest validate requirements-manifest.json` passes"
+          required: true
+  - type: input
+    id: ci_run
+    attributes:
+      label: Link to a green CI run
+      placeholder: https://github.com/<you>/<service>-nil-adapter/actions/runs/<id>
+    validations:
+      required: true
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security self-attestation (a maintainer will independently verify)
+      options:
+        - label: "No silent writes — `ROLLBACK` always previews; reversibility is honored, never faked"
+          required: true
+        - label: "Tier honesty — every declared reversibility tier is backed by real compensation behavior"
+          required: true
+        - label: "No credentials committed; backend auth is via env/secret only"
+          required: true
+        - label: "Inputs validated at the edge; no SSRF / unbounded fan-out to the backend"
+          required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes for reviewers
+      description: Reversibility tier choices, backend quirks discovered, anything non-obvious.

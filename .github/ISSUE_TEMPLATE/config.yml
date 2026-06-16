@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Start a new adapter (Use this template)
+    url: https://github.com/nilscript-org/nil-adapter-template
+    about: Fork the template, fill system.py / translate.py / compensation.py, prove conformance, then open an Adapter submission.
+  - name: How to contribute an adapter
+    url: https://github.com/nilscript-org/nilscript/blob/main/docs/contributing-an-adapter.md
+    about: The full ecosystem flow, the three conformance gates, and the Official Verified review gate.
+  - name: Security disclosure
+    url: https://github.com/nilscript-org/nilscript/blob/main/SECURITY.md
+    about: Report a vulnerability privately (90-day coordinated disclosure).
