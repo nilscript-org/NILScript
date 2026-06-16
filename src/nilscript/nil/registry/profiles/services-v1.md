@@ -17,7 +17,7 @@ implementation (GOVERNANCE: no normative release before running code).
 Amount escalation (normative for this profile): resolved exposure > 1,000 SAR ⇒ min HIGH;
 > 5,000 SAR ⇒ CRITICAL. Args schemas: `schemas/profiles/services-v1/*.json`.
 
-## Reversibility tiers (ROLLBACK, 0.3.0)
+## Reversibility tiers (ROLLBACK, 0.2.1)
 
 Like commerce-v1, each write verb declares a **reversibility** keyword (+ optional `compensation`
 block) consumed by the `ROLLBACK` performative (see

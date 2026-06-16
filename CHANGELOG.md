@@ -1,10 +1,10 @@
 # Changelog
 
-## 0.3.0 — Unreleased
+## 0.2.1 — Unreleased
 **Bounded Reversibility — a 7th performative, ROLLBACK, added in place on the 0.1 wire.**
 Fully additive and backward-compatible: every existing 0.1 message, DSL program, and profile
 remains valid; the envelope `nil` const **stays "0.1"** (no new schema namespace). Any unmarked
-verb is IRREVERSIBLE by default (zero-touch). Package version `0.2.0 → 0.3.0`. The upgraded kernel
+verb is IRREVERSIBLE by default (zero-touch). Package version `0.2.0 → 0.2.1`. The upgraded kernel
 is named **SEQRD-PC** — a mnemonic re-cut of the same set: S·STATUS, E·EVENT, Q·QUERY, R·ROLLBACK,
 D·DECIDE, P·PROPOSE, C·COMMIT. Full test suite green at 160.
 ### Added

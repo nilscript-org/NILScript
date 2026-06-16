@@ -110,7 +110,7 @@ def test_ratification_anchor_is_content_addressed(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path / "memory.jsonl")
     assert store.current_anchor() is None  # unratified
     h = compute_spec_hash(["envelope-bytes", "rollback-bytes", "rfc-text"])
-    store.anchor_ratification(version="0.3.0", label="SEQRD-PC v1", spec_hash=h)
+    store.anchor_ratification(version="0.2.1", label="SEQRD-PC v1", spec_hash=h)
     anchor = store.current_anchor()
     assert anchor is not None
     assert anchor["payload"]["spec_hash"] == h

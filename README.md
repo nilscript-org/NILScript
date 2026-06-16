@@ -30,7 +30,7 @@
 ## Quickstart
 
 ```bash
-# PyPI release is pending — install from source today:
+# pip install nilscript works on PyPI; for the latest 0.2.1 (with the [cli] fix) install from source until it ships:
 pip install "nilscript[cli] @ git+https://github.com/nilscript-org/nilscript.git"
 
 nilscript verbs                                  # the verb catalog from the standard
@@ -94,7 +94,7 @@ Architecture & contribution: [adapter-ecosystem-strategy.md](docs/adapter-ecosys
 ## Install
 
 ```bash
-pip install nilscript          # the standard only (JSON + docs) — zero runtime deps   [PyPI pending]
+pip install nilscript          # the standard only (JSON + docs) — zero runtime deps
 pip install nilscript[cli]     # + the adapter toolkit (scaffold-shim, scan, manifest)
 pip install nilscript[sdk]     # + the Python SDK (httpx, pydantic)
 ```
