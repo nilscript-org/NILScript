@@ -139,7 +139,7 @@ The template repo is essentially **"`nilscript scaffold-shim` output, frozen, wi
 **Phase 3 — open the ecosystem**
 - [x] Publish the community contribution flow (fork template → fill → conformance → PR). → [`docs/contributing-an-adapter.md`](./contributing-an-adapter.md) + a structured **Adapter submission** issue form (`.github/ISSUE_TEMPLATE/adapter-submission.yml`) and a template-chooser `config.yml` linking "Use this template" / the flow / security disclosure. Cross-linked from `CONTRIBUTING.md` and `IMPLEMENTATIONS.md`.
 - [x] Stand up the conformance/attestation roadmap item (hosted signed certificate via the ledger anchor). → [`docs/attestation-design.md`](./attestation-design.md): a 4-stage roadmap grounded in the real `compute_spec_hash` / `anchor_ratification` primitives in `cli/memory.py` (Stage 0 — CI-green — shipped; signing/hosting are roadmap, not advertised yet).
-- [ ] Onboard the next adapters (Salla, Supabase, …). → **next**: each is a real implementation task (discover the backend's verbs, fill `system.py`/`translate.py`/`compensation.py`, prove the three gates). Pick the first backend + confirm depth (real API integration vs. scaffold-and-fill stub).
+- [ ] Onboard the next adapters (Salla, Supabase, …). → **next**: each is a **real implementation** task (discover the backend's verbs, fill `system.py`/`translate.py`/`compensation.py` against the real API, prove the three gates). **Policy: never publish empty/stub adapter repos** — a repo under `nilscript-org` is only created once it is genuinely filled and its three gates pass. The single empty starting point for authors is `nil-adapter-template`; we do not clone it into per-service WIP stubs.
 
 ---
 
