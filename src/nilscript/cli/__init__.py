@@ -144,9 +144,34 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 
 
 def _cmd_manifest(args: argparse.Namespace) -> int:
-    from nilscript.cli.manifest import shareable_violations, strip_instance, validate
+    from nilscript.cli.manifest import diff, merge, shareable_violations, strip_instance, validate
 
-    manifest = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    def _load(path: str) -> dict:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    if args.action == "merge":
+        if len(args.files) < 2:
+            print("merge needs a base manifest + at least one override", file=sys.stderr)
+            return 2
+        manifests = [_load(f) for f in args.files]
+        merged = merge(manifests[0], *manifests[1:])
+        text = json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
+        if args.output:
+            Path(args.output).write_text(text, encoding="utf-8")
+            print(f"wrote merged manifest to {args.output}", file=sys.stderr)
+        else:
+            print(text)
+        return 0
+
+    if args.action == "diff":
+        if len(args.files) != 2:
+            print("diff needs exactly two manifests: OLD NEW", file=sys.stderr)
+            return 2
+        report = diff(_load(args.files[0]), _load(args.files[1]))
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 1 if report["changed"] else 0  # non-zero on drift, for CI gating
+
+    manifest = _load(args.files[0])
 
     if args.action == "validate":
         errors = validate(manifest)
@@ -176,6 +201,52 @@ def _cmd_manifest(args: argparse.Namespace) -> int:
     # show
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
     return 0
+
+
+def _cmd_conformance_test(args: argparse.Namespace) -> int:
+    from nilscript.cli.conformance import run_conformance, summarize
+
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        print("conformance-test needs httpx (pip install nilscript[sdk])", file=sys.stderr)
+        return 2
+
+    base = args.url.rstrip("/")
+    headers = {"Authorization": f"Bearer {args.bearer}"} if args.bearer else {}
+    http = httpx.Client(base_url=base, headers=headers, timeout=20.0)
+
+    def _env(verb: str, extra: dict) -> dict:
+        return {"nil": "0.1", "grant": "g", "workspace": "w", "body": {"verb": verb, **extra}}
+
+    class _HttpProbe:
+        def propose(self, verb, payload_args):
+            return http.post("/nil/v0.1/propose", json=_env(verb, {"args": payload_args})).json()
+
+        def commit(self, proposal_id, idempotency_key):
+            body = {"proposal": proposal_id, "idempotency_key": idempotency_key}
+            return http.post("/nil/v0.1/commit", json={"nil": "0.1", "grant": "g", "workspace": "w", "body": body}).json()
+
+        def query(self, verb, payload_args):
+            return http.post("/nil/v0.1/query", json=_env(verb, {"args": payload_args})).json()
+
+        def status(self, proposal_id):
+            return http.get(f"/nil/v0.1/status/{proposal_id}").json()
+
+    write_args = json.loads(args.args) if args.args else {}
+    checks = run_conformance(
+        _HttpProbe(),
+        write_verb=args.verb,
+        write_args=write_args,
+        query_verb=args.query_verb,
+        query_args=json.loads(args.query_args) if args.query_args else {},
+    )
+    for check in checks:
+        mark = "PASS" if check.passed else "FAIL"
+        print(f"  [{mark}] {check.name}  ({check.detail})")
+    passed, total = summarize(checks)
+    print(f"\n{passed}/{total} conformance checks passed", file=sys.stderr)
+    return 0 if passed == total else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -218,10 +289,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("-o", "--output", help="write the manifest to a file instead of stdout")
     p_scan.set_defaults(func=_cmd_scan)
 
+    p_conf = sub.add_parser("conformance-test", help="run the conformance matrix against a live shim")
+    p_conf.add_argument("--url", required=True, help="base URL of a running shim")
+    p_conf.add_argument("--verb", required=True, help="a write verb to exercise, e.g. services.create_invoice")
+    p_conf.add_argument("--args", help="JSON object of valid args for --verb")
+    p_conf.add_argument("--query-verb", help="optional query verb to exercise the bare-{data} rule")
+    p_conf.add_argument("--query-args", help="JSON object of args for --query-verb")
+    p_conf.add_argument("--bearer", help="bearer token if the shim requires auth")
+    p_conf.set_defaults(func=_cmd_conformance_test)
+
     p_manifest = sub.add_parser("manifest", help="work with requirements manifests")
-    p_manifest.add_argument("action", choices=["validate", "show", "strip"])
-    p_manifest.add_argument("file", help="path to a requirements-manifest.json")
-    p_manifest.add_argument("-o", "--output", help="output file (for `strip`)")
+    p_manifest.add_argument("action", choices=["validate", "show", "strip", "merge", "diff"])
+    p_manifest.add_argument("files", nargs="+", help="manifest path(s); merge: base + overrides, diff: OLD NEW")
+    p_manifest.add_argument("-o", "--output", help="output file (for `strip`/`merge`)")
     p_manifest.set_defaults(func=_cmd_manifest)
 
     return parser

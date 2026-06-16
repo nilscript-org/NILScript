@@ -152,6 +152,107 @@ def shareable_violations(manifest: dict[str, Any]) -> list[str]:
     return violations
 
 
+def _req_key(req: dict[str, Any]) -> tuple[str, str]:
+    return (req.get("field", ""), req.get("kind", ""))
+
+
+def merge(base: dict[str, Any], *overrides: dict[str, Any]) -> dict[str, Any]:
+    """Combine a community **structural** manifest with local **override** manifests (plan §3.4, §6).
+
+    Requirements/prerequisites/quirks are unioned (dedup by identity); instance_values and per-verb
+    scalars (native_target, line_container, …) are overlaid (later override wins). Pure: inputs are
+    not mutated. This is how an integrator pulls `erpnext.manifest.json` and layers their own env
+    bindings on top without re-discovering the structure.
+    """
+    import copy
+
+    result = copy.deepcopy(base)
+    result.setdefault("verbs", {})
+    for override in overrides:
+        for scalar in ("manifest_version", "system", "nil_spec"):
+            if override.get(scalar):
+                result[scalar] = override[scalar]
+        for verb_name, entry in (override.get("verbs", {}) or {}).items():
+            target = result["verbs"].setdefault(verb_name, {})
+            _merge_verb(target, entry)
+        if override.get("transport_quirks"):
+            result["transport_quirks"] = _union_quirks(
+                result.get("transport_quirks", []), override["transport_quirks"]
+            )
+    return result
+
+
+def _merge_verb(target: dict[str, Any], entry: dict[str, Any]) -> None:
+    existing = {_req_key(r) for r in target.get("hidden_requirements", [])}
+    for req in entry.get("hidden_requirements", []):
+        if _req_key(req) not in existing:
+            target.setdefault("hidden_requirements", []).append(req)
+            existing.add(_req_key(req))
+    seen_entities = {p.get("entity") for p in target.get("prerequisites", [])}
+    for prereq in entry.get("prerequisites", []):
+        if prereq.get("entity") not in seen_entities:
+            target.setdefault("prerequisites", []).append(prereq)
+            seen_entities.add(prereq.get("entity"))
+    if entry.get("instance_values"):
+        target.setdefault("instance_values", {}).update(entry["instance_values"])
+    for scalar in ("native_target", "line_container", "line_shape"):
+        if entry.get(scalar):
+            target[scalar] = entry[scalar]
+
+
+def _union_quirks(a: list[dict[str, Any]], b: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_name = {q.get("quirk"): q for q in a}
+    for quirk in b:
+        by_name.setdefault(quirk.get("quirk"), quirk)
+    return list(by_name.values())
+
+
+def diff(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """Structural diff between two manifest versions — drift detection when a system changes (§3.4).
+
+    Reports verbs added/removed and, per shared verb, hidden requirements and prerequisites
+    added/removed. `changed` is True iff anything differs (a quick gate for `manifest diff`).
+    """
+    old_verbs, new_verbs = old.get("verbs", {}) or {}, new.get("verbs", {}) or {}
+    report: dict[str, Any] = {
+        "verbs_added": sorted(set(new_verbs) - set(old_verbs)),
+        "verbs_removed": sorted(set(old_verbs) - set(new_verbs)),
+        "verbs_changed": {},
+    }
+    for verb in sorted(set(old_verbs) & set(new_verbs)):
+        old_reqs = {_req_key(r) for r in old_verbs[verb].get("hidden_requirements", [])}
+        new_reqs = {_req_key(r) for r in new_verbs[verb].get("hidden_requirements", [])}
+        old_pre = {p.get("entity") for p in old_verbs[verb].get("prerequisites", [])}
+        new_pre = {p.get("entity") for p in new_verbs[verb].get("prerequisites", [])}
+        changes: dict[str, Any] = {}
+        if new_reqs - old_reqs:
+            changes["requirements_added"] = sorted(f"{f}:{k}" for f, k in new_reqs - old_reqs)
+        if old_reqs - new_reqs:
+            changes["requirements_removed"] = sorted(f"{f}:{k}" for f, k in old_reqs - new_reqs)
+        if new_pre - old_pre:
+            changes["prerequisites_added"] = sorted(str(e) for e in new_pre - old_pre)
+        if old_pre - new_pre:
+            changes["prerequisites_removed"] = sorted(str(e) for e in old_pre - new_pre)
+        if changes:
+            report["verbs_changed"][verb] = changes
+
+    old_q = {q.get("quirk") for q in old.get("transport_quirks", [])}
+    new_q = {q.get("quirk") for q in new.get("transport_quirks", [])}
+    if new_q - old_q:
+        report["quirks_added"] = sorted(str(q) for q in new_q - old_q)
+    if old_q - new_q:
+        report["quirks_removed"] = sorted(str(q) for q in old_q - new_q)
+
+    report["changed"] = bool(
+        report["verbs_added"]
+        or report["verbs_removed"]
+        or report["verbs_changed"]
+        or report.get("quirks_added")
+        or report.get("quirks_removed")
+    )
+    return report
+
+
 def strip_instance(manifest: dict[str, Any]) -> dict[str, Any]:
     """Return a shareable copy of `manifest` with all `instance_values` removed, leaving only the
     structural requirements. Pure: the input is not mutated."""
