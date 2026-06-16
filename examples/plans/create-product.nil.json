@@ -1,0 +1,32 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "pipeline": [
+    {
+      "id": "step_1",
+      "type": "action",
+      "skill": "product",
+      "verb": "commerce.create_product",
+      "args": { "name": "قميص قطن" },
+      "compensate_with": {
+        "verb": "commerce.delete_product",
+        "args": { "product_id": "x" }
+      },
+      "next": "step_2"
+    },
+    {
+      "id": "step_2",
+      "type": "condition",
+      "expression": "$.step_1.output.state == \"executed\"",
+      "on_true": "step_3"
+    },
+    {
+      "id": "step_3",
+      "type": "notify",
+      "message": { "ar": "تم إنشاء المنتج بنجاح.", "en": "Product created." },
+      "next": null
+    }
+  ]
+}

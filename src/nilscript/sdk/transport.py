@@ -48,10 +48,13 @@ class NilTransport:
         self._backoff_base = backoff_base
         self._sleep = sleep
         self._rng = rng
+        # An empty bearer means the shim requires no auth (e.g. a local dev adapter): omit the
+        # header entirely rather than send an illegal `Authorization: Bearer ` value.
+        headers = {"Authorization": f"Bearer {bearer_secret}"} if bearer_secret else {}
         self._client = client or httpx.AsyncClient(
             base_url=base_url,
             timeout=timeout,
-            headers={"Authorization": f"Bearer {bearer_secret}"},
+            headers=headers,
         )
 
     async def post_sentence(self, path: str, wire: dict[str, Any]) -> dict[str, Any]:

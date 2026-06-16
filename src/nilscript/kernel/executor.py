@@ -211,5 +211,7 @@ class LocalExecutor:
 def _outcome_dict(outcome: StatusBody | ProposalBody, proposal_id: str) -> dict[str, Any]:
     """Normalize a commit outcome (STATUS, or a PROPOSAL when parked) into the node's output."""
     if isinstance(outcome, StatusBody):
-        return {"proposal": outcome.proposal, "state": outcome.state}
-    return {"proposal": proposal_id, "parked": True, "tier": outcome.tier}
+        state = outcome.state.value if outcome.state is not None else None
+        return {"proposal": outcome.proposal, "state": state}
+    tier = outcome.tier.value if outcome.tier is not None else None
+    return {"proposal": proposal_id, "parked": True, "tier": tier}
