@@ -1,7 +1,7 @@
 # NILScript Kernel — Extraction & Software-First Pivot (Deep Plan)
 
 > **Status:** Plan / roadmap. No code is moved or published from this document. · **Date:** 2026-06-16
-> **Companion docs:** [`adapter-ecosystem-strategy.md`](./adapter-ecosystem-strategy.md) · [`saas-grade-content-plan.md`](./saas-grade-content-plan.md) · [`../src/nilscript/dsl/11-RUNTIME-EXPLAINED.md`](../src/nilscript/dsl/11-RUNTIME-EXPLAINED.md)
+> **Companion docs:** [`adapter-ecosystem-strategy.md`](./adapter-ecosystem-strategy.md) · [`saas-grade-content-plan.md`](./saas-grade-content-plan.md) · [`11-RUNTIME-EXPLAINED`](https://github.com/nilscript-org/nilscript-protocol/blob/main/dsl/11-RUNTIME-EXPLAINED.md)
 > **Premise (corrected):** the runtime is **already implemented** in `wosool-cloud` (the 11-RUNTIME doc predates it). This is an **extraction**, not a net-new build.
 
 ---
