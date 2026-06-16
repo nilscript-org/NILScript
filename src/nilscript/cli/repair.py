@@ -126,3 +126,69 @@ def run_repair_loop(
         return RepairOutcome(status="repaired", attempts=attempt, created=outcome.created, final=result)
 
     return RepairOutcome(status="exhausted", attempts=max_attempts, created=outcome.created)
+
+
+# --- backward recovery: the Saga unwind (ROLLBACK) --------------------------------------------
+#
+# Forward repair (above) heals by *completing*. When that is impossible — a prerequisite can't be
+# made, the owner cancels, a downstream step is terminally failed — the program is unwound by
+# *compensation*, in reverse commit order. This is the other arm of the same self-healing axiom.
+
+
+@dataclass(frozen=True)
+class CommittedStep:
+    """A step the runtime already committed, carrying how it may be reversed."""
+
+    verb: str
+    reversibility: str  # REVERSIBLE | COMPENSABLE | IRREVERSIBLE
+    compensation_token: str | None = None
+    result: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class UnwindOutcome:
+    """The result of unwinding a partially-completed saga.
+
+    `status`:
+      - "compensated" — every completed step was reversed (auto for blessed REVERSIBLE steps).
+      - "parked"      — some steps need a human DECIDE (COMPENSABLE / non-allowlisted) — never auto-acted.
+      - "blocked"     — an IRREVERSIBLE step means the program cannot be fully rolled back (honest partial).
+    """
+
+    status: str
+    compensated: list[str] = field(default_factory=list)
+    parked: list[str] = field(default_factory=list)
+    irreversible: list[str] = field(default_factory=list)
+
+
+# step -> the governed compensation outcome (a real PROPOSE->COMMIT upstream).
+Compensator = Callable[["CommittedStep"], dict[str, Any]]
+
+
+def run_saga_unwind(
+    steps: list[CommittedStep],
+    *,
+    compensate: Compensator,
+    auto_compensate: frozenset[str] | set[str] = frozenset(),
+) -> UnwindOutcome:
+    """Unwind committed `steps` in reverse order via governed compensation (plan §3, ROLLBACK).
+
+    Only REVERSIBLE steps whose verb is on the `auto_compensate` allowlist are reversed automatically;
+    COMPENSABLE (or non-allowlisted) steps are PARKED for a human DECIDE — never auto-acted. An
+    IRREVERSIBLE step blocks a full rollback and is reported honestly, never silently skipped.
+    """
+    outcome = UnwindOutcome(status="compensated")
+    for step in reversed(steps):
+        if step.reversibility == "IRREVERSIBLE":
+            outcome.irreversible.append(step.verb)
+        elif step.reversibility == "REVERSIBLE" and step.verb in auto_compensate:
+            compensate(step)  # governed compensation (previewed + committed upstream)
+            outcome.compensated.append(step.verb)
+        else:  # COMPENSABLE, or a REVERSIBLE step not pre-blessed for auto-unwind
+            outcome.parked.append(step.verb)
+
+    if outcome.irreversible:
+        outcome.status = "blocked"
+    elif outcome.parked:
+        outcome.status = "parked"
+    return outcome

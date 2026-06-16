@@ -203,6 +203,17 @@ def _cmd_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _verb_reversibility(verb: str) -> str | None:
+    """The verb's declared reversibility tier from its profile, or None if it declares none.
+
+    None means the rollback-honesty rows are skipped (a verb with no declared tier is IRREVERSIBLE
+    in the standard, but we don't probe a shim for a capability the standard never asked it to add)."""
+    try:
+        return load_profile(verb).get("reversibility")
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+
+
 def _cmd_conformance_test(args: argparse.Namespace) -> int:
     from nilscript.cli.conformance import run_conformance, summarize
 
@@ -233,13 +244,23 @@ def _cmd_conformance_test(args: argparse.Namespace) -> int:
         def status(self, proposal_id):
             return http.get(f"/nil/v0.1/status/{proposal_id}").json()
 
+        def rollback(self, compensation_token, reason):
+            body = {"compensation_token": compensation_token, "reason": reason}
+            return http.post(
+                "/nil/v0.1/rollback", json={"nil": "0.1", "grant": "g", "workspace": "w", "body": body}
+            ).json()
+
     write_args = json.loads(args.args) if args.args else {}
+    # The rollback-honesty rows run only when a tier is known: an explicit --reversibility wins,
+    # else the verb's declared tier from its profile (absent -> IRREVERSIBLE, the honest default).
+    reversibility = getattr(args, "reversibility", None) or _verb_reversibility(args.verb)
     checks = run_conformance(
         _HttpProbe(),
         write_verb=args.verb,
         write_args=write_args,
         query_verb=args.query_verb,
         query_args=json.loads(args.query_args) if args.query_args else {},
+        reversibility=reversibility,
     )
     for check in checks:
         mark = "PASS" if check.passed else "FAIL"
@@ -265,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_profile.set_defaults(func=_cmd_profile)
 
     p_openapi = sub.add_parser(
-        "export-openapi", help="emit an OpenAPI 3.1 document for the five NIL endpoints"
+        "export-openapi", help="emit an OpenAPI 3.1 document for the six NIL endpoints"
     )
     p_openapi.add_argument("--format", choices=["json", "yaml"], default="json")
     p_openapi.add_argument("-o", "--output", help="write to a file instead of stdout")
@@ -296,6 +317,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("--query-verb", help="optional query verb to exercise the bare-{data} rule")
     p_conf.add_argument("--query-args", help="JSON object of args for --query-verb")
     p_conf.add_argument("--bearer", help="bearer token if the shim requires auth")
+    p_conf.add_argument(
+        "--reversibility",
+        choices=["REVERSIBLE", "COMPENSABLE", "IRREVERSIBLE"],
+        help="exercise the rollback-honesty rows at this tier (else read from --verb's profile)",
+    )
     p_conf.set_defaults(func=_cmd_conformance_test)
 
     p_manifest = sub.add_parser("manifest", help="work with requirements manifests")

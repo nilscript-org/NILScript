@@ -10,10 +10,65 @@ from __future__ import annotations
 
 from nilscript.cli.manifest import (
     MANIFEST_VERSION,
+    diff,
+    merge,
     shareable_violations,
     strip_instance,
     validate,
 )
+
+
+def _rev_manifest(verb_entry: dict) -> dict:
+    return {
+        "manifest_version": MANIFEST_VERSION,
+        "system": "erpnext",
+        "nil_spec": "0.1",
+        "verbs": {"commerce.create_product": verb_entry},
+    }
+
+
+def test_reversible_verb_with_compensation_is_valid() -> None:
+    m = _rev_manifest(
+        {"reversibility": "REVERSIBLE", "compensation": {"verb": "commerce.delete_product"}}
+    )
+    assert validate(m) == []
+
+
+def test_reversible_without_compensation_is_rejected() -> None:
+    m = _rev_manifest({"reversibility": "REVERSIBLE"})
+    assert any("compensation" in e for e in validate(m))
+
+
+def test_irreversible_with_compensation_is_rejected() -> None:
+    m = _rev_manifest(
+        {"reversibility": "IRREVERSIBLE", "compensation": {"verb": "x.y"}}
+    )
+    assert any("IRREVERSIBLE" in e for e in validate(m))
+
+
+def test_unknown_reversibility_tier_is_rejected() -> None:
+    assert any("reversibility" in e for e in validate(_rev_manifest({"reversibility": "MAYBE"})))
+
+
+def test_merge_overlays_reversibility() -> None:
+    base = _rev_manifest({"hidden_requirements": []})
+    override = _rev_manifest(
+        {"reversibility": "COMPENSABLE", "compensation": {"verb": "commerce.process_refund"}}
+    )
+    merged = merge(base, override)
+    assert merged["verbs"]["commerce.create_product"]["reversibility"] == "COMPENSABLE"
+
+
+def test_diff_flags_reversibility_drift() -> None:
+    old = _rev_manifest(
+        {"reversibility": "REVERSIBLE", "compensation": {"verb": "commerce.delete_product"}}
+    )
+    new = _rev_manifest({"reversibility": "IRREVERSIBLE"})
+    report = diff(old, new)
+    assert report["changed"] is True
+    assert report["verbs_changed"]["commerce.create_product"]["reversibility_changed"] == [
+        "REVERSIBLE", "IRREVERSIBLE",
+    ]
 
 
 def _erpnext_manifest() -> dict:

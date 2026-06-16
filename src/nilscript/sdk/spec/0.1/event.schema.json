@@ -11,7 +11,8 @@
         "proposed", "refused", "approval_requested", "approved", "rejected",
         "modified", "expired", "executing", "executed", "failed_retryable",
         "failed_terminal", "budget_exhausted", "suspended", "resumed",
-        "handoff_human", "deprecation_warning"
+        "handoff_human", "deprecation_warning",
+        "compensating", "compensated", "compensation_refused"
       ]
     },
     "proposal": { "type": "string" },
@@ -63,7 +64,20 @@
         },
         "replayed": { "type": "boolean" },
         "data": { "type": "object" },
-        "data_gaps": { "type": "array", "items": { "type": "string" } }
+        "data_gaps": { "type": "array", "items": { "type": "string" } },
+        "compensation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reversibility"],
+          "description": "How this just-committed effect may later be reversed. `token` is present only when reversibility != IRREVERSIBLE; after `expires_at` the reversal path is gone.",
+          "properties": {
+            "reversibility": { "enum": ["REVERSIBLE", "COMPENSABLE", "IRREVERSIBLE"] },
+            "token": { "type": "string", "minLength": 8 },
+            "expires_at": { "type": "string", "format": "date-time" }
+          },
+          "if": { "properties": { "reversibility": { "const": "IRREVERSIBLE" } } },
+          "then": { "properties": { "token": false } }
+        }
       }
     }
   }

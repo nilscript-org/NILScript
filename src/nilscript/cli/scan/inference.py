@@ -13,6 +13,7 @@ system actually returned.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -174,3 +175,60 @@ def build_manifest(
     if quirks:
         manifest["transport_quirks"] = list(quirks.values())
     return manifest
+
+
+# --- reversibility-tier inference (plan §4.3, ROLLBACK) ---------------------------------------
+#
+# A *proposal*, never authoritative: the tier is inferred from the verb lexicon (which sibling
+# verbs exist in the catalog) and surfaced for human confirmation. An effect we cannot prove is
+# reversible stays IRREVERSIBLE — the honest, safe default, exactly like an unrecognized error
+# yields nothing.
+
+_CREATE_PREFIXES = ("create_", "add_", "draft_")
+_DELETE_PREFIXES = ("delete_", "remove_")
+_CHARGE_HINTS = ("payment", "invoice", "charge", "fulfillment")
+_OFFSET_HINTS = ("refund", "credit", "void", "reverse")
+
+
+def _strip_prefix(local: str, prefixes: tuple[str, ...]) -> str | None:
+    for p in prefixes:
+        if local.startswith(p):
+            return local[len(p):]
+    return None
+
+
+def propose_reversibility(verb: str, available: Iterable[str]) -> dict[str, Any]:
+    """Propose a reversibility tier for `verb` given the verbs available in the catalog.
+
+    REVERSIBLE  — a create-like verb has a clean inverse sibling (create_product / delete_product).
+    COMPENSABLE — a money/effect verb has an offsetting forward sibling (record_payment / process_refund).
+    IRREVERSIBLE — otherwise. Returns `{reversibility, compensation?}` ready to drop into a profile.
+    """
+    namespace, _, local = verb.partition(".")
+    avail = set(available)
+
+    noun = _strip_prefix(local, _CREATE_PREFIXES)
+    if noun is not None:
+        for dp in _DELETE_PREFIXES:
+            inverse = f"{namespace}.{dp}{noun}"
+            if inverse in avail:
+                return {
+                    "reversibility": "REVERSIBLE",
+                    "compensation": {
+                        "verb": inverse,
+                        "arg_map": {f"{noun}_id": "$.result.entity.id"},
+                    },
+                }
+
+    if any(hint in local for hint in _CHARGE_HINTS):
+        for other in sorted(avail):
+            if other == verb:
+                continue
+            other_local = other.split(".", 1)[-1]
+            if any(hint in other_local for hint in _OFFSET_HINTS):
+                return {
+                    "reversibility": "COMPENSABLE",
+                    "compensation": {"verb": other},
+                }
+
+    return {"reversibility": "IRREVERSIBLE"}

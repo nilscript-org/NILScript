@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nil-spec.org/schemas/0.1/rollback.schema.json",
+  "title": "ROLLBACK body (Speaker→System) — request a governed reversal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["compensation_token", "reason"],
+  "properties": {
+    "compensation_token": {
+      "type": "string",
+      "minLength": 8,
+      "description": "Handle emitted in the original COMMIT's EVENT result (result.compensation.token). Binds the reversal to a specific committed effect."
+    },
+    "reason": {
+      "enum": ["saga_unwind", "owner_cancel", "downstream_failed", "agent_repair"]
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 8,
+      "description": "Rolling back twice under one key replays the original compensation outcome; it never double-compensates. Optional — the System may mint it on the answering PROPOSAL."
+    }
+  },
+  "$comment": "A ROLLBACK is answered by a PROPOSAL (the compensation preview), exactly as PROPOSE is. The previewed compensation is then executed through an ordinary COMMIT, so 'no silent write' holds for free."
+}

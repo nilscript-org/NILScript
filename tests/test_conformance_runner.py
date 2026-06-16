@@ -15,6 +15,7 @@ class ConformantProbe:
         self._proposals: dict[str, dict] = {}
         self._ledger: dict[str, dict] = {}
         self._executed: set[str] = set()
+        self._tokens: set[str] = set()
         self._n = 0
 
     def propose(self, verb: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -33,10 +34,23 @@ class ConformantProbe:
             return {"body": {**self._ledger[idempotency_key], "replayed": True}}
         if proposal_id not in self._proposals:
             return {"body": {"outcome": "refusal", "code": "EXPIRED", "state": "expired"}}
-        body = {"proposal": proposal_id, "state": "executed", "replayed": False}
+        token = f"ctok-{proposal_id}-{'z' * 12}"
+        self._tokens.add(token)
+        body = {
+            "proposal": proposal_id,
+            "state": "executed",
+            "replayed": False,
+            "compensation": {"reversibility": "COMPENSABLE", "token": token},
+        }
         self._ledger[idempotency_key] = body
         self._executed.add(proposal_id)
         return {"body": body}
+
+    def rollback(self, compensation_token: str, reason: str) -> dict[str, Any]:
+        # A faithful reversal: a *previewed* compensation (a proposal), never a silent write.
+        if compensation_token in self._tokens:
+            return {"body": {"outcome": "proposal", "id": "comp-1", "verb": "commerce.process_refund"}}
+        return {"body": {"outcome": "refusal", "code": "COMPENSATION_EXPIRED"}}
 
     def query(self, verb: str, args: dict[str, Any]) -> dict[str, Any]:
         return {"data": {"clients": []}}  # bare {data}, not an envelope
@@ -85,3 +99,66 @@ def test_missing_arg_row_uses_a_dropped_required_field() -> None:
     checks = run_conformance(ConformantProbe(), write_verb="services.create_invoice", write_args=_ARGS)
     row = next(c for c in checks if c.name == "missing_required_arg_refuses")
     assert row.passed
+
+
+# ── rollback-honesty rows ────────────────────────────────────────────────────
+
+
+class IrreversibleProbe(ConformantProbe):
+    """A shim whose write verb is IRREVERSIBLE — every reversal must be refused honestly."""
+
+    def commit(self, proposal_id: str, idempotency_key: str) -> dict[str, Any]:
+        body = super().commit(proposal_id, idempotency_key)
+        _body = body.get("body", {})
+        _body.pop("compensation", None)  # IRREVERSIBLE effects carry no reversal token
+        return body
+
+    def rollback(self, compensation_token: str, reason: str) -> dict[str, Any]:
+        return {"body": {"outcome": "refusal", "code": "IRREVERSIBLE"}}
+
+
+class LyingProbe(ConformantProbe):
+    """Claims to be reversible but *silently executes* the reversal — the runner must catch it."""
+
+    def rollback(self, compensation_token: str, reason: str) -> dict[str, Any]:
+        return {"body": {"state": "executed"}}  # no preview, no refusal: a silent write
+
+
+def _rollback_names(checks: list) -> set[str]:
+    return {c.name for c in checks}
+
+
+def test_reversible_shim_passes_rollback_rows() -> None:
+    checks = run_conformance(
+        ConformantProbe(), write_verb="services.create_invoice", write_args=_ARGS,
+        reversibility="COMPENSABLE",
+    )
+    rollback = [c for c in checks if c.name.startswith("rollback_")]
+    assert {c.name for c in rollback} == {
+        "rollback_previews_compensation", "rollback_no_silent_write", "rollback_unknown_token_refuses",
+    }
+    assert all(c.passed for c in rollback), [(c.name, c.detail) for c in rollback if not c.passed]
+
+
+def test_irreversible_shim_refuses_reversal_honestly() -> None:
+    checks = run_conformance(
+        IrreversibleProbe(), write_verb="services.create_invoice", write_args=_ARGS,
+        reversibility="IRREVERSIBLE",
+    )
+    row = next(c for c in checks if c.name == "rollback_irreversible_refuses")
+    assert row.passed, row.detail
+
+
+def test_runner_detects_silent_reversal_write() -> None:
+    checks = run_conformance(
+        LyingProbe(), write_verb="services.create_invoice", write_args=_ARGS,
+        reversibility="COMPENSABLE",
+    )
+    failed = {c.name for c in checks if not c.passed}
+    assert "rollback_no_silent_write" in failed
+    assert "rollback_previews_compensation" in failed
+
+
+def test_rollback_rows_absent_without_declared_reversibility() -> None:
+    checks = run_conformance(ConformantProbe(), write_verb="services.create_invoice", write_args=_ARGS)
+    assert not any(c.name.startswith("rollback_") for c in checks)

@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/record_payment.json",
   "title": "commerce.record_payment@1.0.0 args — floor HIGH; records a payment FACT; the System derives financial status",
+  "reversibility": "COMPENSABLE",
+  "compensation": { "verb": "commerce.process_refund", "arg_map": { "order_id": "$.args.order_id", "amount": "$.result.data.amount" }, "tier": "HIGH", "window": "P30D" },
   "type": "object", "additionalProperties": false,
   "required": ["order_id", "event"],
   "properties": {

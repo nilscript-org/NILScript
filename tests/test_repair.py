@@ -8,12 +8,69 @@ attempt cap are also covered — the loop must never invent an entity.
 from __future__ import annotations
 
 from nilscript.cli.repair import (
+    CommittedStep,
     RepairBlock,
     Resolution,
     make_refusal,
     repair_of,
     run_repair_loop,
+    run_saga_unwind,
 )
+
+
+def _steps() -> list[CommittedStep]:
+    return [
+        CommittedStep("commerce.create_product", "REVERSIBLE", "tok-1"),
+        CommittedStep("commerce.record_payment", "COMPENSABLE", "tok-2"),
+        CommittedStep("commerce.send_message", "IRREVERSIBLE"),
+    ]
+
+
+def test_saga_unwinds_in_reverse_order_auto_for_blessed_reversible() -> None:
+    seen: list[str] = []
+    out = run_saga_unwind(
+        [CommittedStep("commerce.create_product", "REVERSIBLE", "tok-1"),
+         CommittedStep("commerce.create_coupon", "REVERSIBLE", "tok-2")],
+        compensate=lambda s: seen.append(s.verb) or {"state": "executed"},
+        auto_compensate={"commerce.create_product", "commerce.create_coupon"},
+    )
+    assert out.status == "compensated"
+    assert seen == ["commerce.create_coupon", "commerce.create_product"]  # reverse commit order
+    assert out.compensated == seen
+
+
+def test_compensable_step_parks_for_human_never_auto() -> None:
+    calls: list[str] = []
+    out = run_saga_unwind(
+        [CommittedStep("commerce.record_payment", "COMPENSABLE", "tok-2")],
+        compensate=lambda s: calls.append(s.verb) or {},
+        auto_compensate=set(),
+    )
+    assert out.status == "parked"
+    assert out.parked == ["commerce.record_payment"]
+    assert calls == []  # never auto-acted
+
+
+def test_irreversible_step_blocks_full_rollback_honestly() -> None:
+    out = run_saga_unwind(
+        _steps(),
+        compensate=lambda s: {"state": "executed"},
+        auto_compensate={"commerce.create_product"},
+    )
+    assert out.status == "blocked"
+    assert out.irreversible == ["commerce.send_message"]
+    assert "commerce.create_product" in out.compensated  # reversible still auto-unwound
+    assert "commerce.record_payment" in out.parked
+
+
+def test_reversible_not_on_allowlist_parks() -> None:
+    out = run_saga_unwind(
+        [CommittedStep("commerce.create_product", "REVERSIBLE", "tok-1")],
+        compensate=lambda s: {"state": "executed"},
+        auto_compensate=set(),  # not blessed -> must park
+    )
+    assert out.status == "parked"
+    assert out.parked == ["commerce.create_product"]
 
 _CUSTOMER_REPAIR = RepairBlock(
     missing_entity="customer", resolve_with="services.create_client", carry="party_id->name"

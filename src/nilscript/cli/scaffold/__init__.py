@@ -31,6 +31,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from {pkg}.compensation import COMPENSATIONS
 from {pkg}.edge import CapturingEmitter, create_app
 from {pkg}.system import FakeSystem
 from {pkg}.translate import WRITE_VERBS
@@ -38,6 +39,37 @@ from {pkg}.translate import WRITE_VERBS
 
 def _env(verb: str, args: dict) -> dict:
     return {{"nil": "0.1", "grant": "g", "workspace": "w", "body": {{"verb": verb, "args": args}}}}
+
+
+def _commit(client, verb_name: str) -> dict:
+    args = {{field: "x" for field in WRITE_VERBS[verb_name].required}}
+    pid = client.post("/nil/v0.1/propose", json=_env(verb_name, args)).json()["body"]["id"]
+    return client.post(
+        "/nil/v0.1/commit",
+        json={{"nil": "0.1", "grant": "g", "workspace": "w",
+               "body": {{"proposal": pid, "idempotency_key": pid}}}},
+    ).json()["body"]
+
+
+def test_rollback_honesty() -> None:
+    """A reversible verb emits a compensation token and ROLLBACK previews (never silently writes);
+    an unknown token is refused. Skips only if no verb is mapped reversible in compensation.py."""
+    reversible = next((v for v in sorted(WRITE_VERBS) if v in COMPENSATIONS), None)
+    if reversible is None:
+        pytest.skip("no reversible verb mapped in compensation.py")
+    client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    committed = _commit(client, reversible)
+    token = committed.get("compensation", {{}}).get("token")
+    assert token, f"{{reversible}} is mapped reversible but COMMIT emitted no compensation token"
+
+    rolled = client.post("/nil/v0.1/rollback", json={{"nil": "0.1", "grant": "g", "workspace": "w",
+        "body": {{"compensation_token": token, "reason": "owner_cancel"}}}}).json()["body"]
+    assert rolled["outcome"] == "proposal", "ROLLBACK must PREVIEW a compensation, never silently write"
+
+    bogus = client.post("/nil/v0.1/rollback", json={{"nil": "0.1", "grant": "g", "workspace": "w",
+        "body": {{"compensation_token": "__no_such_token__", "reason": "owner_cancel"}}}}).json()["body"]
+    assert bogus["outcome"] == "refusal", "an unknown compensation token must be refused, never reversed"
 
 
 @pytest.mark.parametrize("verb_name", sorted(WRITE_VERBS))
@@ -57,6 +89,36 @@ def test_write_verb_reaches_executed(verb_name: str) -> None:
     )
     state = committed.json().get("body", {{}}).get("state")
     assert state == "executed", f"{{verb_name}}: not conformant yet (state={{state}}) — fill translate.py"
+'''
+
+
+_COMPENSATION = '''\
+"""Compensation handlers (ROLLBACK / Saga) for this shim — fill these to make verbs reversible.
+
+Every write verb is IRREVERSIBLE until you map it here AND declare its tier in
+requirements-manifest.json. A reversal is a *governed* compensation: the edge previews it (PROPOSE)
+and executes it (COMMIT) like any other action — never a silent write. Until a verb is mapped,
+ROLLBACK of its effect REFUSES with code IRREVERSIBLE, which is the honest default.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+# verb -> {"reversibility": "REVERSIBLE" | "COMPENSABLE", "verb": "<compensating verb>"}
+# Leave a verb OUT to keep it IRREVERSIBLE (the safe, zero-touch default).
+COMPENSATIONS: dict[str, dict[str, Any]] = {}
+
+
+def compensate(verb: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Return the compensating-proposal args for `verb` given its committed `result`.
+
+    Raises NotImplementedError until the verb is mapped — the conformance proof then verifies that
+    ROLLBACK of an unmapped (IRREVERSIBLE) effect is REFUSED, not silently executed.
+    """
+    if verb not in COMPENSATIONS:
+        raise NotImplementedError(f"{verb} is IRREVERSIBLE — no compensation mapped")
+    raise NotImplementedError(f"map the compensation args for {verb} in compensation.py")
 '''
 
 
@@ -109,6 +171,7 @@ def scaffold_shim(name: str, dest: Path, *, lang: str = "python") -> Path:
     _write(src / "manifest.py", T.MANIFEST_LOADER)
     _write(src / "models.py", render_models(active_verbs()))
     _write(src / "translate.py", render_translate(pkg, writes, queries, parked))
+    _write(src / "compensation.py", _COMPENSATION)
     _write(src / "run.py", T.RUN.format(**fmt))
 
     _write(root / "conformance" / "__init__.py", "")

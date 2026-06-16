@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nil-spec.org/schemas/0.1/profiles/commerce-v1/create_product.json",
   "title": "commerce.create_product@1.2.0 args",
+  "reversibility": "REVERSIBLE",
+  "compensation": { "verb": "commerce.delete_product", "arg_map": { "product_id": "$.result.entity.id" }, "tier": "MEDIUM", "window": "P30D" },
   "type": "object", "additionalProperties": false,
   "required": ["name"],
   "properties": {

@@ -60,7 +60,7 @@ def test_active_verbs_exclude_deprecated() -> None:
     assert active_verbs()  # non-empty
 
 
-def test_export_openapi_covers_the_five_endpoints() -> None:
+def test_export_openapi_covers_the_six_endpoints() -> None:
     doc = build_openapi()
     assert doc["openapi"].startswith("3.1")
     paths = doc["paths"]
@@ -68,9 +68,11 @@ def test_export_openapi_covers_the_five_endpoints() -> None:
     assert "post" in paths["/nil/v0.1/commit"]
     assert "post" in paths["/nil/v0.1/query"]
     assert "get" in paths["/nil/v0.1/status/{proposal_id}"]
+    assert "post" in paths["/nil/v0.1/rollback"]
     assert "post" in paths["/webhooks/nil-events"]
     schemas = doc["components"]["schemas"]
     assert "ProposeBody" in schemas
+    assert "RollbackBody" in schemas
     assert "Envelope" in schemas
     assert "$schema" not in schemas["Envelope"]
 

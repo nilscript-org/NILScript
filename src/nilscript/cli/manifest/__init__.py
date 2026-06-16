@@ -30,6 +30,10 @@ REQUIREMENT_KINDS = frozenset(
     }
 )
 
+# The reversibility tier a verb may declare (ROLLBACK / Saga). A verb that declares no tier is
+# IRREVERSIBLE by default — the honest, zero-touch-compatible baseline.
+REVERSIBILITY_TIERS = frozenset({"REVERSIBLE", "COMPENSABLE", "IRREVERSIBLE"})
+
 # Substrings that mark an instance-values KEY as secret-bearing — forbidden in a shared manifest
 # regardless of whether the value is a placeholder (plan §6 governance). Bias toward false positives:
 # a benign field wrongly flagged costs a rename; a leaked credential in the public registry is the
@@ -128,6 +132,21 @@ def _validate_verb(verb_name: str, entry: Any) -> list[str]:
     if instance and not isinstance(instance, dict):
         errors.append(f"verb {verb_name!r}: `instance_values` must be an object")
 
+    if "reversibility" in entry:
+        tier = entry["reversibility"]
+        if tier not in REVERSIBILITY_TIERS:
+            errors.append(
+                f"verb {verb_name!r}: unknown reversibility {tier!r} (expected one of {sorted(REVERSIBILITY_TIERS)})"
+            )
+        comp = entry.get("compensation")
+        if tier in {"REVERSIBLE", "COMPENSABLE"}:
+            if not isinstance(comp, dict) or not comp.get("verb"):
+                errors.append(
+                    f"verb {verb_name!r}: {tier} requires a `compensation` block naming the compensating `verb`"
+                )
+        elif comp is not None:
+            errors.append(f"verb {verb_name!r}: IRREVERSIBLE verbs must not carry a `compensation` block")
+
     return errors
 
 
@@ -195,7 +214,7 @@ def _merge_verb(target: dict[str, Any], entry: dict[str, Any]) -> None:
             seen_entities.add(prereq.get("entity"))
     if entry.get("instance_values"):
         target.setdefault("instance_values", {}).update(entry["instance_values"])
-    for scalar in ("native_target", "line_container", "line_shape"):
+    for scalar in ("native_target", "line_container", "line_shape", "reversibility", "compensation"):
         if entry.get(scalar):
             target[scalar] = entry[scalar]
 
@@ -233,6 +252,12 @@ def diff(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
             changes["prerequisites_added"] = sorted(str(e) for e in new_pre - old_pre)
         if old_pre - new_pre:
             changes["prerequisites_removed"] = sorted(str(e) for e in old_pre - new_pre)
+        # A reversibility tier change is drift the CI must catch: a verb that quietly downgrades
+        # REVERSIBLE -> IRREVERSIBLE (or claims a tier it no longer honors) flips the safety contract.
+        old_rev = old_verbs[verb].get("reversibility", "IRREVERSIBLE")
+        new_rev = new_verbs[verb].get("reversibility", "IRREVERSIBLE")
+        if old_rev != new_rev:
+            changes["reversibility_changed"] = [old_rev, new_rev]
         if changes:
             report["verbs_changed"][verb] = changes
 

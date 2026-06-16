@@ -13,8 +13,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+
+
+def compute_spec_hash(parts: Iterable[str]) -> str:
+    """Deterministic content hash of the spec parts (schemas + RFC text), order-independent.
+
+    Sorting makes the anchor reproducible regardless of file-read order, so the same spec always
+    yields the same hash — and any byte change yields a different one (the drift signal)."""
+    digest = hashlib.sha256()
+    for part in sorted(parts):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
 
 
 class MemoryStore:
@@ -46,6 +59,44 @@ class MemoryStore:
     def add_skill(self, name: str, steps: list[dict[str, Any]], *, supersedes: str | None = None) -> dict[str, Any]:
         """Add (or, via `supersedes`, revise) a Voyager-style reusable skill macro."""
         return self._append("skill", {"name": name, "steps": steps}, supersedes=supersedes)
+
+    def record_reversal(
+        self,
+        *,
+        verb: str,
+        tier: str,
+        outcome: str,
+        compensation_token: str | None = None,
+        approver: str | None = None,
+    ) -> dict[str, Any]:
+        """Append an immutable reversal record (ROLLBACK). Every compensation is remembered:
+        which verb, its tier, who approved it, and how it resolved — never edited, never lost."""
+        return self._append(
+            "reversal",
+            {
+                "verb": verb,
+                "tier": tier,
+                "outcome": outcome,
+                "compensation_token": compensation_token,
+                "approver": approver,
+            },
+            supersedes=None,
+        )
+
+    def anchor_ratification(self, *, version: str, label: str, spec_hash: str) -> dict[str, Any]:
+        """Write the ratification anchor: a content-hash of the frozen spec, bound to a version/label.
+
+        Because the ledger is append-only and content-addressed, this block can never be silently
+        altered — any later change to the spec changes its hash and appears as a NEW anchor, never an
+        in-place edit. That is what makes the lock permanent (plan Part 6, "lock it")."""
+        return self._append(
+            "anchor", {"version": version, "label": label, "spec_hash": spec_hash}, supersedes=None
+        )
+
+    def current_anchor(self) -> dict[str, Any] | None:
+        """The most recently written ratification anchor, or None if the spec is unratified."""
+        anchors = [e for e in self._entries() if e["kind"] == "anchor"]
+        return anchors[-1] if anchors else None
 
     def history(self, kind: str | None = None) -> list[dict[str, Any]]:
         """Every entry ever written (audit trail), optionally filtered by kind."""

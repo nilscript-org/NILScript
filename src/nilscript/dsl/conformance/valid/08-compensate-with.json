@@ -1,0 +1,21 @@
+{
+  "wosool": "0.1",
+  "workspace": "ws_demo",
+  "locale": "ar",
+  "entry": "step_1",
+  "on_error": "compensate",
+  "pipeline": [
+    {
+      "id": "step_1",
+      "type": "action",
+      "skill": "product",
+      "verb": "commerce.create_product",
+      "args": { "name": "قميص قطن", "price": "89" },
+      "compensate_with": {
+        "verb": "commerce.delete_product",
+        "args": { "product_id": "$.step_1.output.id" }
+      },
+      "next": null
+    }
+  ]
+}

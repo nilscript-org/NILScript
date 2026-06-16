@@ -34,6 +34,7 @@ CORE_SCHEMAS: dict[str, str] = {
     "query.schema.json": "QueryBody",
     "query-answer.schema.json": "QueryAnswer",
     "event.schema.json": "EventBody",
+    "rollback.schema.json": "RollbackBody",
     "grant.schema.json": "Grant",
 }
 

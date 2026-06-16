@@ -19,6 +19,10 @@ class RefusalCode(StrEnum):
     EXPIRED = "EXPIRED"
     RATE_LIMITED = "RATE_LIMITED"
     UPSTREAM_UNAVAILABLE = "UPSTREAM_UNAVAILABLE"
+    # Backward-recovery refusals (ROLLBACK): the System refuses to *pretend* it can
+    # reverse an effect it cannot. An honest refusal, never a silent corrective write.
+    IRREVERSIBLE = "IRREVERSIBLE"
+    COMPENSATION_EXPIRED = "COMPENSATION_EXPIRED"
 
 
 RETRIABLE_REFUSALS: frozenset[RefusalCode] = frozenset(

@@ -17,7 +17,11 @@ from typing import Any, Protocol
 
 
 class ShimProbe(Protocol):
-    """The four agent-plane calls, returning each endpoint's parsed JSON body."""
+    """The agent-plane calls, returning each endpoint's parsed JSON body.
+
+    `rollback` is optional: a shim that does not implement backward recovery simply omits it,
+    and the runner skips the rollback-honesty rows (its verbs are then IRREVERSIBLE by default).
+    """
 
     def propose(self, verb: str, args: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -26,6 +30,8 @@ class ShimProbe(Protocol):
     def query(self, verb: str, args: dict[str, Any]) -> dict[str, Any]: ...
 
     def status(self, proposal_id: str) -> dict[str, Any]: ...
+
+    def rollback(self, compensation_token: str, reason: str) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,17 @@ def _outcome(envelope: dict[str, Any]) -> str:
     return str(_body(envelope).get("outcome", ""))
 
 
+def _code(envelope: dict[str, Any]) -> str:
+    return str(_body(envelope).get("code", ""))
+
+
+def _compensation_token(committed: dict[str, Any]) -> str:
+    """The reversal handle a backend emits on COMMIT (body.compensation or result.compensation)."""
+    body = _body(committed)
+    comp = body.get("compensation") or body.get("result", {}).get("compensation") or {}
+    return str(comp.get("token", "")) if isinstance(comp, dict) else ""
+
+
 def run_conformance(
     probe: ShimProbe,
     *,
@@ -52,8 +69,15 @@ def run_conformance(
     unknown_verb: str = "namespace.__does_not_exist__",
     query_verb: str | None = None,
     query_args: dict[str, Any] | None = None,
+    reversibility: str | None = None,
 ) -> list[Check]:
-    """Run the conformance matrix against `probe`. Returns one Check per row (order stable)."""
+    """Run the conformance matrix against `probe`. Returns one Check per row (order stable).
+
+    When `reversibility` (the write verb's declared tier) is given and the probe implements
+    `rollback`, the rollback-honesty rows are appended — proving the shim cannot *lie* about
+    reversal: an IRREVERSIBLE effect must refuse, a reversible one must *preview* a compensation
+    (never a silent write), and an unknown token must never trigger a phantom reversal.
+    """
     checks: list[Check] = []
 
     # Row 1 — valid PROPOSE previews (a proposal, not a refusal), and yields a proposal id.
@@ -126,7 +150,65 @@ def run_conformance(
         bare = isinstance(answer, dict) and "data" in answer and "performative" not in answer
         checks.append(Check("query_returns_bare_data", bare, f"keys={sorted(answer)[:4] if isinstance(answer, dict) else answer!r}"))
 
+    # Rollback-honesty rows — appended only when a reversibility tier is declared AND the shim
+    # implements rollback. They prove the shim cannot misrepresent its reversal capability.
+    if reversibility is not None and hasattr(probe, "rollback"):
+        checks.extend(
+            _rollback_rows(probe, reversibility, _compensation_token(committed))
+        )
+
     return checks
+
+
+def _rollback_rows(probe: ShimProbe, reversibility: str, token: str) -> list[Check]:
+    rows: list[Check] = []
+    rolled = probe.rollback(token, "saga_unwind")
+    r_out, r_code = _outcome(rolled), _code(rolled)
+    r_state = _body(rolled).get("state", "")
+
+    # R1 — reversibility is honored: IRREVERSIBLE refuses with the honest code; a reversible /
+    # compensable effect is answered by a *previewed* compensation (a proposal), never executed.
+    if reversibility == "IRREVERSIBLE":
+        # An honest refusal proves no phantom reversal: IRREVERSIBLE (named) or COMPENSATION_EXPIRED
+        # (no reversal handle was ever issued) both mean "this effect cannot be undone" — never a write.
+        rows.append(
+            Check(
+                "rollback_irreversible_refuses",
+                r_out == "refusal"
+                and r_code in {"IRREVERSIBLE", "COMPENSATION_EXPIRED"}
+                and r_state != "executed",
+                f"outcome={r_out!r} code={r_code!r} state={r_state!r}",
+            )
+        )
+    else:
+        rows.append(
+            Check(
+                "rollback_previews_compensation",
+                r_out == "proposal" and r_state != "executed",
+                f"outcome={r_out!r} state={r_state!r}",
+            )
+        )
+
+    # R2 — no silent write on reversal: the rollback response must not itself be a bare executed
+    # state with no preview/refusal. (For both branches the reversal is governed, not silent.)
+    rows.append(
+        Check(
+            "rollback_no_silent_write",
+            r_state != "executed" and r_out in {"proposal", "refusal"},
+            f"outcome={r_out!r} state={r_state!r}",
+        )
+    )
+
+    # R3 — an unknown / expired compensation token never triggers a phantom reversal.
+    expired = probe.rollback("__no_such_token__", "saga_unwind")
+    rows.append(
+        Check(
+            "rollback_unknown_token_refuses",
+            _outcome(expired) == "refusal" and _body(expired).get("state") != "executed",
+            f"outcome={_outcome(expired)!r} state={_body(expired).get('state')!r}",
+        )
+    )
+    return rows
 
 
 def summarize(checks: list[Check]) -> tuple[int, int]:

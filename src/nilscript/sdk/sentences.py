@@ -30,7 +30,14 @@ class NilModel(BaseModel):
 
 
 class Performative(StrEnum):
-    """The closed agent-plane set (§4)."""
+    """The closed agent-plane set (§4).
+
+    ROLLBACK is the lifecycle-closing primitive: the backward-recovery counterpart of
+    PROPOSE. It does not execute anything — it *requests* a governed reversal, which the
+    System answers with a PROPOSAL (the compensation preview) that is then COMMITted like
+    any other action. Reversal therefore reuses the entire preview/commit machinery, so
+    the "no silent write" invariant holds for free.
+    """
 
     PROPOSE = "PROPOSE"
     PROPOSAL = "PROPOSAL"
@@ -38,6 +45,32 @@ class Performative(StrEnum):
     STATUS = "STATUS"
     QUERY = "QUERY"
     EVENT = "EVENT"
+    ROLLBACK = "ROLLBACK"
+
+
+class Reversibility(StrEnum):
+    """How (and whether) an effect can be reversed — declared per verb (Saga tiers).
+
+    REVERSIBLE    — a clean deterministic inverse exists (create ↔ delete).
+    COMPENSABLE   — no inverse, but a different forward action offsets it (invoice → credit-note).
+    IRREVERSIBLE  — no sanctioned reversal; must be caught at PROPOSE/preview time.
+
+    The legacy default for any unmarked verb is IRREVERSIBLE: a System refuses to claim a
+    reversal it cannot honour, so existing shims are conformant with zero new code.
+    """
+
+    REVERSIBLE = "REVERSIBLE"
+    COMPENSABLE = "COMPENSABLE"
+    IRREVERSIBLE = "IRREVERSIBLE"
+
+
+class RollbackReason(StrEnum):
+    """Why a reversal is being requested (carried on a ROLLBACK body)."""
+
+    SAGA_UNWIND = "saga_unwind"
+    OWNER_CANCEL = "owner_cancel"
+    DOWNSTREAM_FAILED = "downstream_failed"
+    AGENT_REPAIR = "agent_repair"
 
 
 class Tier(StrEnum):
@@ -78,6 +111,10 @@ class EventKind(StrEnum):
     RESUMED = "resumed"
     HANDOFF_HUMAN = "handoff_human"
     DEPRECATION_WARNING = "deprecation_warning"
+    # Backward-recovery lifecycle (ROLLBACK / Saga compensation).
+    COMPENSATING = "compensating"
+    COMPENSATED = "compensated"
+    COMPENSATION_REFUSED = "compensation_refused"
 
 
 class Severity(StrEnum):
@@ -105,6 +142,21 @@ class ProposeBody(NilModel):
 class CommitBody(NilModel):
     proposal: str = Field(pattern=PROPOSAL_ID_PATTERN)
     idempotency_key: str = Field(min_length=8)
+
+
+class RollbackBody(NilModel):
+    """Speaker→System ROLLBACK: request a governed reversal of a committed effect.
+
+    Answered by a PROPOSAL (the compensation preview), whose tier drives the authority gate
+    — low-risk REVERSIBLE may self-heal within grant; high-value/COMPENSABLE is forced to a
+    human DECIDE. The previewed compensation is then executed through an ordinary COMMIT.
+    """
+
+    compensation_token: str = Field(min_length=8)
+    reason: RollbackReason
+    # Rolling back twice under one key replays the original compensation outcome; it never
+    # double-compensates. Optional: a System may mint the key itself on the answering proposal.
+    idempotency_key: str | None = Field(default=None, min_length=8)
 
 
 class QueryBody(NilModel):
@@ -201,6 +253,25 @@ class SsotRef(NilModel):
     read_after_write: bool | None = None
 
 
+class Compensation(NilModel):
+    """How a just-committed effect may later be reversed (emitted on the EVENT result).
+
+    `token` is the handle a future ROLLBACK references; it is present only when the effect
+    is actually reversible. After `expires_at` the reversal path is gone — effectively
+    IRREVERSIBLE in practice.
+    """
+
+    reversibility: Reversibility
+    token: str | None = Field(default=None, min_length=8)
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _token_iff_reversible(self) -> Self:
+        if self.reversibility is Reversibility.IRREVERSIBLE and self.token is not None:
+            raise ValueError("IRREVERSIBLE effects must not carry a compensation token")
+        return self
+
+
 class ResultEnvelope(NilModel):
     """The System-composed outcome (§11.1). `claim` bounds what we may tell a human."""
 
@@ -212,6 +283,7 @@ class ResultEnvelope(NilModel):
     replayed: bool | None = None
     data: dict[str, Any] | None = None
     data_gaps: tuple[str, ...] | None = None
+    compensation: Compensation | None = None
 
 
 class EventBody(NilModel):

@@ -8,7 +8,37 @@ must reproduce, automatically, what cost five manual attempts (plan Phase-2 DoD)
 
 from __future__ import annotations
 
-from nilscript.cli.scan.inference import build_manifest, infer
+from nilscript.cli.scan.inference import build_manifest, infer, propose_reversibility
+
+
+_CATALOG = [
+    "commerce.create_product", "commerce.delete_product",
+    "commerce.record_payment", "commerce.process_refund",
+    "commerce.send_message",
+]
+
+
+def test_infers_reversible_from_inverse_sibling() -> None:
+    out = propose_reversibility("commerce.create_product", _CATALOG)
+    assert out["reversibility"] == "REVERSIBLE"
+    assert out["compensation"]["verb"] == "commerce.delete_product"
+    assert out["compensation"]["arg_map"] == {"product_id": "$.result.entity.id"}
+
+
+def test_infers_compensable_from_offsetting_sibling() -> None:
+    out = propose_reversibility("commerce.record_payment", _CATALOG)
+    assert out["reversibility"] == "COMPENSABLE"
+    assert out["compensation"]["verb"] == "commerce.process_refund"
+
+
+def test_defaults_to_irreversible_when_no_reversal_exists() -> None:
+    out = propose_reversibility("commerce.send_message", _CATALOG)
+    assert out == {"reversibility": "IRREVERSIBLE"}
+
+
+def test_no_inverse_sibling_is_not_reversible() -> None:
+    # create_coupon has no delete_coupon in the catalog -> honest IRREVERSIBLE, not a guess.
+    assert propose_reversibility("commerce.create_coupon", _CATALOG)["reversibility"] == "IRREVERSIBLE"
 
 
 def test_link_validation_error_infers_a_prerequisite() -> None:

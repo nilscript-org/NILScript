@@ -75,6 +75,16 @@
         "initial_seconds": { "type": "number", "minimum": 0, "default": 2 }
       }
     },
+    "compensateWith": {
+      "type": "object",
+      "description": "The compensating action that reverses this step if the saga unwinds (ROLLBACK). `verb` is the compensating NIL verb; `args` derive from prior results by backward-only reference, keeping the program at least-power.",
+      "additionalProperties": false,
+      "required": ["verb"],
+      "properties": {
+        "verb": { "$ref": "#/$defs/nilVerb" },
+        "args": { "$ref": "#/$defs/args" }
+      }
+    },
     "nodeErrorPolicy": {
       "type": "object",
       "additionalProperties": false,
@@ -114,7 +124,8 @@
         "args": { "$ref": "#/$defs/args" },
         "next": { "anyOf": [{ "$ref": "#/$defs/nodeId" }, { "type": "null" }] },
         "retry_policy": { "$ref": "#/$defs/retryPolicy" },
-        "on_error": { "$ref": "#/$defs/nodeErrorPolicy" }
+        "on_error": { "$ref": "#/$defs/nodeErrorPolicy" },
+        "compensate_with": { "$ref": "#/$defs/compensateWith" }
       }
     },
 

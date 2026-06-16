@@ -28,7 +28,8 @@
         "COMMIT",
         "STATUS",
         "QUERY",
-        "EVENT"
+        "EVENT",
+        "ROLLBACK"
       ]
     },
     "grant": {

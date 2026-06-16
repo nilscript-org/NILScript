@@ -1,7 +1,7 @@
 """Build an OpenAPI 3.1 document for the NIL agent-plane endpoints from the bundled schemas.
 
 Pure transform: reads the standard's JSON Schemas and emits the one API surface every
-conformant backend (or its translation shim) exposes — the five endpoints, no backend
+conformant backend (or its translation shim) exposes — the six endpoints, no backend
 specifics. OpenAPI 3.1 is JSON-Schema-2020-12 compatible, so the standard's schemas drop in
 as components unchanged (minus the `$schema` meta key OpenAPI disallows on a component).
 """
@@ -28,7 +28,7 @@ def _resp(name: str, description: str) -> dict[str, Any]:
 
 
 def build_openapi() -> dict[str, Any]:
-    """Return the OpenAPI 3.1 document for the five NIL endpoints, as a plain dict."""
+    """Return the OpenAPI 3.1 document for the six NIL endpoints, as a plain dict."""
     components: dict[str, Any] = {}
     for filename, name in CORE_SCHEMAS.items():
         schema = load_core_schema(filename)
@@ -72,6 +72,16 @@ def build_openapi() -> dict[str, Any]:
                 "responses": {"200": _resp("Envelope", "Envelope(STATUS)")},
             }
         },
+        f"{_BASE}/rollback": {
+            "post": {
+                "operationId": "rollback",
+                "summary": "ROLLBACK — request a governed reversal. Answered by a PROPOSAL (compensation preview); no side effects.",
+                "requestBody": _body("RollbackBody"),
+                "responses": {
+                    "200": _resp("Envelope", "Envelope(PROPOSAL) — the compensation preview, or an IRREVERSIBLE refusal")
+                },
+            }
+        },
         "/webhooks/nil-events": {
             "post": {
                 "operationId": "event",
@@ -88,7 +98,7 @@ def build_openapi() -> dict[str, Any]:
             "title": "NIL Agent-Plane API",
             "version": SPEC_VERSION,
             "description": (
-                "The five endpoints every NIL-conformant backend (or its translation shim) "
+                "The six endpoints every NIL-conformant backend (or its translation shim) "
                 "exposes. Generated from the nilscript standard schemas; contains no backend "
                 "specifics."
             ),

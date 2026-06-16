@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nilscript.cli.manifest import diff, merge, shareable_violations
-from nilscript.cli.memory import MemoryStore, propose_manifest_patch
+from nilscript.cli.memory import MemoryStore, compute_spec_hash, propose_manifest_patch
 
 
 def _structural() -> dict:
@@ -92,3 +92,33 @@ def test_lesson_feeds_back_into_manifest_only_as_a_proposal() -> None:
     assert patch["verbs"]["services.create_invoice"]["hidden_requirements"][0]["field"] == "cost_center"
     # a non-structural lesson proposes nothing (no silent guesses)
     assert propose_manifest_patch({"payload": {"text": "just a note"}}) is None
+
+
+def test_reversal_is_recorded_immutably(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory.jsonl")
+    store.record_reversal(
+        verb="commerce.record_payment", tier="HIGH", outcome="compensated",
+        compensation_token="tok-2", approver="owner:DECIDE",
+    )
+    reversals = store.history("reversal")
+    assert len(reversals) == 1
+    assert reversals[0]["payload"]["outcome"] == "compensated"
+    assert reversals[0]["payload"]["approver"] == "owner:DECIDE"
+
+
+def test_ratification_anchor_is_content_addressed(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory.jsonl")
+    assert store.current_anchor() is None  # unratified
+    h = compute_spec_hash(["envelope-bytes", "rollback-bytes", "rfc-text"])
+    store.anchor_ratification(version="0.3.0", label="SEQRD-PC v1", spec_hash=h)
+    anchor = store.current_anchor()
+    assert anchor is not None
+    assert anchor["payload"]["spec_hash"] == h
+    assert anchor["payload"]["label"] == "SEQRD-PC v1"
+
+
+def test_spec_hash_is_order_independent_and_change_sensitive() -> None:
+    a = compute_spec_hash(["one", "two", "three"])
+    b = compute_spec_hash(["three", "one", "two"])
+    assert a == b  # reproducible regardless of read order
+    assert a != compute_spec_hash(["one", "two", "three!"])  # any byte change is detected

@@ -17,10 +17,18 @@ from nilscript.cli.scaffold import classify, scaffold_shim
 def test_scaffold_emits_the_expected_tree(tmp_path: Path) -> None:
     root = scaffold_shim("acme-nil-adapter", tmp_path)
     pkg = root / "src" / "acme_nil_adapter"
-    for expected in ("edge.py", "translate.py", "system.py", "state.py", "manifest.py", "models.py"):
+    for expected in ("edge.py", "translate.py", "system.py", "state.py", "manifest.py", "models.py", "compensation.py"):
         assert (pkg / expected).exists(), f"missing {expected}"
     assert (root / "requirements-manifest.json").exists()
     assert (root / "conformance" / "test_conformance.py").exists()
+
+
+def test_scaffold_emits_compensation_stub(tmp_path: Path) -> None:
+    root = scaffold_shim("acme-nil-adapter", tmp_path)
+    comp = (root / "src" / "acme_nil_adapter" / "compensation.py").read_text(encoding="utf-8")
+    assert "COMPENSATIONS" in comp
+    assert "IRREVERSIBLE" in comp  # the honest default for any unmapped verb
+    assert "def compensate(" in comp
 
 
 def test_parked_verb_is_marked_not_stubbed(tmp_path: Path) -> None:
