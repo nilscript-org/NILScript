@@ -168,6 +168,9 @@ class StatusBody(NilModel):
     proposal: str = Field(pattern=PROPOSAL_ID_PATTERN)
     state: ProposalState | None = None
     replayed: bool | None = None
+    # SEQRD-PC: a reversible/compensable executed write returns its compensation handle here
+    # (e.g. {"reversibility": "REVERSIBLE", "token": "..."}) so a later ROLLBACK can reference it.
+    compensation: dict[str, Any] | None = None
 
 
 class Candidate(NilModel):

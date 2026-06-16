@@ -30,6 +30,92 @@ def _verb_markers(verb) -> str:  # type: ignore[no-untyped-def]
     return ("  " + "  ".join(parts)) if parts else ""
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    """Execute a DSL program locally against a mounted NIL adapter — the headless kernel.
+
+    Validate (optionally, with --context) → walk the graph → drive the adapter via PROPOSE/COMMIT →
+    emit the execution trace. Headless and Temporal-free; durability is the Wosool Cloud upgrade.
+    """
+    import asyncio
+
+    from nilscript.kernel import LocalExecutor
+    from nilscript.sdk.client import NilClient
+    from nilscript.sdk.grants import GrantRef
+    from nilscript.sdk.transport import NilTransport
+
+    program = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+    inputs = json.loads(args.input) if args.input else None
+
+    if args.context:
+        from nilscript.kernel import ValidationContext, validate
+
+        ctx = ValidationContext.from_corpus(
+            json.loads(Path(args.context).read_text(encoding="utf-8"))
+        )
+        result = validate(program, ctx)
+        for d in result.diagnostics:
+            print(f"  {d.severity} {d.code}: {d.message}", file=sys.stderr)
+        if not result.ok:
+            print("refused: program failed validation", file=sys.stderr)
+            return 1
+
+    grant = GrantRef.from_secret(
+        grant_id=args.grant_id,
+        workspace=args.workspace or program.get("workspace", ""),
+        secret=args.bearer or "",
+        scopes=frozenset(args.scope) if args.scope else frozenset({"*"}),
+    )
+    transport = NilTransport(base_url=args.adapter_url, bearer_secret=args.bearer or "")
+    client = NilClient(transport=transport, grant=grant)
+    executor = LocalExecutor(
+        client, session_id="cli-session", run_id="cli-run", locale=program.get("locale", "ar")
+    )
+
+    async def _go():  # type: ignore[no-untyped-def]
+        try:
+            return await executor.execute(program, input=inputs)
+        finally:
+            await transport.aclose()
+
+    result = asyncio.run(_go())
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "completed": result.completed,
+                    "partial": result.partial,
+                    "blocked_at": result.blocked_at,
+                    "refusal": result.refusal,
+                    "compensated": result.compensated,
+                    "notifications": result.notifications,
+                    "context": result.context,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+    else:
+        status = (
+            "completed"
+            if result.completed
+            else ("compensated (partial)" if result.partial else "halted")
+        )
+        print(f"run {status}")
+        for nid, entry in result.context.items():
+            if nid == "input":
+                continue
+            print(f"  {nid}: {entry.get('output')}")
+        if result.refusal:
+            print(f"  refused at {result.refusal['node']}: {result.refusal['code']}")
+        if result.compensated:
+            print(f"  compensated: {', '.join(result.compensated)}")
+        for note in result.notifications:
+            print(f"  notify: {note.get('ar') or note.get('en')}")
+    return 0 if result.completed else 1
+
+
 def _cmd_verbs(args: argparse.Namespace) -> int:
     verbs = all_verbs()
     if args.json:
@@ -329,6 +415,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_manifest.add_argument("files", nargs="+", help="manifest path(s); merge: base + overrides, diff: OLD NEW")
     p_manifest.add_argument("-o", "--output", help="output file (for `strip`/`merge`)")
     p_manifest.set_defaults(func=_cmd_manifest)
+
+    p_run = sub.add_parser(
+        "run", help="execute a DSL program locally against a mounted NIL adapter (the kernel)"
+    )
+    p_run.add_argument("plan", help="path to the DSL program (e.g. plan.nil.json)")
+    p_run.add_argument("--adapter-url", required=True, help="base URL of a running NIL shim")
+    p_run.add_argument("--grant-id", default="local", help="agent-plane grant id")
+    p_run.add_argument("--workspace", help="workspace (defaults to the program's `workspace`)")
+    p_run.add_argument("--bearer", help="bearer token if the shim requires auth")
+    p_run.add_argument("--scope", action="append", help="grant scope (repeatable; default '*')")
+    p_run.add_argument("--input", help="JSON object seeding $.input.* references")
+    p_run.add_argument("--context", help="optional validation-context JSON; validates before running")
+    p_run.add_argument("--json", action="store_true", help="machine-readable execution trace")
+    p_run.set_defaults(func=_cmd_run)
 
     return parser
 
