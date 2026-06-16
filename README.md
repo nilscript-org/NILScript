@@ -84,7 +84,8 @@ The two layers:
 
 | Repo | Role |
 | --- | --- |
-| **nilscript** (this) | The protected core — CLI, generator, conformance engine, schemas. Never forked to build an adapter. |
+| **nilscript** (this) | The kernel + canonical JSON schemas — CLI, generator, conformance engine, runtime. `pip install nilscript`. |
+| [**nilscript-protocol**](https://github.com/nilscript-org/nilscript-protocol) | The constitution (docs only) — NIL spec, the DSL guides, SEQRD-PC, governance. |
 | [**nil-adapter-template**](https://github.com/nilscript-org/nil-adapter-template) | The fork base authors use ("Use this template"). Red until filled. |
 | [**pocketbase-nil-adapter**](https://github.com/nilscript-org/pocketbase-nil-adapter) | First 🟢 Official Verified Adapter — a real, conformant PocketBase shim (16/16). |
 
