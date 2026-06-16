@@ -254,7 +254,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="nilscript",
         description="Tooling to build and verify NIL adapters from the standard.",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=False)
 
     p_verbs = sub.add_parser("verbs", help="list the verb catalog from the standard")
     p_verbs.add_argument("--json", action="store_true", help="machine-readable output")
@@ -308,7 +308,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "command", None) is None:
+        # bare `nilscript` -> the banner, then the command list (never an error).
+        from nilscript.cli._banner import render
+
+        print(render())
+        parser.print_help()  # the command list, then a clean exit 0
+        return 0
     return int(args.func(args))
 
 

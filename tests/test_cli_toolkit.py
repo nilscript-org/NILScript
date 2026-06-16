@@ -90,6 +90,15 @@ def test_manifest_validate_flags_a_leak(tmp_path: Path, capsys) -> None:
     assert "LEAK" in capsys.readouterr().err
 
 
+def test_bare_invocation_shows_banner_and_commands(capsys) -> None:
+    rc = main([])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Welcome to NILScript" in out
+    assert "TRUST NO AGENT" in out
+    assert "scaffold-shim" in out  # the command list is shown too
+
+
 def test_scan_without_replay_explains_itself(capsys) -> None:
     rc = main(["scan", "--url", "https://x.example", "--safe"])
     assert rc == 2
