@@ -458,8 +458,11 @@ async def nil_rollback(target: str, token: str) -> dict:
             return {"ok": False, "error": f"{body.get('code')}: {body.get('message')}"}
         ts = datetime.now(UTC)
         outcome = await client.commit(body["id"], idempotency_key=nil_uuid("ui-rollback", ts.isoformat() + token, 0))
-        return {"ok": getattr(outcome, "state", None) == "executed",
-                "state": getattr(outcome, "state", None), "verb": body.get("verb")}
+        state = getattr(outcome, "state", None)
+        result = {"ok": state == "executed", "state": state, "verb": body.get("verb")}
+        if state != "executed":  # surface WHY (e.g. the backend rejected the compensating write)
+            result["error"] = f"compensation did not execute (state={state})"
+        return result
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     finally:
@@ -1251,7 +1254,7 @@ async function loadHistory(){
   const r=await (await fetch('/api/rollback',{method:'POST',headers:{'content-type':'application/json'},
    body:JSON.stringify({seq:+b.dataset.seq,target:b.dataset.tg})})).json();
   if(r.ok){add('sys','rolled back via '+(r.verb||'compensation'));loadHistory();}
-  else{b.textContent='↩ Rollback';add('msg bot','rollback failed: '+esc(r.error||''));}
+  else{b.textContent='↩ Rollback';add('msg bot','rollback failed: '+esc(r.error||r.state||'reversal did not execute'));}
  });
 }
 

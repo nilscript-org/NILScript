@@ -122,6 +122,24 @@ The standard is language-neutral JSON: a Go/TypeScript/Rust implementer reads th
 `src/nilscript/nil/` and `src/nilscript/dsl/` directly — no per-language package reserved (the
 OpenAPI / JSON-Schema model).
 
+## Benchmarks
+
+NIL is the layer between the agent and the backend, so we **instrument** established benchmarks and
+report a controlled A/B — same model, same attacks, **raw** vs **NIL-gated**. On the
+[InjecAgent](https://github.com/uiuc-kang-lab/InjecAgent) prompt-injection suite (ACL Findings 2024):
+
+![InjecAgent: unauthorized-write rate, raw vs NIL](bench/assets/injecagent_safety.svg)
+
+> Across **4,216 evaluations** (2 models × base+enhanced × 1,054 cases), agents were hijacked into an
+> unauthorized write 0–4.5% of the time; **through NIL those writes commit 0.00%**, while benign tasks
+> stay at **100%**. The result is model- and attack-independent — NIL's defense is structural
+> (propose→approve→commit), not a smarter model.
+
+Method, caveats, and the full plan (all four axes — task-success, safety, conformance, performance):
+[`docs/benchmarking-plan.md`](docs/benchmarking-plan.md) · harness + how to reproduce:
+[`bench/`](bench/). *(Single-step harness, not InjecAgent's two-step ReAct; ASRs are harness-specific
+— only the NIL→0 result is the comparable claim. See the plan's credibility notes.)*
+
 ## Where it stands
 
 - ✅ **Spec v0.2** released (the NIL spec in [nilscript-protocol](https://github.com/nilscript-org/nilscript-protocol/tree/main/nil)); SEQRD-PC / ROLLBACK in the toolkit.
