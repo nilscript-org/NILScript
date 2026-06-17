@@ -7,3 +7,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# demo runtime state (never commit a session key)
+demo/.nil-ui-state.json

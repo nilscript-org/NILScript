@@ -19,6 +19,17 @@
 
 ---
 
+## New in 0.3.0
+
+- **Discovery handshake** — every adapter exposes `GET /nil/v0.1/describe` returning its *skeleton*: `{nil, system, verbs, targets:{name:{exists, fields[]}}}`. The SDK `handshake(transport)` connects any client uniformly: **reachable → conformant → provisioned**.
+- **Mandatory conformance row** — `exposes_describe_skeleton` is now the first check; the matrix is 11 rows. A shim without a valid describe is non-conformant.
+- **PROPOSE preflight** — a verb whose native target isn't provisioned is **refused at PROPOSE** (`UPSTREAM_UNAVAILABLE`), not failed after COMMIT.
+- **Generic `resource.*` family** (`resource-v1` profiles) — `create / read / update / delete` over **any** target the skeleton exposes, with **no per-entity verb authoring**. `read` is a QUERY; writes ride PROPOSE→COMMIT.
+- **Synthesized reversibility** — generic writes are reversible with no per-verb mapping: create→delete, update→restore *before-image*, delete→recreate, all via the standard `ROLLBACK`.
+- **Identifier resolution** — `update`/`delete` accept a real id *or* a human identifier (code/name/…), resolved server-side.
+- **`STATUS.result`** — a COMMIT returns the SSOT result: `entity{type,id,url}` + `ssot{system,read_after_write}` + compensation handle.
+- **Adapter I/O interface** gained `exists(target)`, `schema(target)`, `get(target,id)`; `scaffold-shim` emits all of the above (skeleton-aware adapters by default).
+
 ## Why
 
 - **Every agent↔system integration is rebuilt from scratch.** NIL is the neutral wire contract, so you build an adapter *once*.
