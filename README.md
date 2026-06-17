@@ -122,23 +122,38 @@ The standard is language-neutral JSON: a Go/TypeScript/Rust implementer reads th
 `src/nilscript/nil/` and `src/nilscript/dsl/` directly — no per-language package reserved (the
 OpenAPI / JSON-Schema model).
 
-## Benchmarks
+## Benchmarks — the numbers
 
-NIL is the layer between the agent and the backend, so we **instrument** established benchmarks and
-report a controlled A/B — same model, same attacks, **raw** vs **NIL-gated**. On the
-[InjecAgent](https://github.com/uiuc-kang-lab/InjecAgent) prompt-injection suite (ACL Findings 2024):
+A safety layer is only worth anything if the numbers move. So we took the
+[InjecAgent](https://github.com/uiuc-kang-lab/InjecAgent) prompt-injection suite (ACL Findings 2024) —
+where a poisoned tool response tries to hijack the agent into an unauthorized write — and ran it
+**twice per case**: the agent calling tools directly (**raw**), and the same agent routed through NIL
+(**gated**). Same model, same attacks. Only the gate differs.
 
-![InjecAgent: unauthorized-write rate, raw vs NIL](bench/assets/injecagent_safety.svg)
+![InjecAgent: unauthorized-write rate, raw vs NIL — zero through NIL across every model and setting](bench/assets/injecagent_safety.svg)
 
-> Across **4,216 evaluations** (2 models × base+enhanced × 1,054 cases), agents were hijacked into an
-> unauthorized write 0–4.5% of the time; **through NIL those writes commit 0.00%**, while benign tasks
-> stay at **100%**. The result is model- and attack-independent — NIL's defense is structural
-> (propose→approve→commit), not a smarter model.
+| | Raw agent | **Through NIL** |
+|---|---|---|
+| Unauthorized writes committed | **up to 4.46%** | **0.00%** |
+| Benign tasks completed | 100% | **100%** |
+| Evaluations | — | **4,216** (2 models × base+enhanced × 1,054 cases) |
 
-Method, caveats, and the full plan (all four axes — task-success, safety, conformance, performance):
-[`docs/benchmarking-plan.md`](docs/benchmarking-plan.md) · harness + how to reproduce:
-[`bench/`](bench/). *(Single-step harness, not InjecAgent's two-step ReAct; ASRs are harness-specific
-— only the NIL→0 result is the comparable claim. See the plan's credibility notes.)*
+**Read that again.** Across **4,216** attacks, on two different models, under both the standard and the
+*reinforced* injection setting, the number of unauthorized writes that reached the backend through NIL
+was **zero** — and it cost nothing: every legitimate task still completed. The raw agents were hijacked
+into a real write on **up to 1 in 22** cases; NIL committed **none** of them.
+
+That gap isn't a better prompt or a smarter model — it's **structural**. A write physically cannot
+commit without a previewed `propose → approve → commit`, and the agent can only name verbs the backend
+actually exposes. Change the model and the raw hijack rate moves; **the NIL column stays 0.**
+
+> Honesty matters as much as the numbers: this harness uses a single-step decision (not InjecAgent's
+> two-step ReAct), so the *raw* hijack rates here (0–4.46%) sit below the paper's 24% GPT-4 baseline and
+> are **harness-specific** — the comparable, defensible claim is the **NIL → 0**, reported alongside
+> 100% benign success (never the safety number alone).
+
+Full method, the other three axes (task-success, conformance, performance), and credibility notes:
+[`docs/benchmarking-plan.md`](docs/benchmarking-plan.md). Reproduce it: [`bench/`](bench/).
 
 ## Where it stands
 
