@@ -6,4 +6,7 @@ recursive-include src/nilscript/nil *.json *.md
 recursive-include src/nilscript/dsl *.json *.md
 recursive-include src/nilscript/docs *.md
 recursive-include src/nilscript/sdk *.json *.md
+# The reference Playground (with the pocketbase adapter vendored inside it) ships too,
+# so `nilscript demo` works from an sdist install as well as the wheel.
+recursive-include src/nilscript/demo *.py *.md
 global-exclude __pycache__ *.py[cod]

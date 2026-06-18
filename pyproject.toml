@@ -25,11 +25,11 @@ sdk = ["httpx>=0.27", "pydantic>=2.0"]
 # `export-openapi --format yaml`; pydantic backs `scaffold-shim`'s model generation
 # (cli/scaffold/_models.py). The base package stays dependency-free — these deps live only here.
 cli = ["pyyaml>=6.0", "pydantic>=2.0"]
-# The reference Playground (demo/): a FastAPI chat UI that drives a live NIL shim through the SDK,
-# with an LLM planner (LiteLLM, any OpenAI-compatible provider). `nilscript demo` launches it.
-# Both shims (in-memory sandbox + live PocketBase) import the pocketbase adapter, which is not on
-# PyPI — install it from the sibling checkout: `pip install -e ../adapters/pocketbase-nil-adapter`
-# (the demo README + Playground deploy notes cover this). These are the pure-PyPI runtime deps.
+# The reference Playground (src/nilscript/demo/): a FastAPI chat UI that drives a live NIL shim
+# through the SDK, with an LLM planner (LiteLLM, any OpenAI-compatible provider). `nilscript demo`
+# launches it. The pocketbase adapter the shims need is vendored *inside* the demo
+# (src/nilscript/demo/pocketbase_nil_adapter/, a demo file), so this extra is fully self-contained
+# on PyPI — no sibling checkout required. The adapter only needs fastapi + pydantic, both below.
 demo = [
   "nilscript[sdk]",
   "fastapi>=0.110",
@@ -77,4 +77,8 @@ nilscript = [
   "sdk/py.typed",
   "sdk/**/*.json",
   "sdk/**/*.md",
+  # The reference Playground ships with the wheel so `nilscript demo` runs from a pip install.
+  # The pocketbase adapter is vendored inside demo/ (a demo file), included by these globs.
+  "demo/**/*.py",
+  "demo/**/*.md",
 ]

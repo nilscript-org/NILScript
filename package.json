@@ -1,0 +1,26 @@
+{
+  "name": "nilscript",
+  "version": "0.3.0",
+  "description": "The neutral standard for connecting systems to agents — Network Intent Layer (NIL) + the nilscript DSL. This npm entry is a pointer; the spec, schemas, SDK and CLI live at nilscript.org and on PyPI (`pip install nilscript`).",
+  "keywords": [
+    "nil",
+    "nilscript",
+    "agents",
+    "intent",
+    "standard",
+    "dsl",
+    "json-schema"
+  ],
+  "homepage": "https://nilscript.org",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nilscript-org/nilscript.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nilscript-org/nilscript/issues"
+  },
+  "license": "Apache-2.0 AND CC-BY-4.0",
+  "files": [
+    "README.md"
+  ]
+}

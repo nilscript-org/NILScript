@@ -46,9 +46,12 @@ norm() {
 hdr "A · kernel (single source for sdk/ + cli/)"
 KVER="$(grep -m1 '^version = ' "$KERNEL/pyproject.toml" | tr -d ' "' | cut -d= -f2)"
 [[ "$KVER" == "0.3.0" ]] && ok "kernel version = 0.3.0" || bad "kernel version = $KVER (expected 0.3.0)"
-# the demo must consume the installed SDK, not a vendored copy
-if grep -rqE "^(from|import) nilscript\.sdk" "$KERNEL/demo" 2>/dev/null \
-   && ! find "$KERNEL/demo" -name '*.py' -path '*sdk*' | grep -q .; then
+# the demo must consume the installed SDK, not a vendored copy (the demo now lives inside the
+# package at src/nilscript/demo/; the pocketbase adapter is vendored there as a demo file, but the
+# SDK must still come from the kernel)
+DEMO_DIR="$KERNEL/src/nilscript/demo"
+if grep -rqE "^(from|import) nilscript\.sdk" "$DEMO_DIR" 2>/dev/null \
+   && ! find "$DEMO_DIR" -name '*.py' -path '*/sdk/*' | grep -q .; then
   ok "demo imports the kernel SDK (no vendored copy)"
 else
   warn "could not confirm demo uses the installed SDK"
