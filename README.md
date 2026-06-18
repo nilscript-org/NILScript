@@ -1,6 +1,6 @@
 <div align="center">
 
-# nilscript
+# NIL Script
 
 ### Give an AI agent real power over your systems — and take on zero risk doing it.
 
