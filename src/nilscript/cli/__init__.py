@@ -363,9 +363,10 @@ def _cmd_conformance_test(args: argparse.Namespace) -> int:
 def _find_demo_dir() -> Path | None:
     """Locate the reference Playground's demo/ directory.
 
-    The demo ships alongside the source tree (repo_root/demo/), not inside the importable
-    package, so an editable/source checkout finds it by walking up from this module. An
-    explicit NILSCRIPT_DEMO_DIR override wins (e.g. a packaged or relocated install)."""
+    The demo ships *inside* the package at nilscript/demo/ (so `pip install nilscript[demo]`
+    is self-contained — the pocketbase adapter is vendored there as a demo file). Walking up
+    from this module finds it both in an installed wheel (site-packages/nilscript/demo/) and an
+    editable/source checkout (src/nilscript/demo/). An explicit NILSCRIPT_DEMO_DIR override wins."""
     override = os.environ.get("NILSCRIPT_DEMO_DIR")
     if override:
         cand = Path(override)
