@@ -80,3 +80,58 @@ def test_healthz_reports_count() -> None:
     s.ingest(_event(1), 1)
     client = TestClient(create_app(s, secret=""))
     assert client.get("/healthz").json() == {"status": "ok", "events": 1}
+
+
+# ── human-approval gate (Phase 2) ────────────────────────────────────────────────────────────
+
+def _proposed(seq, *, proposal, verb="commerce.process_refund", tier="HIGH"):
+    return {
+        "nil": "0.1", "id": f"prop{seq}", "performative": "EVENT", "grant": "g1", "workspace": "",
+        "body": {"event": "proposed", "proposal": proposal, "verb": verb, "tier": tier,
+                 "preview": {"en": f"Refund {proposal}", "ar": "استرداد"}},
+    }
+
+
+def test_await_then_decision_flow() -> None:
+    s = _store()
+    s.ingest(_proposed(1, proposal="px"), 1)  # the control plane saw the intent
+    assert s.decision("px") == "unknown"
+    s.await_approval("px")
+    assert s.decision("px") == "pending"
+    # the pending card is enriched from the proposed event
+    p = s.pending()[0]
+    assert p["proposal_id"] == "px" and p["verb"] == "commerce.process_refund" and p["tier"] == "HIGH"
+    assert s.decide("px", "approved", actor="owner") is True
+    assert s.decision("px") == "approved"
+    assert s.pending() == []
+
+
+def test_decide_only_transitions_pending() -> None:
+    s = _store()
+    s.await_approval("py")
+    assert s.decide("py", "rejected") is True
+    assert s.decide("py", "approved") is False  # already decided → no-op
+    assert s.decision("py") == "rejected"
+
+
+def test_await_is_idempotent() -> None:
+    s = _store()
+    s.await_approval("pz")
+    s.decide("pz", "approved")
+    s.await_approval("pz")  # must not reset an approved decision
+    assert s.decision("pz") == "approved"
+
+
+def test_approval_endpoints() -> None:
+    s = _store()
+    s.ingest(_proposed(1, proposal="pe", verb="commerce.create_product", tier="HIGH"), 1)
+    client = TestClient(create_app(s, secret=""))
+    assert client.post("/proposals/pe/await").json()["status"] == "pending"
+    assert client.get("/proposals/pe/decision").json()["status"] == "pending"
+    assert client.get("/api/pending").json()["pending"][0]["proposal_id"] == "pe"
+    bad = client.post("/proposals/pe/decision", json={"status": "maybe"})
+    assert bad.status_code == 400
+    ok = client.post("/proposals/pe/decision", json={"status": "approved", "actor": "me"})
+    assert ok.json()["status"] == "approved"
+    assert client.get("/proposals/pe/decision").json()["status"] == "approved"
+    assert client.get("/api/pending").json()["pending"] == []

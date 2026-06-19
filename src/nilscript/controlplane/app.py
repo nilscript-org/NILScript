@@ -53,6 +53,35 @@ def create_app(store: EventStore | None = None, *, secret: str | None = None) ->
     def events(limit: int = 100) -> dict[str, Any]:
         return {"events": store.recent(limit)}
 
+    # ── human-approval gate (Phase 2) ────────────────────────────────────────────────────────
+    @app.post("/proposals/{proposal_id}/await")
+    def await_approval(proposal_id: str) -> dict[str, Any]:
+        """Called by the gate when it holds a proposal for owner approval."""
+        return store.await_approval(proposal_id)
+
+    @app.get("/proposals/{proposal_id}/decision")
+    def get_decision(proposal_id: str) -> dict[str, Any]:
+        """Polled by the gate before it commits a held proposal."""
+        return {"proposal_id": proposal_id, "status": store.decision(proposal_id)}
+
+    @app.post("/proposals/{proposal_id}/decision")
+    async def post_decision(proposal_id: str, request: Request) -> Any:
+        """Owner approves/rejects from the UI."""
+        body = {}
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = {}
+        status = body.get("status")
+        if status not in ("approved", "rejected"):
+            return JSONResponse({"error": "status must be 'approved' or 'rejected'"}, status_code=400)
+        ok = store.decide(proposal_id, status, actor=body.get("actor", "owner"), reason=body.get("reason", ""))
+        return {"ok": ok, "proposal_id": proposal_id, "status": store.decision(proposal_id)}
+
+    @app.get("/api/pending")
+    def pending() -> dict[str, Any]:
+        return {"pending": store.pending()}
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         return _INDEX_HTML
@@ -80,9 +109,21 @@ _INDEX_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
   .re{color:var(--crit);border-color:var(--crit)} .ro{color:var(--hi);border-color:var(--hi)}
   .tier-HIGH{color:var(--hi)} .tier-CRITICAL{color:var(--crit)}
   .src{color:var(--mut)} .empty{padding:40px 22px;color:var(--mut)}
+  #pending{padding:0}
+  .pcard{display:flex;align-items:center;gap:14px;padding:14px 22px;border-bottom:1px solid var(--line);
+    background:linear-gradient(90deg,rgba(210,153,34,.07),transparent)}
+  .pcard .grow{flex:1}.pcard .pv{color:#79c0ff;font-weight:600}.pcard .pp{color:var(--mut);font-size:13px}
+  .btn{padding:6px 14px;border-radius:7px;border:1px solid var(--line);background:transparent;
+    color:var(--fg);cursor:pointer;font:inherit}
+  .btn.ok{color:var(--ok);border-color:var(--ok)}.btn.no{color:var(--crit);border-color:var(--crit)}
+  .btn:hover{filter:brightness(1.3)}
+  .phead{padding:12px 22px;color:var(--hi);font-size:12px;text-transform:uppercase;letter-spacing:.04em;
+    border-bottom:1px solid var(--line);display:none}
 </style></head><body>
 <header><span class=dot></span><h1>nilscript · control plane</h1>
   <span class=sub id=meta>— one pane for every agent action</span></header>
+<div class=phead id=phead>⏳ pending approval — nothing commits until you decide</div>
+<section id=pending></section>
 <table><thead><tr><th>time</th><th>source</th><th>event</th><th>verb</th><th>tier</th>
   <th>proposal</th><th>workspace</th></tr></thead><tbody id=rows></tbody></table>
 <div class=empty id=empty>waiting for events…</div>
@@ -106,7 +147,25 @@ async function tick(){
     }).join('');
   }catch(_){}
 }
-tick();setInterval(tick,2000);
+async function decide(id,status){
+  await fetch('/proposals/'+id+'/decision',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({status})});
+  pend();tick();
+}
+async function pend(){
+  try{
+    const r=await fetch('/api/pending');const {pending}=await r.json();
+    const sec=document.getElementById('pending');document.getElementById('phead').style.display=pending.length?'block':'none';
+    sec.innerHTML=pending.map(p=>{
+      let pv='';try{const o=JSON.parse(p.preview);pv=(o&&(o.en||o.ar))||'';}catch(_){}
+      return `<div class=pcard><div class=grow><span class=pv>${p.verb||''}</span> `+
+        `<span class="pill tier-${p.tier||''}">${p.tier||''}</span><div class=pp>${pv} · ${(p.proposal_id||'').slice(0,12)}</div></div>`+
+        `<button class="btn ok" onclick="decide('${p.proposal_id}','approved')">Approve</button>`+
+        `<button class="btn no" onclick="decide('${p.proposal_id}','rejected')">Reject</button></div>`;
+    }).join('');
+  }catch(_){}
+}
+tick();pend();setInterval(()=>{tick();pend();},2000);
 </script></body></html>"""
 
 
