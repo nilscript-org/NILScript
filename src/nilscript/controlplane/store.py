@@ -31,6 +31,18 @@ CREATE TABLE IF NOT EXISTS events (
     envelope     TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_events_id ON events(id DESC);
+
+CREATE TABLE IF NOT EXISTS approvals (
+    proposal_id TEXT PRIMARY KEY,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    verb        TEXT,
+    tier        TEXT,
+    preview     TEXT,
+    actor       TEXT,
+    reason      TEXT,
+    created_at  TEXT NOT NULL,
+    decided_at  TEXT
+);
 """
 
 
@@ -101,3 +113,67 @@ class EventStore:
     def count(self) -> int:
         with self._lock:
             return int(self._conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"])
+
+    # ── human-approval gate (Phase 2) ────────────────────────────────────────────────────────
+    def _enrich(self, proposal_id: str) -> dict[str, Any]:
+        """Pull verb/tier/preview from the proposal's 'proposed' event (the control plane already
+        received it from the adapter), so the approval card shows the full intent."""
+        row = self._conn.execute(
+            "SELECT verb, tier, envelope FROM events WHERE proposal = ? AND event = 'proposed' "
+            "ORDER BY id DESC LIMIT 1",
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            return {"verb": None, "tier": None, "preview": None}
+        preview = None
+        try:
+            preview = json.dumps((json.loads(row["envelope"]).get("body") or {}).get("preview"))
+        except (ValueError, TypeError):
+            preview = None
+        return {"verb": row["verb"], "tier": row["tier"], "preview": preview}
+
+    def await_approval(self, proposal_id: str) -> dict[str, Any]:
+        """Register a proposal as awaiting human approval (idempotent — keeps an existing decision)."""
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT status FROM approvals WHERE proposal_id = ?", (proposal_id,)
+            ).fetchone()
+            if existing is not None:
+                return {"proposal_id": proposal_id, "status": existing["status"]}
+            meta = self._enrich(proposal_id)
+            self._conn.execute(
+                "INSERT INTO approvals (proposal_id, status, verb, tier, preview, created_at) "
+                "VALUES (?, 'pending', ?, ?, ?, ?)",
+                (proposal_id, meta["verb"], meta["tier"], meta["preview"], _now()),
+            )
+            self._conn.commit()
+        return {"proposal_id": proposal_id, "status": "pending"}
+
+    def decision(self, proposal_id: str) -> str:
+        """'pending' | 'approved' | 'rejected' | 'unknown' (never registered)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM approvals WHERE proposal_id = ?", (proposal_id,)
+            ).fetchone()
+        return row["status"] if row is not None else "unknown"
+
+    def decide(self, proposal_id: str, status: str, *, actor: str = "", reason: str = "") -> bool:
+        """Owner decision. Only transitions a 'pending' row; returns False otherwise (idempotent/guarded)."""
+        if status not in ("approved", "rejected"):
+            raise ValueError("status must be 'approved' or 'rejected'")
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE approvals SET status = ?, actor = ?, reason = ?, decided_at = ? "
+                "WHERE proposal_id = ? AND status = 'pending'",
+                (status, actor, reason, _now(), proposal_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def pending(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT proposal_id, verb, tier, preview, created_at FROM approvals "
+                "WHERE status = 'pending' ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]

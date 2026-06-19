@@ -19,8 +19,11 @@ The safety model is the SDK's, unchanged:
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from typing import Any
+
+import httpx
 
 from nilscript.sdk.client import NilClient
 from nilscript.sdk.connect import handshake
@@ -102,7 +105,7 @@ class NilTools:
     async def commit(self, proposal_id: str, *, session_id: str | None = None) -> dict[str, Any]:
         """COMMIT a previously previewed proposal — the only tool that mutates the backend."""
         sid = self._sid(session_id)
-        gate_block = self._gate_blocks(sid, proposal_id)
+        gate_block = await self._gate_decision(sid, proposal_id)
         if gate_block is not None:
             return gate_block
         key = commit_idempotency_key(sid, proposal_id)
@@ -135,18 +138,51 @@ class NilTools:
         self._remember(sid, preview)  # so the reversal's own commit can be tier-gated
         return preview.model_dump(mode="json", exclude_none=True)
 
-    def _gate_blocks(self, sid: str, proposal_id: str) -> dict[str, Any] | None:
+    def _approval_required(self, tier: str, note: str = "") -> dict[str, Any]:
+        return {
+            "committed": False,
+            "outcome": "approval_required",
+            "tier": tier,
+            "message": (
+                f"gate=human: a {tier} proposal needs owner approval in the control plane before "
+                f"commit; lower tiers commit directly.{(' ' + note) if note else ''}"
+            ),
+        }
+
+    async def _gate_decision(self, sid: str, proposal_id: str) -> dict[str, Any] | None:
+        """Human gate: HIGH/CRITICAL proposals are HELD until the owner decides in the control plane.
+
+        Returns None to allow the commit (gate off, low tier, or owner-approved); otherwise an
+        approval_required / rejected envelope. Fails SAFE — if the control plane is unreachable, a
+        gated proposal is held, never auto-committed.
+        """
         if self._gate != "human":
             return None
         tier = self._proposals.get(sid, {}).get(proposal_id, {}).get("tier")
-        if tier in GATED_TIERS:
+        if tier not in GATED_TIERS:
+            return None  # low tiers commit directly even in human mode
+        base = os.environ.get("NIL_APPROVAL_URL", "").rstrip("/")
+        if not base:
+            return self._approval_required(tier, "(no control plane configured)")
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                resp = await c.get(f"{base}/proposals/{proposal_id}/decision")
+                status = resp.json().get("status") if resp.status_code < 400 else "unknown"
+        except (httpx.HTTPError, ValueError):
+            return self._approval_required(tier, "(control plane unreachable; holding)")
+        if status == "approved":
+            return None  # the owner approved → the write proceeds
+        if status == "rejected":
             return {
                 "committed": False,
-                "outcome": "approval_required",
+                "outcome": "rejected",
                 "tier": tier,
-                "message": (
-                    f"gate=human: a {tier} proposal needs an out-of-band owner approval "
-                    "(DECIDE) before commit; lower tiers commit directly"
-                ),
+                "message": f"gate=human: a {tier} proposal was REJECTED by the owner; not committed",
             }
-        return None
+        # pending / unknown → register it for approval and hold
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                await c.post(f"{base}/proposals/{proposal_id}/await")
+        except httpx.HTTPError:
+            pass
+        return self._approval_required(tier)
