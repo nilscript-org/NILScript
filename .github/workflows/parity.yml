@@ -30,7 +30,7 @@ jobs:
         with:
           repository: nilscript-org/pocketbase-nil-adapter
           path: nizam/adapters/pocketbase-nil-adapter
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install deps (kernel dev extra covers pytest/httpx/fastapi/pydantic)
