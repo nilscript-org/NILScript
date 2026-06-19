@@ -1,0 +1,13 @@
+{
+  "config": {
+    "provider": "",
+    "model": "",
+    "api_key": "",
+    "api_base": ""
+  },
+  "live_creds": {
+    "url": "https://pocketbase.io",
+    "identity": "test@example.com",
+    "password": "123456"
+  }
+}

@@ -36,9 +36,18 @@ demo = [
   "uvicorn>=0.29",
   "litellm>=1.40",
 ]
+# The generic NIL-MCP server (src/nilscript/mcp/): one front door so any MCP-compatible agent
+# (Claude, Cursor, …) connects once and drives any mounted NIL adapter through governed
+# propose→approve→commit→rollback. `nilscript mcp --adapter-url <shim>` launches it over stdio.
+# A thin layer over the SDK's NilClient + handshake — pulls the MCP SDK on top of [sdk].
+mcp = [
+  "nilscript[sdk]",
+  "mcp>=1.2",
+]
 dev = [
   "nilscript[sdk]",
   "nilscript[cli]",
+  "mcp>=1.2",  # the MCP server's unit tests import nilscript.mcp
   "pytest",
   "pytest-asyncio>=0.24",
   "respx",
@@ -77,6 +86,8 @@ nilscript = [
   "sdk/py.typed",
   "sdk/**/*.json",
   "sdk/**/*.md",
+  # The "Using NILScript" agent skill ships with the MCP server (the recipe alongside the kitchen).
+  "mcp/*.md",
   # The reference Playground ships with the wheel so `nilscript demo` runs from a pip install.
   # The pocketbase adapter is vendored inside demo/ (a demo file), included by these globs.
   "demo/**/*.py",

@@ -24,6 +24,8 @@ from nilscript.sdk.sentences import (
     ProposalBody,
     ProposeBody,
     QueryBody,
+    RollbackBody,
+    RollbackReason,
     StatusBody,
     make_envelope,
 )
@@ -35,6 +37,7 @@ PROPOSE_PATH = "/nil/v0.1/propose"
 COMMIT_PATH = "/nil/v0.1/commit"
 QUERY_PATH = "/nil/v0.1/query"
 STATUS_PATH = "/nil/v0.1/status"
+ROLLBACK_PATH = "/nil/v0.1/rollback"
 
 CommitOutcome = StatusBody | ProposalBody
 
@@ -155,6 +158,39 @@ class NilClient:
         if not isinstance(data, dict):
             raise NilProtocolError("query answer must be an object with a 'data' member")
         return data
+
+    async def rollback(
+        self,
+        compensation_token: str,
+        reason: RollbackReason,
+        *,
+        idempotency_key: str | None = None,
+        ts: datetime | None = None,
+        trace: str | None = None,
+    ) -> ProposalBody:
+        """Request a governed reversal of a committed effect (the backward-recovery primitive).
+
+        ROLLBACK never executes anything: it is answered by a PROPOSAL — the *compensation
+        preview*, whose tier drives the authority gate — which the caller then executes through
+        the ordinary commit(). An irreversible/expired effect comes back as a refusal
+        (IRREVERSIBLE / COMPENSATION_EXPIRED), never a silent corrective write. Refusals are
+        returned values, exactly like propose().
+        """
+        envelope = make_envelope(
+            Performative.ROLLBACK,
+            RollbackBody(
+                compensation_token=compensation_token,
+                reason=reason,
+                idempotency_key=idempotency_key,
+            ),
+            sentence_id=idempotency_key if idempotency_key is not None else self._id_factory(),
+            grant=self._grant.grant_id,
+            workspace=self._grant.workspace,
+            ts=ts if ts is not None else _utcnow(),
+            trace=trace,
+        )
+        answer = await self._transport.post_sentence(ROLLBACK_PATH, envelope.to_wire())
+        return self._parse_proposal(answer)
 
     async def status(self, proposal_id: str) -> StatusBody:
         if not _SAFE_PROPOSAL_ID.match(proposal_id):
