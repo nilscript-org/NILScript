@@ -402,6 +402,42 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     return subprocess.call([sys.executable, "demo_ui.py"], cwd=str(demo_dir), env=env)
 
 
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    """Serve the generic NIL-MCP server: any MCP-compatible agent drives the mounted adapter.
+
+    One front door over the same wiring `nilscript run` uses; every write stays two-step
+    (propose→commit). The bearer secret is read from an env var (never a process arg) and held by
+    the server — the agent never sees the backend credential.
+    """
+    try:
+        from nilscript.mcp.server import serve
+    except ModuleNotFoundError:
+        print("the MCP server needs the MCP SDK (pip install nilscript[mcp])", file=sys.stderr)
+        return 2
+
+    if args.grant_secret_env:
+        bearer = os.environ.get(args.grant_secret_env, "")
+    else:
+        bearer = args.bearer or ""
+    scopes = frozenset(args.scope) if args.scope else None
+    print(
+        f"nilscript mcp → adapter {args.adapter_url}  (gate={args.gate}, transport={args.transport}, "
+        f"dynamic_tools={not args.no_dynamic_tools})",
+        file=sys.stderr,
+    )
+    serve(
+        adapter_url=args.adapter_url,
+        grant_id=args.grant_id,
+        workspace=args.workspace or "",
+        bearer=bearer,
+        scopes=scopes,
+        gate=args.gate,
+        transport=args.transport,
+        dynamic_tools=not args.no_dynamic_tools,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nilscript",
@@ -479,6 +515,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo = sub.add_parser("demo", help="launch the reference Playground UI (needs nilscript[demo])")
     p_demo.add_argument("--port", type=int, default=8770, help="port to serve the Playground on (default 8770)")
     p_demo.set_defaults(func=_cmd_demo)
+
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="serve the generic NIL-MCP server for any MCP-compatible agent (needs nilscript[mcp])",
+    )
+    p_mcp.add_argument("--adapter-url", required=True, help="base URL of a running NIL shim")
+    p_mcp.add_argument("--grant-id", default="local", help="agent-plane grant id")
+    p_mcp.add_argument("--workspace", help="workspace")
+    p_mcp.add_argument(
+        "--grant-secret-env",
+        help="name of an env var holding the bearer secret (preferred over --bearer)",
+    )
+    p_mcp.add_argument("--bearer", help="bearer token if the shim requires auth")
+    p_mcp.add_argument("--scope", action="append", help="grant scope (repeatable; default '*')")
+    p_mcp.add_argument(
+        "--gate",
+        choices=["two-step", "human", "auto"],
+        default="two-step",
+        help="commit gate policy (default two-step)",
+    )
+    p_mcp.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+        help="MCP transport (default stdio)",
+    )
+    p_mcp.add_argument(
+        "--no-dynamic-tools",
+        action="store_true",
+        help="register only the six generic primitives (skip per-verb propose_<verb> tools)",
+    )
+    p_mcp.set_defaults(func=_cmd_mcp)
 
     return parser
 

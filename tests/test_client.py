@@ -134,6 +134,50 @@ async def test_commit_refusal_returns_proposal_body() -> None:
     assert outcome.code is RefusalCode.EXPIRED
 
 
+ROLLBACK_PREVIEW_BODY = {
+    "outcome": "proposal",
+    "id": "comp-0001",
+    "verb": "services.issue_credit_note",
+    "tier": "HIGH",
+    "preview": {"ar": "إشعار دائن لعكس الفاتورة"},
+    "expires_at": "2026-06-13T07:00:00Z",
+}
+
+
+@respx.mock
+async def test_rollback_requests_compensation_preview() -> None:
+    from nilscript.sdk.sentences import RollbackReason
+
+    route = respx.post(f"{BASE}/nil/v0.1/rollback").mock(
+        return_value=httpx.Response(200, json=server_envelope("PROPOSAL", ROLLBACK_PREVIEW_BODY))
+    )
+    preview = await make_client().rollback("token-abcdefgh", RollbackReason.OWNER_CANCEL)
+    assert isinstance(preview, ProposalBody)
+    assert not preview.is_refusal
+    assert preview.verb == "services.issue_credit_note"
+    wire = json.loads(route.calls.last.request.content)
+    assert wire["performative"] == "ROLLBACK"
+    assert wire["body"]["compensation_token"] == "token-abcdefgh"
+    assert wire["body"]["reason"] == "owner_cancel"
+
+
+@respx.mock
+async def test_rollback_irreversible_is_refusal_not_raise() -> None:
+    from nilscript.sdk.sentences import RollbackReason
+
+    respx.post(f"{BASE}/nil/v0.1/rollback").mock(
+        return_value=httpx.Response(
+            200,
+            json=server_envelope(
+                "PROPOSAL", {"outcome": "refusal", "code": "IRREVERSIBLE", "message": "cannot un-send"}
+            ),
+        )
+    )
+    result = await make_client().rollback("token-abcdefgh", RollbackReason.AGENT_REPAIR)
+    assert result.is_refusal
+    assert result.code is RefusalCode.IRREVERSIBLE
+
+
 @respx.mock
 async def test_query_returns_data_dict() -> None:
     respx.post(f"{BASE}/nil/v0.1/query").mock(
