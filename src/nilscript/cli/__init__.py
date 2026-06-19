@@ -420,9 +420,10 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
     else:
         bearer = args.bearer or ""
     scopes = frozenset(args.scope) if args.scope else None
+    auth_token = os.environ.get(args.auth_token_env, "") or None if args.auth_token_env else None
     print(
         f"nilscript mcp → adapter {args.adapter_url}  (gate={args.gate}, transport={args.transport}, "
-        f"dynamic_tools={not args.no_dynamic_tools})",
+        f"dynamic_tools={not args.no_dynamic_tools}, auth={'on' if auth_token else 'off'})",
         file=sys.stderr,
     )
     serve(
@@ -436,6 +437,7 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
         host=args.host,
         port=args.port,
         dynamic_tools=not args.no_dynamic_tools,
+        auth_token=auth_token,
     )
     return 0
 
@@ -585,6 +587,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_mcp.add_argument("--host", default="127.0.0.1", help="bind host for HTTP transports")
     p_mcp.add_argument("--port", type=int, default=8765, help="bind port for HTTP transports")
+    p_mcp.add_argument(
+        "--auth-token-env",
+        help="env var holding a front-door bearer required on /mcp (HTTP transports; recommended for public URLs)",
+    )
     p_mcp.add_argument(
         "--no-dynamic-tools",
         action="store_true",

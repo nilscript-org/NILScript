@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir "nilscript[mcp]" "uvicorn[standard]>=0.29"
 #   NIL_GRANT_SECRET  bearer secret for the adapter        (if the adapter requires auth)
 #   NIL_GRANT_SCOPES  comma-separated grant scopes         (optional; default '*')
 #   NIL_MCP_GATE      two-step | human | auto              (default two-step)
+#   NIL_MCP_AUTH_TOKEN  front-door bearer required on /mcp (STRONGLY recommended for a public URL;
+#                       /healthz stays open. Unset = open endpoint.)
 ENV NIL_MCP_GATE=two-step
 EXPOSE 8765
 

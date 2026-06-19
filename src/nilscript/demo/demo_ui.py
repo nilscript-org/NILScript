@@ -700,7 +700,8 @@ async def mcp_connect(target: str = "memory"):
     if target not in TARGETS:
         return JSONResponse({"error": f"unknown target {target!r}"}, status_code=400)
     adapter_url = TARGETS[target]["url"]
-    skeleton = await connect_checks(target)  # reuses the demo's reachable→conformant→ready checks
+    checks = await connect_checks(target)  # reuses the demo's reachable→conformant→ready checks
+    ready = bool(checks) and all(c.get("ok") for c in checks)
     try:
         from nilscript.mcp.server import connection_info
         recipe = connection_info(adapter_url=adapter_url, transport="stdio")
@@ -710,7 +711,101 @@ async def mcp_connect(target: str = "memory"):
             "install": "pip install nilscript[mcp]",
             "stdio": {"command": f"nilscript mcp --adapter-url {adapter_url}"},
         }
-    return {"target": target, "adapter_url": adapter_url, "recipe": recipe, "handshake": skeleton}
+    return {"target": target, "adapter_url": adapter_url, "ready": ready,
+            "checks": checks, "recipe": recipe}
+
+
+@app.get("/connect", response_class=HTMLResponse)
+async def connect_page():
+    """A self-contained onboarding page: copy the command, see the shim status, connect an agent."""
+    return _CONNECT_HTML
+
+
+_CONNECT_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Connect an agent · NILScript</title>
+<style>
+:root{--bg:#0b0d12;--card:#151922;--line:#262c38;--ink:#e8ecf3;--dim:#8b95a7;--accent:#6ee7b7;--bad:#f87171}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto}
+.wrap{max-width:760px;margin:0 auto;padding:40px 20px}
+h1{font-size:26px;margin:0 0 4px}.sub{color:var(--dim);margin:0 0 24px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin:16px 0}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:8px;font-size:13px;padding:5px 11px;border-radius:999px;border:1px solid var(--line)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--dim)}.dot.ok{background:var(--accent)}.dot.bad{background:var(--bad)}
+.step{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin:0 0 8px}
+pre{background:#0e1117;border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:auto;margin:0;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+.cmd{display:flex;gap:8px;align-items:flex-start}
+button{background:#222937;color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:9px 13px;cursor:pointer;font-size:13px;white-space:nowrap}
+button:hover{border-color:var(--accent)}
+ol{margin:8px 0 0;padding-left:20px}ol li{margin:6px 0}
+a{color:var(--accent)} .muted{color:var(--dim);font-size:13px}
+.tabs{display:flex;gap:8px;margin:0 0 14px}.tab{padding:7px 13px;border:1px solid var(--line);border-radius:9px;cursor:pointer;font-size:13px;color:var(--dim)}
+.tab.on{color:var(--ink);border-color:var(--accent)} .hidden{display:none}
+</style></head><body><div class=wrap>
+<h1>Connect an agent</h1>
+<p class=sub>Point any MCP-compatible agent at this backend through the NIL gate — it can only act with your approval.</p>
+
+<div class=card>
+  <div class=row style="justify-content:space-between">
+    <div class=step style=margin:0>Backend status</div>
+    <span class=chip id=status><span class="dot" id=dot></span><span id=statusText>checking…</span></span>
+  </div>
+  <p class=muted id=adapter style=margin:10px_0_0></p>
+</div>
+
+<div class=tabs>
+  <div class="tab on" data-pane=local onclick="pick('local')">Local (Claude Code / Cursor)</div>
+  <div class="tab" data-pane=remote onclick="pick('remote')">Remote (claude.ai)</div>
+</div>
+
+<div class=card id=pane-local>
+  <div class=step>1 · run the server</div>
+  <div class=cmd><pre id=stdioCmd>…</pre><button onclick="cp(stdioCmd,this)">Copy</button></div>
+  <div class=step style=margin-top:16px>2 · add to your client (stdio)</div>
+  <div class=cmd><pre id=cfg>…</pre><button onclick="cp(cfg,this)">Copy</button></div>
+  <ol>
+    <li>Claude Code: <code>claude mcp add nilscript -- nilscript mcp --adapter-url …</code></li>
+    <li>Cursor / Cline / Zed: paste the JSON into the MCP config.</li>
+    <li>In the agent, load the <b>using_nilscript</b> prompt, then ask it to act.</li>
+  </ol>
+</div>
+
+<div class="card hidden" id=pane-remote>
+  <div class=step>1 · host the server</div>
+  <pre>NIL_ADAPTER_URL=&lt;adapter&gt; NIL_GRANT_SECRET=… NIL_MCP_AUTH_TOKEN=&lt;token&gt; \\
+  uvicorn nilscript.mcp.app:app --host 0.0.0.0 --port 8765
+# readiness: GET /healthz · endpoint: /mcp</pre>
+  <div class=step style=margin-top:16px>2 · add a Custom Connector on claude.ai</div>
+  <ol>
+    <li>Settings → Connectors → Add custom connector.</li>
+    <li>URL: <code>https://&lt;your-host&gt;/mcp</code> (send the bearer token if you set one).</li>
+  </ol>
+  <p class=muted>Set <b>NIL_MCP_AUTH_TOKEN</b> for any public URL — without it, anyone who can reach it can drive the backend (within the grant). <code>/healthz</code> stays open.</p>
+</div>
+
+<p class=muted>The agent gets <code>nil_describe / nil_propose / nil_commit / nil_query / nil_status / nil_rollback</code> plus a <code>propose_&lt;verb&gt;</code> per exposed verb. Only <b>nil_commit</b> writes, and only an approved proposal commits. Full guide: <a href=https://github.com/nilscript-org/nilscript/blob/main/docs/connect-claude.md>docs/connect-claude.md</a>.</p>
+</div>
+
+<script>
+function cp(el,btn){navigator.clipboard.writeText(el.innerText).then(()=>{const t=btn.innerText;btn.innerText='Copied';setTimeout(()=>btn.innerText=t,1200)})}
+function pick(p){for(const t of document.querySelectorAll('.tab'))t.classList.toggle('on',t.dataset.pane===p);
+  document.getElementById('pane-local').classList.toggle('hidden',p!=='local');
+  document.getElementById('pane-remote').classList.toggle('hidden',p!=='remote')}
+async function refresh(){
+  try{const r=await fetch('/api/mcp?target=memory');const d=await r.json();
+    document.getElementById('adapter').textContent='adapter: '+d.adapter_url;
+    const rec=d.recipe||{};const st=(rec.stdio||{});
+    document.getElementById('stdioCmd').textContent=st.command||'pip install nilscript[mcp]';
+    document.getElementById('cfg').textContent=JSON.stringify(st.claude_desktop_config||{},null,2);
+    const dot=document.getElementById('dot'),tx=document.getElementById('statusText');
+    if(d.ready){dot.className='dot ok';tx.textContent='ready to connect'}
+    else{dot.className='dot bad';tx.textContent='shim not reachable — start it (nilscript demo)'}
+  }catch(e){document.getElementById('statusText').textContent='demo API unavailable'}
+}
+refresh();setInterval(refresh,4000);
+</script>
+</body></html>"""
 
 
 @app.get("/api/providers")

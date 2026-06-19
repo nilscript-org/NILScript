@@ -33,6 +33,9 @@ def create_app():  # type: ignore[no-untyped-def]
         scopes=frozenset(scopes_raw.split(",")) if scopes_raw else None,
         gate=os.environ.get("NIL_MCP_GATE", "two-step"),
         dynamic_tools=os.environ.get("NIL_MCP_DYNAMIC", "1") != "0",
+        # Front-door bearer for the /mcp endpoint. STRONGLY recommended for a public URL: without it
+        # anyone who can reach the URL can drive the backend (within the grant). /healthz stays open.
+        auth_token=os.environ.get("NIL_MCP_AUTH_TOKEN") or None,
     )
 
 
