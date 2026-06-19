@@ -59,3 +59,26 @@ def test_build_asgi_app_returns_callable_even_if_adapter_unreachable() -> None:
     # discovery on an unreachable adapter yields no dynamic tools but must not raise.
     app = build_asgi_app(adapter_url="http://127.0.0.1:9", bearer="")
     assert callable(app)
+
+
+def test_remote_auth_gate_protects_mcp_but_not_healthz() -> None:
+    # sync test: build_asgi_app calls asyncio.run() internally (discovery), so it can't run inside
+    # an active event loop — we drive the httpx assertions via a nested asyncio.run.
+    import asyncio
+
+    import httpx
+
+    app = build_asgi_app(adapter_url="http://127.0.0.1:9", bearer="", auth_token="sekret-token")
+
+    async def _check() -> None:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            # /healthz is open (adapter unreachable -> 503, but never 401)
+            assert (await c.get("/healthz")).status_code != 401
+            # /mcp without the bearer is rejected at the front door
+            assert (await c.post("/mcp", json={})).status_code == 401
+            # with the bearer it passes the gate (downstream MCP status, just not 401)
+            ok = await c.post("/mcp", json={}, headers={"authorization": "Bearer sekret-token"})
+            assert ok.status_code != 401
+
+    asyncio.run(_check())

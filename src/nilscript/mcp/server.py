@@ -240,23 +240,38 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     dynamic_tools: bool = True,
+    auth_token: str | None = None,
 ) -> None:
     """Build and run the server (blocking). Called by `nilscript mcp`.
 
-    `transport='stdio'` for local IDE clients; `'streamable-http'` (or `'sse'`) for a remote URL.
+    `transport='stdio'` for local IDE clients; `'streamable-http'` for a remote URL. HTTP transports
+    go through `build_asgi_app` (so `/healthz` and the optional `auth_token` front-door apply) served
+    by uvicorn; stdio uses the FastMCP runner directly (auth is implicit — the client owns the process).
     """
-    import asyncio
+    if transport == "stdio":
+        verbs: list[str] = []
+        if dynamic_tools:
+            import asyncio
 
-    verbs: list[str] = []
-    if dynamic_tools:
-        verbs = asyncio.run(_discover_verbs(adapter_url, bearer))
+            verbs = asyncio.run(_discover_verbs(adapter_url, bearer))
+        tools = build_tools(
+            adapter_url=adapter_url, grant_id=grant_id, workspace=workspace,
+            bearer=bearer, scopes=scopes, gate=gate,
+        )
+        server = build_server(tools, dynamic_verbs=verbs, host=host, port=port)
+        server.run(transport="stdio")
+        return
 
-    tools = build_tools(
+    try:
+        import uvicorn
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise RuntimeError("HTTP transport needs uvicorn (pip install 'uvicorn[standard]')") from exc
+
+    app = build_asgi_app(
         adapter_url=adapter_url, grant_id=grant_id, workspace=workspace,
-        bearer=bearer, scopes=scopes, gate=gate,
+        bearer=bearer, scopes=scopes, gate=gate, dynamic_tools=dynamic_tools, auth_token=auth_token,
     )
-    server = build_server(tools, dynamic_verbs=verbs, host=host, port=port)
-    server.run(transport=transport)  # type: ignore[arg-type]
+    uvicorn.run(app, host=host, port=port)
 
 
 def build_asgi_app(
@@ -268,10 +283,14 @@ def build_asgi_app(
     scopes: frozenset[str] | None = None,
     gate: str = "two-step",
     dynamic_tools: bool = True,
+    auth_token: str | None = None,
 ):  # type: ignore[no-untyped-def]
     """Return a streamable-HTTP ASGI app for production hosting (uvicorn/gunicorn behind nilscript.org).
 
     The skeleton is discovered once at build time so per-verb tools reflect the mounted adapter.
+    `auth_token` (if set) is a static front-door bearer required on /mcp — without it a public URL is
+    open to anyone who can reach it (the NIL gate still bounds writes, but a connected agent can
+    commit in-scope). `/healthz` stays open for load-balancer probes.
     """
     import asyncio
 
@@ -304,4 +323,18 @@ def build_asgi_app(
         )
 
     app.add_route("/healthz", _healthz, methods=["GET"])
+
+    if auth_token:
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        class _BearerGate(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
+                # /healthz stays open; everything else (the /mcp endpoint) needs the bearer.
+                if request.url.path.rstrip("/") != "/healthz":
+                    if request.headers.get("authorization", "") != f"Bearer {auth_token}":
+                        return JSONResponse({"error": "unauthorized"}, status_code=401)
+                return await call_next(request)
+
+        app.add_middleware(_BearerGate)
+
     return app

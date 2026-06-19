@@ -15,6 +15,9 @@ Two transports: **stdio** (local IDE clients) and **streamable-HTTP** (remote, e
 
 ---
 
+> **Onboarding page:** with the demo running (`nilscript demo`), open **`/connect`** — a copy-paste
+> page with the exact command, the client config, and a live "shim ready" status chip.
+
 ## A. Local — Claude Desktop / Cursor (stdio), 3 steps
 
 ```bash
@@ -50,10 +53,15 @@ the **using_nilscript** prompt first. Done — it now acts on a real backend, sa
 Run the server over HTTP, pointed at your adapter:
 
 ```bash
-NIL_ADAPTER_URL=https://your-adapter NIL_GRANT_SECRET=… \
+NIL_ADAPTER_URL=https://your-adapter NIL_GRANT_SECRET=… NIL_MCP_AUTH_TOKEN=<front-door-token> \
   uvicorn nilscript.mcp.app:app --host 0.0.0.0 --port 8765
-# serves the MCP endpoint at  http://<host>:8765/mcp
+# serves the MCP endpoint at  http://<host>:8765/mcp   (readiness: GET /healthz, open)
 ```
+
+> **Set `NIL_MCP_AUTH_TOKEN` for any public URL.** With it, `/mcp` requires `Authorization: Bearer
+> <token>` (the connector sends it); `/healthz` stays open. Without it the endpoint is open — the NIL
+> gate still bounds writes, but a connected agent can commit within the grant. (Equivalent CLI:
+> `nilscript mcp … --transport streamable-http --auth-token-env NIL_MCP_AUTH_TOKEN`.)
 
 or, equivalently, the CLI:
 
