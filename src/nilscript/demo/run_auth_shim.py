@@ -8,14 +8,24 @@ from __future__ import annotations
 
 import os
 
-from pocketbase_nil_adapter.edge import CapturingEmitter, create_app
+from pocketbase_nil_adapter.edge import CapturingEmitter, HttpEventEmitter, create_app
 from pocketbase_nil_adapter.system import FakeSystem
 
 BEARER = os.environ.get("NIL_BEARER", "secret123")
+NIL_EVENTS_WEBHOOK = os.environ.get("NIL_EVENTS_WEBHOOK", "")
+NIL_EVENTS_SECRET = os.environ.get("NIL_EVENTS_SECRET", "")
+NIL_EVENTS_SOURCE = os.environ.get("NIL_EVENTS_SOURCE", "playground")
+
+
+def _emitter():
+    """Reflect every commit to the control plane when a webhook is configured; else in-memory only."""
+    if NIL_EVENTS_WEBHOOK:
+        return HttpEventEmitter(NIL_EVENTS_WEBHOOK, NIL_EVENTS_SECRET, source=NIL_EVENTS_SOURCE)
+    return CapturingEmitter()
 
 
 def build_auth_app():
-    return create_app(FakeSystem(), CapturingEmitter(), bearer=BEARER)
+    return create_app(FakeSystem(), _emitter(), bearer=BEARER)
 
 
 if __name__ == "__main__":

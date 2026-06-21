@@ -13,13 +13,23 @@ import time
 
 import httpx
 
-from pocketbase_nil_adapter.edge import CapturingEmitter, create_app
+from pocketbase_nil_adapter.edge import CapturingEmitter, HttpEventEmitter, create_app
 from pocketbase_nil_adapter.system import PocketBaseClient
 
 PB_URL = os.environ.get("PB_URL", "https://pocketbase.io")
 PB_EMAIL = os.environ.get("PB_EMAIL", "test@example.com")
 PB_PASSWORD = os.environ.get("PB_PASSWORD", "123456")
 NIL_BEARER = os.environ.get("NIL_BEARER", "secret123")
+NIL_EVENTS_WEBHOOK = os.environ.get("NIL_EVENTS_WEBHOOK", "")
+NIL_EVENTS_SECRET = os.environ.get("NIL_EVENTS_SECRET", "")
+NIL_EVENTS_SOURCE = os.environ.get("NIL_EVENTS_SOURCE", "playground")
+
+
+def _emitter():
+    """Reflect every commit to the control plane when a webhook is configured; else in-memory only."""
+    if NIL_EVENTS_WEBHOOK:
+        return HttpEventEmitter(NIL_EVENTS_WEBHOOK, NIL_EVENTS_SECRET, source=NIL_EVENTS_SOURCE)
+    return CapturingEmitter()
 UI_TRACE = os.environ.get("UI_TRACE_URL", "http://127.0.0.1:8770/api/trace")
 
 
@@ -56,7 +66,7 @@ _install_backend_tracing()
 
 def build_live_app():
     client = PocketBaseClient(PB_URL, admin_email=PB_EMAIL, admin_password=PB_PASSWORD)
-    return create_app(client, CapturingEmitter(), bearer=NIL_BEARER)
+    return create_app(client, _emitter(), bearer=NIL_BEARER)
 
 
 if __name__ == "__main__":
