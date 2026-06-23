@@ -52,22 +52,32 @@ mostly assembly + polish + design, not net-new invention.
 Everything below draws from one spine so the README, PyPI blurb, docs hero, and landing hero never
 contradict each other.
 
-- **One-liner:** *NILScript is the neutral standard for letting agents act in real systems —
-  safely, with confirmation, and without bespoke glue per backend.*
-- **The problem:** every "agent + your system" integration is re-built from scratch; the friction is
-  *discovery* (a backend's hidden, undocumented requirements) and *safety* (an agent must not write
-  blindly).
-- **The insight:** separate the neutral **intent layer** (verbs, envelopes, confirmation, the five
-  endpoints) from **backend reality** (captured once in a shareable manifest). Build an adapter once;
-  scan a system once; the world shares the result.
-- **The proof:** a real customer + invoice executed through the conversational gateway into a live
-  ERPNext, from the standard alone.
+- **One-liner:** *NILScript is the governed action layer for AI agents: the agent proposes intent, a
+  deterministic kernel is the only component that commits, and an action a backend never declared is
+  unexpressible rather than filtered.* Primary tagline: *Unexpressible, not filtered.* NIL expands to
+  **Network Intent Layer** (never "Language").
+- **The problem:** every "agent + your system" integration is re-built from scratch, and a raw agent
+  can author an undeclared call; the friction is *discovery* (a backend's hidden requirements) and
+  *governance* (the agent must only be able to author what the backend declared).
+- **The insight:** separate the neutral **intent layer** (verbs, envelopes, propose/approve/commit,
+  the endpoints) from **backend reality** (captured once in a shareable manifest). Build an adapter
+  once; scan a system once; the world shares the result. NIL composes with MCP as the governed layer
+  MCP leaves undefined.
+- **The proof (honest):** a real customer + invoice executed through the conversational gateway into a
+  live ERPNext, from the standard alone. The zero unauthorized-write result is by construction within
+  the threat model, confirmed on a live backend, and holds only while NIL is the sole effect path;
+  MCP-path per-request re-verification is future work. No merchant adoption at scale yet.
 - **Three pillars (used as the landing/docs triad):**
-  1. **Neutral by design** — no backend specifics in the standard (like OpenAPI for APIs).
-  2. **Safe by contract** — no commit without confirmation; PROPOSE has no side effects.
+  1. **Governed, not glued** — an agent can only name verbs and targets the backend has declared; an
+     undeclared action has no representation to send.
+  2. **Earned, not asserted** — PROPOSE has no side effects; nothing commits without approval; the
+     success envelope is confirmed by reading the record back; ROLLBACK previews a real compensation.
   3. **De-frictioned by tooling** — `scan` once, generate an adapter, share the manifest.
-- **Voice:** precise, engineer-to-engineer, low-hype. Comparables to invoke: OpenAPI, JSON Schema,
-  MCP, Stripe-doc clarity. Banned words: "revolutionary," "seamless," "magical."
+- **Voice:** precise, engineer-to-engineer, low-hype. Comparables to invoke: MCP (composes with),
+  OAuth/server-side authorization (closest analogy), JSON Schema / Stripe-doc clarity (quality bar).
+  Banned descriptors: "OpenAPI for agents," "agentic firewall" (unless qualified "structural, not a
+  filter"), "guardrail," "makes agents safe/trustworthy," "replaces MCP." Banned words:
+  "revolutionary," "seamless," "magical."
 
 **Deliverable:** `docs/brand/messaging.md` — the canonical spine + a glossary + the do/don't word
 list. Every other surface cites it.
@@ -236,7 +246,7 @@ This phase **designs and builds** it — no new story invention, just the fact-c
   4. **How it works** — the five endpoints + the PROPOSE→CONFIRM→COMMIT flow, animated.
   5. **The proof** — the ERPNext live story, with the actual collisions → manifest.
   6. **For whom** — the audiences from `nilscript-landing/audiences`.
-  7. **Open & neutral** — governance, license, "like OpenAPI for agent-actions."
+  7. **Open & neutral** — governance, license, "the governed action layer MCP leaves undefined."
   8. **CTA footer** — docs, GitHub, spec, community.
 - **Tech:** a static framework (Astro recommended — content-first, fast, MD-friendly so it can pull
   from the existing markdown) or Next.js if richer interactivity is wanted. Strict perf budget

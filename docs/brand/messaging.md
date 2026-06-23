@@ -6,8 +6,13 @@
 
 ## One-liner
 
-**NILScript is the neutral standard for letting agents act in real systems — safely, with
-confirmation, and without bespoke glue per backend.**
+**NILScript is the governed action layer for AI agents: the agent proposes intent, a deterministic
+kernel is the only component that commits, and an action a backend never declared is unexpressible
+rather than filtered.**
+
+> Canonical descriptor: *the governed action layer for AI agents.* Primary tagline:
+> *Unexpressible, not filtered.* NIL expands to **Network Intent Layer** (never "Language"). NIL
+> composes with MCP as the governed layer MCP leaves undefined; it does not replace it.
 
 ## The problem
 
@@ -28,13 +33,20 @@ once; the world shares the result.
 
 A real customer + invoice executed through the conversational gateway into a **live ERPNext**, from
 the standard alone. That is the completed proof. There is **no merchant adoption at scale yet** —
-the story is "neutral standard + proven reference path," not "battle-tested in production."
+the story is "open standard + proven reference path," not "battle-tested in production." The zero
+unauthorized-write result is **by construction** within the threat model and confirmed on a live
+backend, not a surprising empirical rate; it holds only while NIL is the sole effect path. On the
+kernel API path the kernel performs the read-back confirmation; on the MCP path that confirmation
+currently rests on the adapter envelope, gated at admission but not yet re-verified per request
+(kernel-side re-verification there is future work).
 
 ## Three pillars
 
-1. **Neutral by design** — no backend specifics in the standard (like OpenAPI for APIs).
-2. **Safe by contract** — no commit without confirmation; `PROPOSE` has no side effects;
-   `ROLLBACK` previews a compensation, never a silent write.
+1. **Governed, not glued** — an agent can only name verbs and targets the backend has declared; an
+   undeclared action has no representation to send, so it is unexpressible, not filtered.
+2. **Earned, not asserted** — `PROPOSE` has no side effects; nothing commits without approval; a
+   success envelope is confirmed by reading the record back; `ROLLBACK` previews a real compensation,
+   never a silent write, and never pretends an irreversible effect can be undone.
 3. **De-frictioned by tooling** — `scan` once, generate an adapter, share the manifest.
 
 ## What it is, precisely (two layers, both specs)
@@ -48,7 +60,13 @@ Both are specs, not software. A reference implementation obeys them; it never de
 
 ## Comparables to invoke
 
-OpenAPI, JSON Schema, MCP, Stripe-doc clarity. The mental model is **"OpenAPI for agent-actions."**
+MCP and OpenAPI standardize what an agent can *reach*; NIL governs what an agent can *author*, and
+composes with them as the governed action layer they leave undefined. The closest correct analogy is
+**server-side authorization for agent writes** (OAuth-shaped, enforced at the effect boundary). Use
+JSON Schema / Stripe-doc clarity as a *quality* reference, not as the definition. Do **not** describe
+NIL as "OpenAPI for agent-actions," an "agentic firewall" (unless immediately qualified "structural,
+not a filter"), a "guardrail," something that "makes agents safe/trustworthy," or a replacement for
+MCP — these are banned descriptors.
 
 ## Voice
 
@@ -60,7 +78,8 @@ Precise, engineer-to-engineer, low-hype.
 
 ## Glossary (canonical terms)
 
-- **NIL** — Network Intent Layer; the neutral wire contract.
+- **NIL** — Network Intent Layer; the governed-action contract (a neutral wire contract under which an
+  agent proposes intent and only a deterministic kernel commits).
 - **nilscript DSL** — the orchestration language above NIL.
 - **Verb** — a named action in a domain profile (e.g. `commerce.create_product`).
 - **Envelope** — the request/response wrapper on the NIL wire (`nil`, `grant`, `workspace`, `body`).
