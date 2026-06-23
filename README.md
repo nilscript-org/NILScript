@@ -4,11 +4,16 @@
 
 <img src="assets/nil-logo.png" alt="&lt;nil&gt;" width="140" />
 
-### Give an AI agent real power over your systems — and take on zero risk doing it.
+### The governed action layer for AI agents.
 
-**NIL (the Network Intent Layer) is the neutral standard for how agents *act* in real backends:**
-every write is **previewed, approved, fully traced, and one-click reversible** — and an agent can only
-touch what your backend actually exposes. Hallucinations can't write. *OpenAPI for agent-actions.*
+**An agent proposes intent; a deterministic kernel is the only thing that commits; an action a backend
+never declared is unexpressible, not filtered. Composes with MCP. `pip install nilscript`.**
+
+NIL (the Network Intent Layer) governs how agents *act* in real backends: every write is **proposed,
+approved, traced, and reversible only when the verb earns it**, and an agent can only name verbs and
+targets your backend has declared. An undeclared action has no representation to send, so it is
+unexpressible, not filtered. The zero unauthorized-write result is by construction within the threat
+model and confirmed on a live backend; it holds only while NIL is the sole effect path.
 
 [![CI](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml/badge.svg)](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml)
 [![tests](https://img.shields.io/badge/tests-180%20passing-2ea44f)](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml)
