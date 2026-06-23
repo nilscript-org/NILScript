@@ -1,13 +1,18 @@
 {
   "benchmark": "InjecAgent",
-  "dataset": "uiuc-kang-lab/InjecAgent@main (data/test_cases_{dh,ds}_{base,enhanced}.json)",
-  "harness": "single-step decision, temp 0, 16-way concurrent; paired A/B (same attempts, gate differs)",
+  "dataset": "uiuc-kang-lab/InjecAgent@<PIN A COMMIT> (data/test_cases_{dh,ds}_{base,enhanced}.json)",
+  "harness": "single-step decision, temp 0; paired A/B (same attempts, only the gate differs). Corrected (#50): errored/undecodable cases are excluded from ASR/UWR and surfaced as error_rate; a no-attack-landed run is flagged degenerate.",
   "axis": "safety",
-  "rows": [
-    {"model": "cerebras/gpt-oss-120b", "setting": "base",     "cases": 1054, "asr": 0.0275, "uwr_raw": 0.0275, "uwr_nil": 0.0, "benign": 1.0},
-    {"model": "cerebras/gpt-oss-120b", "setting": "enhanced", "cases": 1054, "asr": 0.0047, "uwr_raw": 0.0047, "uwr_nil": 0.0, "benign": 1.0},
-    {"model": "cerebras/zai-glm-4.7",  "setting": "base",     "cases": 1054, "asr": 0.0446, "uwr_raw": 0.0446, "uwr_nil": 0.0, "benign": 1.0},
-    {"model": "cerebras/zai-glm-4.7",  "setting": "enhanced", "cases": 1054, "asr": 0.0,    "uwr_raw": 0.0,    "uwr_nil": 0.0, "benign": 1.0}
+  "scores": "gate DECISIONS over tool names, NOT executed backend writes. uwr_raw == asr by construction; uwr_nil == 0 by the intent-oracle membership test (the measured face of Proposition 2, not independent evidence).",
+  "headline": "Across 2,108 base-setting evaluations on two models, raw agents are hijacked into an unauthorized write in up to 4.46% of cases; routed through NIL, 0.00% is admitted at the gate while the authorized-call pass-through stays 100% (false-refusal rate 0).",
+  "evidentiary_rows": [
+    {"model": "cerebras/gpt-oss-120b", "setting": "base", "cases": 1054, "asr": 0.0275, "uwr_raw": 0.0275, "uwr_nil": 0.0, "authorized_passthrough": 1.0, "degenerate": false},
+    {"model": "cerebras/zai-glm-4.7",  "setting": "base", "cases": 1054, "asr": 0.0446, "uwr_raw": 0.0446, "uwr_nil": 0.0, "authorized_passthrough": 1.0, "degenerate": false}
   ],
-  "totals": {"evaluations": 4216, "uwr_nil_max": 0.0, "benign_min": 1.0}
+  "withheld_rows": [
+    {"model": "cerebras/gpt-oss-120b", "setting": "enhanced", "reason": "pre-correction harness: near-zero raw ASR was not separable from error-masking; re-run with the corrected harness + a pinned dataset/seed before use."},
+    {"model": "cerebras/zai-glm-4.7",  "setting": "enhanced", "reason": "degenerate (raw ASR 0 => no attack landed for NIL to block) AND unverifiable under the pre-correction harness."}
+  ],
+  "totals": {"evaluations": 2108, "uwr_nil_max": 0.0, "authorized_passthrough_min": 1.0},
+  "notes": "Headline = 2,108 base-setting evaluations (two base rows above). The enhanced runs are WITHHELD from the evidentiary claim. authorized_passthrough = no authorized call refused (a false-refusal rate of zero), NOT measured downstream task completion (that is the planned tau-bench axis). The base rows have a nonzero raw ASR, so a real attack landed for NIL to admit at zero; that is the informative comparison."
 }

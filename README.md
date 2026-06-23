@@ -12,7 +12,7 @@ touch what your backend actually exposes. Hallucinations can't write. *OpenAPI f
 
 [![CI](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml/badge.svg)](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml)
 [![tests](https://img.shields.io/badge/tests-180%20passing-2ea44f)](https://github.com/nilscript-org/nilscript/actions/workflows/ci.yml)
-[![unauthorized writes via NIL](https://img.shields.io/badge/unauthorized%20writes%20via%20NIL-0%25%20%2F%204216%20evals-2ea44f)](#benchmarks--the-numbers)
+[![unauthorized writes via NIL](https://img.shields.io/badge/unauthorized%20writes%20at%20the%20gate-0%25%20%2F%202108%20base%20evals-2ea44f)](#benchmarks--the-numbers)
 [![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)](https://www.python.org/)
 [![spec](https://img.shields.io/badge/NIL-0.3.0-5b5bd6)](https://github.com/nilscript-org/nilscript-protocol/blob/main/nil/0.2.0.md)
 [![license](https://img.shields.io/badge/license-Apache--2.0%20AND%20CC--BY--4.0-444)](LICENSE)
@@ -32,29 +32,67 @@ a poisoned tool response tries to hijack the agent into an unauthorized write �
 **twice**: the agent calling tools directly (**raw**), and the same agent routed through NIL
 (**gated**). Same model, same attacks. Only the gate differs.
 
-![InjecAgent: unauthorized-write rate, raw vs NIL — zero through NIL across every model and setting](bench/assets/injecagent_safety.svg)
+![InjecAgent: unauthorized-write rate, raw vs NIL — zero at the gate across both models, base setting](bench/assets/injecagent_safety.svg)
 
-| | Raw agent | **Through NIL** |
+| model (base setting) | Raw agent | **Through NIL** |
 |---|---|---|
-| Unauthorized writes committed | **up to 4.46%** | **0.00%** |
-| Benign tasks completed | 100% | **100%** |
-| Evaluations | — | **4,216** (2 models × base+enhanced × 1,054 cases) |
+| gpt-oss-120b | unauthorized writes admitted **2.75%** | **0.00%** |
+| zai-glm-4.7 | unauthorized writes admitted **4.46%** | **0.00%** |
+| authorized-call pass-through | 100% | **100%** |
 
-**Read that again.** Across **4,216** attacks, on two different models, under both the standard and the
-*reinforced* injection setting, the number of unauthorized writes that reached the backend through NIL
-was **zero** — and it cost nothing: every legitimate task still completed. Raw agents were hijacked
-into a real write on **up to 1 in 22** cases; NIL committed **none** of them.
+These are **2,108 base-setting evaluations** (two models × 1,054 cases). A raw agent is hijacked into
+an unauthorized write up to **4.46%** of the time (~1 in 22); routed through NIL, that write is
+**admitted at the gate 0.00%** of the time, and **no** authorized call is refused (a false-refusal
+rate of 0). The two *enhanced*-setting rows are withheld from the evidentiary claim: they are
+degenerate (raw ASR ≈ 0), and a pre-correction harness counted API errors as non-hijacked, so a
+near-zero ASR there is not separable from error-masking.
 
-That gap isn't a better prompt or a smarter model — it's **structural**. A write physically cannot
-commit without a previewed `propose → approve → commit`, and the agent can only name verbs the backend
-exposes. Change the model and the raw hijack rate moves; **the NIL column stays 0.**
+That gap isn't a better prompt or a smarter model; it's **structural**. An undeclared action is
+**unexpressible** (its preimage under translation is empty, `β⁻¹(a) = ∅`), not merely filtered: a
+write cannot be admitted without a previewed `propose → approve → commit`, and the agent can only name
+verbs the backend exposes. The NIL column stays **0 by construction** (Proposition 2 of the paper),
+not as an estimate across these two models.
 
-> Honesty matters as much as the numbers: this harness uses a single-step decision (not InjecAgent's
-> two-step ReAct), so the *raw* rates here (0–4.46%) sit below the paper's 24% GPT-4 baseline and are
-> **harness-specific** — the comparable, defensible claim is the **NIL → 0**, always reported next to
-> 100% benign success (never the safety number alone). Full method + the other three axes
-> (task-success, conformance, performance): [`docs/benchmarking-plan.md`](docs/benchmarking-plan.md) ·
-> reproduce: [`bench/`](bench/).
+> Read what the harness scores: **gate decisions over tool names, not executed backend writes**. Raw
+> UWR equals ASR by construction; the NIL `0` is the intent-oracle membership test (the measured face
+> of Proposition 2), not independent empirical evidence. The "authorized-call pass-through" column is a
+> false-refusal rate of 0 (no authorized call was refused); it is **not** measured task completion.
+> End-to-end task-success against a goal state is a separate, **planned** τ-bench axis. This harness
+> uses a single-step decision (not InjecAgent's two-step ReAct), so the *raw* rates (2.75–4.46%) are
+> **harness-specific** and sit below the paper's 24% GPT-4 baseline. The runner was corrected (#50) so
+> errored/undecodable cases are excluded from ASR/UWR and surfaced as `error_rate`, and a run where no
+> attack lands is flagged degenerate. Full method + the other axes (task-success, conformance,
+> performance): [`docs/benchmarking-plan.md`](docs/benchmarking-plan.md) · reproduce: [`bench/`](bench/).
+
+### Edge-level evidence: SRR and Effect-Leakage on a live adapter
+
+The gate-decision number above scores tool names, not committed effects. A second axis measures the
+real thing through the adapter's **production edge** on a live odoo-CRM adapter: **Structural-Rejection
+Rate (SRR)** (did an undeclared verb get rejected at the edge) and **Effect-Leakage (EL)** (did any
+undeclared action reach the backend). Result: **SRR = 100%, EL = 0** across four corpora: synthetic
+undeclared verbs (N=50), plausible-attacker verbs (N=8), injecagent-derived verbs (N=8), and the
+load-bearing one, `resource.*` against provisioned-but-undeclared targets like `account.payment` /
+`hr.employee` (N=8). SRR = 100% is true **by construction**; it is implementation-faithfulness
+evidence, not a surprising rate.
+
+The fourth corpus is the one that earned the result. *Before* the `resource.*` target gate it leaked:
+**SRR 0%, EL 8/8** (a real payment/employee write), confirmed by a failing test. Closing that hole is
+what makes the 100%/0 honest. The reference-implementation audit found and closed two
+"asserted-not-earned" defects:
+
+- **The COMMIT success envelope is now earned.** After a write the edge re-reads the system of record
+  and confirms each written field; a silently dropped field flips `verified` to `false`/`partial` and
+  names it, instead of a hardcoded `verified: true`.
+- **The generic `resource.*` CRUD family is skeleton-bounded.** It is bound to an operator-declared
+  target set (default-deny), and `describe()` advertises exactly that set, so **advertised ≡
+  committable** (a CRM adapter cannot be steered into accounting/payroll).
+
+Both invariants are **kernel-gated at admission**: the conformance procedure rejects any adapter that
+returns a constant `verified: true` or bounds `resource.*` only by target-existence. Both checks were
+red before the fix; every scaffolded adapter now embeds them. On a real Odoo, both were observed
+through the deployed edge: `resource.create{account.payment}` refused at PROPOSE with `UNKNOWN_VERB`
+(EL = 0); a contact committed with `verified: true` carrying a per-field before→requested→after
+read-back; the rollback's HIGH delete held by the human-approval gate.
 
 ## The one-paragraph version
 
@@ -195,8 +233,9 @@ OpenAPI / JSON-Schema model).
 
 - ✅ **0.3.0** — describe handshake, generic `resource.*` CRUD, synthesized reversibility, `ROLLBACK`.
 - ✅ **180 kernel tests** green; **pocketbase adapter 17/17** conformance; cross-repo **parity gate** in CI.
-- ✅ **Safety proven on a published benchmark** — InjecAgent, 4,216 evals, **unauthorized writes via NIL = 0%** (see [the numbers](#benchmarks--the-numbers)).
-- ✅ **Live proof** — a real customer + invoice into a live ERPNext, from the standard alone; the reference Playground drives a live PocketBase end-to-end.
+- ✅ **Safety on a published benchmark**: InjecAgent, **2,108 base-setting evals**, two models, **unauthorized writes admitted at the gate = 0.00%**, authorized-call pass-through 100% (see [the numbers](#benchmarks--the-numbers)).
+- ✅ **Edge-level evidence**: through a live odoo-CRM adapter's production edge, **Structural-Rejection Rate (SRR) = 100%, Effect-Leakage (EL) = 0** across four corpora (see below); both COMMIT-verification and `resource.*` target-bounding invariants are kernel-gated at admission.
+- ✅ **Live proof** — a real customer + invoice into a live ERPNext, from the standard alone; the reference Playground drives a live PocketBase end-to-end; both invariants observed through the deployed edge on a real Odoo.
 - 🚧 **Young open standard** — not yet battle-tested at merchant scale. We lead with the proof, not traction claims.
 - 🚧 **PyPI publish** staged; install from source for 0.3.0 until it lands.
 

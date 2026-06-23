@@ -333,7 +333,9 @@ provisioned targets gets honest, tested reversal with no per-entity verb authori
 | G2 Skeleton-bounded | `describe()` + V4 whitelist (`kernel/validator.py`) | `tests/test_kernel_validator.py`, `tests/test_mcp_dynamic.py` |
 | G3 Honest bounded reversibility | `sdk/refusals.py` (`IRREVERSIBLE`, `COMPENSATION_EXPIRED`); compensation adapter file | `tests/test_rollback.py`, `tests/test_dsl_compensation.py` |
 | G4 Tiers earned (drift-guard) | `cli/manifest/`, `cli/conformance/` | `tests/test_conformance_runner.py`, `tests/test_manifest.py` |
-| InjecAgent A/B (4,216 cases; UWR_NIL=0; benign=100%) | `bench/safety/injecagent_runner.py`, `bench/safety/matrix.json` | `bench/safety/last_result.json` |
+| InjecAgent A/B (2,108 base-setting cases; admitted-at-gate=0%; authorized pass-through=100%; enhanced withheld) | `bench/safety/injecagent_runner.py`, `bench/safety/matrix.json` | `bench/safety/last_result.json` |
+| Edge-level SRR/EL (live odoo-CRM edge; SRR=100%, EL=0 over 4 corpora; 4th = resource.* x undeclared targets) | `odoo-crm-nil-adapter/conformance/test_unexpressibility.py` | earned by the resource.* skeleton bound |
+| Earned verified + resource.* bound (kernel admission gates) | `bench/conformance/test_admission_gates.py`, `cli/scaffold/_templates.py` | red before fix; embedded in every scaffold |
 | Anti-tautology / intent oracle | `bench/core/gate.py` (`oracle` vs `auto`) | `bench/README.md` discipline note |
 | pass^k conformance | `bench/conformance/test_invariants.py`, `bench/core/report.py` | property-based, `max_examples`/`stateful_step_count` |
 | Plan language + static validation | `kernel/{models,validator,executor,references,guards}.py` | `tests/test_kernel_*.py` |
