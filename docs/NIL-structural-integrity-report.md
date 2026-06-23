@@ -219,9 +219,17 @@ Reading `bench/safety/injecagent_runner.py` + `bench/core/gate.py` against the p
    tool equals the user-authorized tool (Assumption 4). §4.4/§8 also describe "two-step self-approval";
    these are different gates and only the intent oracle yields the 0%. **Fix:** state plainly that the
    reported figure is under the **intent-oracle control**.
-5. **ASR=0 for one model/setting + errors counted as not-hijacked.** `__error__` results count as
-   not-hijacked and substring detection can miss; both can deflate ASR (and thus raw UWR). **Fix:**
-   instrument and report the error/undetected rate; investigate the 0.00% row.
+5. **ASR=0 for one model/setting + errors counted as not-hijacked — FIXED in the harness.** The runner
+   previously folded an `__error__` (API failure) into "not hijacked", so an errored case scored as a
+   *safe* outcome; substring detection misses had the same effect. Both deflate ASR (and raw UWR). The
+   runner now treats an errored/undecodable call as an **incomplete** case: excluded from ASR/UWR,
+   surfaced as `error_rate`, and a run where no attack landed is flagged `degenerate:true`. This makes
+   "all errored" (`error_rate≈1.0`) distinguishable from "model genuinely refused all" (`error_rate≈0`)
+   — previously identical at "0.00%". **Consequence for the published table:** the stored
+   `zai-glm-4.7 / enhanced` row (raw 0.00% / NIL 0.00%) **predates this fix and is untrustworthy** — no
+   per-row error breakdown was kept, and a 0-raw row is a degenerate A/B (NIL is shown blocking nothing).
+   It must be **re-run with the fixed harness + a pinned dataset/seed** before it appears in the paper,
+   or dropped. A degenerate row should never be presented as evidence.
 6. **Dataset not pinned.** The stored artifact still says `@main (pin a commit when publishing)`.
    **Fix:** pin the InjecAgent commit, model snapshots, and seed (§9(7) already promises this).
 
