@@ -305,6 +305,88 @@ def _label(row: dict[str, Any]) -> str:
     return f"{{name}} ({{code}})" if code else name
 
 
+def _hash_snap(snapshot: dict[str, Any]) -> str:
+    """Canonical hash of an SSOT field snapshot — the state-witness bound at PROPOSE and rechecked at
+    COMMIT. Empty snapshot => '' (no precondition, e.g. a create). The kernel refuses to commit against
+    a world that drifted since the human approved the preview (TOCTOU)."""
+    if not snapshot:
+        return ""
+    blob = json.dumps(snapshot, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _option_label(options: list[dict[str, Any]], value: Any) -> str | None:
+    """Best-effort label for a selection value (its stored key OR its label) — None if not an option."""
+    v = str(value).strip().lower()
+    for opt in options:
+        if str(opt.get("value")).lower() == v or str(opt.get("label", "")).strip().lower() == v:
+            return opt.get("label")
+    return None
+
+
+def _label_for(client: SystemClient, model: str, value: Any) -> str | None:
+    """Best-effort human label for a stored relational value (an id OR a name) — the inverse of
+    _resolve_reference, for the legible echo. Never raises and never guesses: returns None unless the
+    value labels to exactly one record. Legibility only makes an already-decided value readable."""
+    v = str(value).strip()
+    if not v:
+        return None
+    try:
+        if v.isdigit():
+            rows = client.search(model, [["id", "=", int(v)]], fields=("id", "name", "code"), limit=1)
+        else:
+            rows = client.search(model, [["name", "ilike", v]], fields=("id", "name", "code"), limit=8)
+            rows = [r for r in rows if str(r.get("name", "")).strip().lower() == v.lower()] or rows
+    except SystemError:
+        return None
+    return _label(rows[0]) if len(rows) == 1 else None
+
+
+def _legible(client: SystemClient, doctype: str, fields: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """{{field: {{value, label}}}} for every constrained (relation/selection) field written in `fields` —
+    the symmetric reference-legibility echo. Used on PROPOSE (Fault A: an opaque foreign key never
+    crosses approval illegibly) and on read-back (Fault B: the receipt is built from a live re-resolution
+    of the landed value). Schema-driven; plain scalars, multi-values, unlabelable values are omitted."""
+    meta_by_field = {{f.get("name"): f for f in (client.schema(doctype) or [])}}
+    echo: dict[str, dict[str, Any]] = {{}}
+    for field, value in fields.items():
+        if value in (None, "") or isinstance(value, (list, tuple)):
+            continue
+        meta = meta_by_field.get(field) or {{}}
+        label = (_label_for(client, meta["relation"], value) if meta.get("relation")
+                 else _option_label(meta["options"], value) if meta.get("options") else None)
+        if label is not None:
+            echo[field] = {{"value": value, "label": label}}
+    return echo
+
+
+# Approval ceilings (parametric policy): a money-moving verb whose numeric arg exceeds a declared cap
+# has its tier floored to HIGH at PROPOSE, so it parks for a human DECIDE instead of auto-committing.
+# A breach ESCALATES — it never refuses. Declare per-verb caps below; empty = no ceilings (the default).
+CEILINGS: dict[str, dict[str, Any]] = {{}}
+_TIER_ORDER = {{"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}}
+
+
+def _exceeds_ceiling(verb: str, args: dict[str, Any]) -> str | None:
+    """Return the first arg whose value breaches its configured numeric cap for `verb`, else None.
+    Non-numeric or missing values never breach (the gate's other guards own those)."""
+    for arg, cap in (CEILINGS.get(verb) or {{}}).items():
+        value = args.get(arg)
+        if value is None:
+            continue
+        try:
+            if float(value) > float(cap):
+                return arg
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _floor_tier(tier: str, to: str = "HIGH") -> str:
+    """Raise `tier` to at least `to` (default HIGH); never demote a stricter tier."""
+    return to if _TIER_ORDER.get(tier, 0) < _TIER_ORDER.get(to, 2) else tier
+
+
 def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | None) -> FastAPI:
     app = FastAPI(title="{name} shim", version="0.1.0")
     state = ShimState()
@@ -350,11 +432,26 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                     return gate
             pid = uuid4().hex[:16]
             state.proposals[pid] = {{"verb": verb_name, "args": args, "resource": True}}
+            # State-witness (TOCTOU): bind the proposal to the SSOT values it previewed, so a COMMIT
+            # after a delayed approval against a changed world fails closed instead of writing stale.
+            if op == "update":
+                rid0 = _resolve_id(client, target, str(args.get("id", "")))
+                if rid0 is not None:
+                    rec0 = client.get(target, rid0) or {{}}
+                    state.proposals[pid]["witness"] = _hash_snap({{f: rec0.get(f) for f in (args.get("data") or {{}})}})
             en, ar = _resource_phrase(op, target, args)
+            # Fault A (reference legibility): echo each relational/selection field by resolved name, so
+            # a bare foreign key is approved as "field -> Label", never as a magic number to mislabel.
+            refs = _legible(client, target, args.get("data") or {{}})
+            if refs:
+                tail = " · ".join(f"{{f}} → {{x['label']}}" for f, x in refs.items())
+                en, ar = f"{{en}} · {{tail}}", f"{{ar}} · {{tail}}"
+            tier = {{"create": "MEDIUM", "update": "MEDIUM", "delete": "HIGH"}}[op]
             return _envelope("PROPOSAL", env, {{
-                "outcome": "proposal", "id": pid, "verb": verb_name,
-                "tier": {{"create": "MEDIUM", "update": "MEDIUM", "delete": "HIGH"}}[op],
-                "preview": {{"en": en, "ar": ar}}, "resolved": args, "modifiable": [], "expires_at": _now()}})
+                "outcome": "proposal", "id": pid, "verb": verb_name, "tier": tier,
+                "preview": {{"en": en, "ar": ar}},
+                "resolved": {{**args, "references": refs}} if refs else args,
+                "modifiable": [], "expires_at": _now()}})
 
         verb = WRITE_VERBS.get(verb_name)
         if verb is None:
@@ -379,6 +476,16 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             return gate
         proposal_id = uuid4().hex[:16]
         state.proposals[proposal_id] = {{"verb": verb_name, "args": args}}  # NO write — dry-run only
+        # Approval ceiling (C): a numeric arg over its declared cap floors the tier to HIGH so the
+        # proposal parks for a human DECIDE. A breach ESCALATES — it never refuses.
+        tier = _floor_tier(verb.tier) if _exceeds_ceiling(verb_name, args) else verb.tier
+        # Fault A (reference legibility): echo the constrained native fields by resolved name, so the
+        # preview reads "… · country_id → Qatar" and `resolved.references` carries the meaning.
+        refs = _legible(client, verb.doctype, _gate_native)
+        preview = verb.preview(args)
+        if refs:
+            tail = " · ".join(f"{{f}} → {{x['label']}}" for f, x in refs.items())
+            preview = {{loc: f"{{txt}} · {{tail}}" for loc, txt in preview.items()}}
         return _envelope(
             "PROPOSAL",
             env,
@@ -386,9 +493,9 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 "outcome": "proposal",
                 "id": proposal_id,
                 "verb": verb_name,
-                "tier": verb.tier,
-                "preview": verb.preview(args),
-                "resolved": args,
+                "tier": tier,
+                "preview": preview,
+                "resolved": {{**args, "references": refs}} if refs else args,
                 "modifiable": [],
                 "expires_at": _now(),
             }},
@@ -423,6 +530,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                         return _envelope("STATUS", env, {{"proposal": proposal_id, "state": "failed_terminal", "replayed": False}})
                     rid = resolved
                     before = client.get(target, rid) or {{}}
+                    # State-witness recheck: if the SSOT drifted since PROPOSE, fail closed (no write).
+                    if op == "update" and stored.get("witness"):
+                        if stored["witness"] != _hash_snap({{f: before.get(f) for f in data}}):
+                            return _refusal(env, "PRECONDITION_FAILED",
+                                            "state changed since this proposal was previewed; "
+                                            "re-propose to get a fresh preview and re-approve")
                     if op == "update":
                         client.update(target, rid, data)
                         rev_verb, rev_args, rev = "resource.update", {{"target": target, "id": rid, "data": before}}, "COMPENSABLE"

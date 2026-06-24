@@ -70,7 +70,8 @@ def test_preview_for_exact_locale_and_fallback() -> None:
 
 
 def test_annex_a_is_complete() -> None:
-    # 15 original Annex A codes + 2 backward-recovery codes (IRREVERSIBLE, COMPENSATION_EXPIRED).
-    assert len(RefusalCode) == 17
-    assert {RefusalCode.IRREVERSIBLE, RefusalCode.COMPENSATION_EXPIRED} <= set(RefusalCode)
+    # 15 original Annex A codes + 2 backward-recovery codes (IRREVERSIBLE, COMPENSATION_EXPIRED)
+    # + 1 state-witness/TOCTOU code (PRECONDITION_FAILED).
+    assert len(RefusalCode) == 18
+    assert {RefusalCode.IRREVERSIBLE, RefusalCode.COMPENSATION_EXPIRED, RefusalCode.PRECONDITION_FAILED} <= set(RefusalCode)
     assert {RefusalCode.RATE_LIMITED, RefusalCode.UPSTREAM_UNAVAILABLE} == RETRIABLE_REFUSALS
