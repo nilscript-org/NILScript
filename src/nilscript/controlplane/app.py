@@ -267,6 +267,22 @@ def create_app(
     def adapters() -> dict[str, Any]:
         return {"adapters": store.adapters()}
 
+    @app.get("/api/adapter-skeleton")
+    async def api_adapter_skeleton(
+        workspace: str = "", adapter_id: str = "", authorization: str | None = Header(default=None),
+    ) -> Any:
+        """The verbs (and target names) a specific adapter declares — feeds the UI compose form's verb
+        dropdowns. Token-gated: it triggers a live handshake using the adapter's bearer."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        skeleton = await adapter_skeletons(workspace, adapter_id)
+        if skeleton is None:
+            return JSONResponse({"error": "adapter not reachable/conformant"}, status_code=503)
+        return {
+            "verbs": skeleton.get("verbs", []),
+            "targets": sorted((skeleton.get("targets") or {}).keys()),
+        }
+
     @app.get("/api/automations")
     def api_automations() -> dict[str, Any]:
         """Dashboard view of every automation (latest version, all workspaces). Public read — no
@@ -827,6 +843,20 @@ _INDEX_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
   .runrow .rst.failed,.runrow .rst.blocked{color:#ff9a90;border-color:rgba(251,90,78,.4)}
   .runrow .rst.partial,.runrow .rst.compensated{color:#f0c674;border-color:rgba(224,166,41,.45)}
   .runrow .rst.running{color:var(--blue);border-color:rgba(91,140,255,.35)}
+  /* compose form */
+  .cform{border:1px solid var(--line2);border-radius:var(--radius);background:var(--panel);
+    padding:14px 16px;display:grid;gap:10px;margin-bottom:14px}
+  .cform input,.cform select,.cform textarea{background:var(--elev);border:1px solid var(--line2);
+    border-radius:8px;color:var(--fg);font:12px var(--mono);padding:7px 10px;width:100%}
+  .cform textarea{min-height:46px;resize:vertical}
+  .cform .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .cform .ids{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .stageblk{border:1px solid var(--line);border-radius:10px;padding:11px 12px;display:grid;gap:8px}
+  .stageblk .stitle{color:var(--verb);font-size:12px;font-weight:600}
+  .stageblk.b2{border-color:rgba(168,119,247,.3)}
+  .cform .handoff{display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px;flex-wrap:wrap}
+  .cform .handoff input{width:auto;flex:1 1 120px}
+  .arrow{color:var(--violet);font-weight:600}
 
   /* toast */
   #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);
@@ -875,6 +905,26 @@ _INDEX_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
     <div class=auth-row>
       <input id=optoken type=password placeholder="operator token (for controls)" autocomplete=off oninput=saveToken()>
       <span class=hint id=tokhint>controls (approve / pause / run) need the registry token — view is open</span>
+      <button class="btn tiny" onclick=toggleCompose()>＋ New cross-system automation</button>
+    </div>
+    <div id=composeForm style=display:none>
+      <div class=cform>
+        <div class=ids><input id=cf_id placeholder="automation id (e.g. lead-to-invoice)">
+          <input id=cf_name placeholder="name"></div>
+        <div class="stageblk b1">
+          <div class=stitle>Stage 1 — system A</div>
+          <div class=row2><select id=cf_a1 onchange="loadVerbs('cf_v1',this.value)"></select><select id=cf_v1></select></div>
+          <textarea id=cf_args1 placeholder='args JSON — e.g. {"name":"Acme Co"}'></textarea>
+        </div>
+        <div class="stageblk b2">
+          <div class=stitle>Stage 2 — system B</div>
+          <div class=row2><select id=cf_a2 onchange="loadVerbs('cf_v2',this.value)"></select><select id=cf_v2></select></div>
+          <textarea id=cf_args2 placeholder='args JSON — use $.input.X for handoff, e.g. {"ref":"$.input.lead"}'></textarea>
+          <div class=handoff>handoff: <input id=cf_hk placeholder="input key (e.g. lead)">
+            <span class=arrow>←</span> <input id=cf_hr value="$.stage_1.step_1.output.state"></div>
+        </div>
+        <button class="btn ok" onclick=submitCompose()>Create automation</button>
+      </div>
     </div>
     <div id=automations></div>
   </section>
@@ -1189,6 +1239,51 @@ async function openRuns(ws,id){
       <span>${esc((x.fired_by||'').slice(0,20))}</span><span style=color:var(--faint)>${hhmmss(x.started_at)}</span></div>`).join('')
       :'<div class=runrow style=color:var(--faint)>no runs yet</div>';
   }catch(_){el.innerHTML='<div class=runrow>could not load runs</div>';}
+}
+
+// ── compose form: build a two-system automation in one click ────────────────────────────────────
+let cfWs='';
+function val(id){var e=document.getElementById(id);return e?e.value.trim():'';}
+function toggleCompose(){const f=document.getElementById('composeForm');if(!f)return;
+  if(f.style.display==='none'){f.style.display='block';populateCompose();}else f.style.display='none';}
+async function populateCompose(){
+  try{const d=await(await fetch('/api/registry')).json();cfWs=d.workspace||'';const ads=d.adapters||[];
+   const opts='<option value="">— select adapter —</option>'+ads.map(a=>`<option value="${esc(a.adapter_id)}">${esc(a.label||a.adapter_id)}${a.system?(' ('+esc(a.system)+')'):''}</option>`).join('');
+   ['cf_a1','cf_a2'].forEach(id=>{const s=document.getElementById(id);if(s)s.innerHTML=opts;});
+   ['cf_v1','cf_v2'].forEach(id=>{const s=document.getElementById(id);if(s)s.innerHTML='<option value="">— pick adapter first —</option>';});
+  }catch(_){}
+}
+async function loadVerbs(vsel,adapter){
+  const s=document.getElementById(vsel);if(!s)return;
+  if(!adapter){s.innerHTML='<option value="">— pick adapter first —</option>';return;}
+  if(!tokenVal()){s.innerHTML='<option value="">operator token required</option>';return;}
+  s.innerHTML='<option>loading…</option>';
+  try{const r=await fetch(`/api/adapter-skeleton?workspace=${encodeURIComponent(cfWs)}&adapter_id=${encodeURIComponent(adapter)}`,{headers:authHeaders()});
+    if(r.status===401){s.innerHTML='<option value="">token rejected</option>';return;}
+    if(!r.ok){s.innerHTML='<option value="">adapter unreachable</option>';return;}
+    const d=await r.json();const vs=d.verbs||[];
+    s.innerHTML=vs.length?('<option value="">— select verb —</option>'+vs.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('')):'<option value="">no verbs</option>';
+  }catch(_){s.innerHTML='<option value="">error</option>';}
+}
+async function submitCompose(){
+  if(!tokenVal())return toast('Enter the <b>operator token</b> above first.');
+  const id=val('cf_id'),nm=val('cf_name')||id,a1=val('cf_a1'),v1=val('cf_v1'),a2=val('cf_a2'),v2=val('cf_v2');
+  if(!id||!a1||!v1||!a2||!v2)return toast('Need id + both adapters + both verbs.');
+  let ar1={},ar2={};
+  try{ar1=val('cf_args1')?JSON.parse(val('cf_args1')):{};ar2=val('cf_args2')?JSON.parse(val('cf_args2')):{};}
+  catch(e){return toast('Args must be valid JSON.');}
+  const stage=(n,ad,vb,ar)=>({name:n,adapter:ad,plan:{wosool:"0.1",workspace:cfWs,entry:"step_1",
+    pipeline:[{id:"step_1",type:"action",skill:vb.split('.')[0],verb:vb,args:ar}]}});
+  const s2=stage('stage_2',a2,v2,ar2);const hk=val('cf_hk'),hr=val('cf_hr');if(hk&&hr)s2.input_from={[hk]:hr};
+  const body={automation_id:id,name:{en:nm,ar:nm},trigger:{type:"manual"},
+    composed:{workspace:cfWs,stages:[stage('stage_1',a1,v1,ar1),s2]}};
+  try{const r=await fetch('/automations/compose/register',{method:'POST',headers:authHeaders(),body:JSON.stringify(body)});
+    if(r.status===401)return toast('Operator token rejected.');
+    const d=await r.json();
+    if(!d.ok){const why=(d.report&&d.report.stages||[]).flatMap(s=>(s.diagnostics||[]).map(x=>x.code)).join(', ')||(d.report&&d.report.errors||[]).join(', ')||d.error||'refused';
+      return toast('Refused: '+esc(why));}
+    toast('Cross-system automation <b>registered</b> — pending approval.');toggleCompose();loadAutomations();
+  }catch(_){toast('Could not create the automation.');}
 }
 
 initToken();tick();pend();loadAdapters();loadRouting();loadAutomations();applyThemeGlyph();

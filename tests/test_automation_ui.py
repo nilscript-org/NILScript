@@ -51,6 +51,29 @@ def test_dashboard_html_includes_automations_panel(tmp_path):
     assert "operator token" in html  # the token-gated control affordance
 
 
+def test_adapter_skeleton_endpoint_feeds_the_form(tmp_path):
+    store = EventStore(path=str(tmp_path / "cp.db"))
+
+    async def adapter_skeletons(workspace: str, adapter_id: str):
+        return {"reachable": True, "conformant": True,
+                "verbs": ["crm.create_lead", "crm.create_contact"], "targets": {"crm.lead": {}}}
+
+    c = TestClient(create_app(store, adapter_skeleton_provider=adapter_skeletons, registry_token="t"))
+    assert c.get("/api/adapter-skeleton", params={"workspace": "acme", "adapter_id": "odoo"}).status_code == 401
+    ok = c.get("/api/adapter-skeleton", params={"workspace": "acme", "adapter_id": "odoo"},
+               headers={"Authorization": "Bearer t"})
+    assert ok.status_code == 200
+    assert ok.json()["verbs"] == ["crm.create_lead", "crm.create_contact"]
+    assert ok.json()["targets"] == ["crm.lead"]
+
+
+def test_compose_form_present_in_html(tmp_path):
+    html = _client(tmp_path).get("/").text
+    assert "id=composeForm" in html
+    assert "submitCompose" in html and "loadVerbs" in html
+    assert "New cross-system automation" in html
+
+
 def test_api_automations_lists_across_workspaces(tmp_path):
     c = _client(tmp_path)
     c.post("/automations/register", json={
