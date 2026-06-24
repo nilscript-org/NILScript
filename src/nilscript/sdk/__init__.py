@@ -8,10 +8,12 @@ backend. It is imported only when nilscript is installed with the ``[sdk]`` extr
 from nilscript.sdk.bootstrap import client_for_grant, client_from_env
 from nilscript.sdk.client import NilClient
 from nilscript.sdk.connect import handshake
+from nilscript.sdk.ceilings import exceeds_ceiling, floor_tier
 from nilscript.sdk.grants import GrantRef, scope_allows
 from nilscript.sdk.legibility import echo_preview, field_label, legible
 from nilscript.sdk.refusals import RefusalCode
 from nilscript.sdk.transport import NilTransport
+from nilscript.sdk.witness import compute_witness, witness_changed
 
 # Documented public alias (uppercase NIL).
 NILClient = NilClient
@@ -29,4 +31,8 @@ __all__ = [
     "legible",
     "field_label",
     "echo_preview",
+    "compute_witness",
+    "witness_changed",
+    "exceeds_ceiling",
+    "floor_tier",
 ]

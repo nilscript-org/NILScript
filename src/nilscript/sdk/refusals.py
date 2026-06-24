@@ -23,6 +23,10 @@ class RefusalCode(StrEnum):
     # reverse an effect it cannot. An honest refusal, never a silent corrective write.
     IRREVERSIBLE = "IRREVERSIBLE"
     COMPENSATION_EXPIRED = "COMPENSATION_EXPIRED"
+    # State-witness (TOCTOU): a proposal is bound to the SSOT state it previewed; if that state
+    # drifts before COMMIT (a delayed approval against a changed world), the kernel fails closed
+    # rather than writing against stale reality. Re-preview, re-approve — never a blind commit.
+    PRECONDITION_FAILED = "PRECONDITION_FAILED"
 
 
 RETRIABLE_REFUSALS: frozenset[RefusalCode] = frozenset(

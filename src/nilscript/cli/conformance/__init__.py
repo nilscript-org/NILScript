@@ -72,6 +72,7 @@ def run_conformance(
     query_verb: str | None = None,
     query_args: dict[str, Any] | None = None,
     reversibility: str | None = None,
+    reference_probe: tuple[str, dict[str, Any]] | None = None,
 ) -> list[Check]:
     """Run the conformance matrix against `probe`. Returns one Check per row (order stable).
 
@@ -163,6 +164,27 @@ def run_conformance(
         answer = probe.query(query_verb, query_args or {})
         bare = isinstance(answer, dict) and "data" in answer and "performative" not in answer
         checks.append(Check("query_returns_bare_data", bare, f"keys={sorted(answer)[:4] if isinstance(answer, dict) else answer!r}"))
+
+    # Row — reference legibility (docs/reference-legibility.md): a written relational/selection field
+    # MUST be echoed by resolved NAME in `resolved.references[field].label`, never a bare id — so an
+    # opaque foreign key (the country_id=224 class of error) cannot cross approval illegibly. Driven
+    # by an optional probe (verb+args that set a constrained field); a backend exposing no constrained
+    # field omits the probe and the row is simply absent (advertised ≡ committable, legibly).
+    if reference_probe is not None:
+        rverb, rargs = reference_probe
+        rp = probe.propose(rverb, rargs)
+        resolved = _body(rp).get("resolved") or {}
+        refs = resolved.get("references", {}) if isinstance(resolved, dict) else {}
+        labeled = isinstance(refs, dict) and any(
+            isinstance(v, dict) and v.get("label") for v in refs.values()
+        )
+        checks.append(
+            Check(
+                "references_echoed_by_name",
+                _outcome(rp) == "proposal" and labeled,
+                f"outcome={_outcome(rp)!r} references={refs}",
+            )
+        )
 
     # Rollback-honesty rows — appended only when a reversibility tier is declared AND the shim
     # implements rollback. They prove the shim cannot misrepresent its reversal capability.

@@ -162,3 +162,40 @@ def test_runner_detects_silent_reversal_write() -> None:
 def test_rollback_rows_absent_without_declared_reversibility() -> None:
     checks = run_conformance(ConformantProbe(), write_verb="services.create_invoice", write_args=_ARGS)
     assert not any(c.name.startswith("rollback_") for c in checks)
+
+
+class _RefProbe(ConformantProbe):
+    """Echoes a relational field by resolved NAME — the legible behavior the row enforces."""
+
+    def __init__(self, legible: bool) -> None:
+        super().__init__()
+        self._legible = legible
+
+    def propose(self, verb: str, args: dict[str, Any]) -> dict[str, Any]:
+        if verb == "commerce.create_order" and args.get("party_id"):
+            refs = {"party_id": {"value": "cli_88", "label": "Acme Corp"}} if self._legible else {}
+            return {"body": {"outcome": "proposal", "id": "rp1", "resolved": {"references": refs}}}
+        return super().propose(verb, args)
+
+
+def test_references_echoed_by_name_passes_when_legible() -> None:
+    checks = run_conformance(
+        _RefProbe(legible=True), write_verb="services.create_invoice", write_args=_ARGS,
+        reference_probe=("commerce.create_order", {"party_id": "Acme Corp"}),
+    )
+    row = next(c for c in checks if c.name == "references_echoed_by_name")
+    assert row.passed, row.detail
+
+
+def test_references_row_detects_bare_id_illegibility() -> None:
+    checks = run_conformance(
+        _RefProbe(legible=False), write_verb="services.create_invoice", write_args=_ARGS,
+        reference_probe=("commerce.create_order", {"party_id": "Acme Corp"}),
+    )
+    row = next(c for c in checks if c.name == "references_echoed_by_name")
+    assert not row.passed  # a bare id with no label must fail the row
+
+
+def test_references_row_absent_without_probe() -> None:
+    checks = run_conformance(ConformantProbe(), write_verb="services.create_invoice", write_args=_ARGS)
+    assert not any(c.name == "references_echoed_by_name" for c in checks)
