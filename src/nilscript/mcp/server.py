@@ -316,6 +316,21 @@ def _register_tools(server: Any, provider: ToolsProvider) -> None:
     async def nil_query(verb: str, args: dict[str, Any] | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         return await provider.get(ctx).query(verb, args)
 
+    async def nil_search(target: str, filter: list[dict[str, Any]] | None = None, fields: list[str] | None = None, limit: int = 50, cursor: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        return await provider.get(ctx).search(target, filter, fields, limit, cursor)
+
+    async def nil_count(target: str, filter: list[dict[str, Any]] | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        return await provider.get(ctx).count(target, filter)
+
+    async def nil_get(target: str, id: Any, fields: list[str] | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        return await provider.get(ctx).get(target, id, fields)
+
+    async def nil_aggregate(target: str, group_by: str, metrics: list[str] | None = None, filter: list[dict[str, Any]] | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        return await provider.get(ctx).aggregate(target, group_by, metrics, filter)
+
+    async def nil_export(target: str, filter: list[dict[str, Any]] | None = None, fields: list[str] | None = None, approved: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        return await provider.get(ctx).export(target, filter, fields, approved)
+
     async def nil_status(proposal_id: str, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         return await provider.get(ctx).status(proposal_id)
 
@@ -339,6 +354,32 @@ def _register_tools(server: Any, provider: ToolsProvider) -> None:
     server.add_tool(
         nil_query, name="nil_query",
         description="Read live business truth (verb + args). No side effect.",
+    )
+    server.add_tool(
+        nil_search, name="nil_search",
+        description="Lean, FILTERED, PAGINATED read of a target (filter=[{field,op,value}], small fields=, "
+        "limit, cursor). Returns {items:[{id,…projected}], next_cursor} — never whole records, never "
+        "unbounded; an over-cap page is REFUSED (narrow the filter or use nil_export), never truncated.",
+    )
+    server.add_tool(
+        nil_count, name="nil_count",
+        description="Just {count} for a target+filter. The FIRST call for any 'how many / does X exist' — "
+        "never list to count.",
+    )
+    server.add_tool(
+        nil_get, name="nil_get",
+        description="One lean record by key (target + id + optional fields). For exact lookups.",
+    )
+    server.add_tool(
+        nil_aggregate, name="nil_aggregate",
+        description="Server-side rollup (target + group_by + metrics): 'revenue by country', 'count by "
+        "status'. Small result; rows never enter context. Refuses → nil_export when unsupported.",
+    )
+    server.add_tool(
+        nil_export, name="nil_export",
+        description="Stream a bulk read to a DATA HANDLE (not rows): open it in your sandbox and use code "
+        "(pandas/sqlite) for analysis over many rows. Bulk extraction is gated+audited "
+        "(BULK_APPROVAL_REQUIRED until approved=true).",
     )
     server.add_tool(
         nil_status, name="nil_status",
