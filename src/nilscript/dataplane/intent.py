@@ -36,13 +36,31 @@ class Binding:
     value: Any
 
 
+# op → the universal generic-CRUD verb every adapter supports (no adapter-specific verb map, no
+# keywords): a change intent executes through resource.* — the deterministic write spine.
+OP_TO_RESOURCE: dict[str, str] = {
+    "create": "resource.create",
+    "update": "resource.update",
+    "remove": "resource.delete",
+}
+
+
+@dataclass(frozen=True)
+class Change:
+    """The write shape of an intent: what to make true. Resolved → propose→commit→tier (governed)."""
+
+    op: str                 # create | update | remove
+    set: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class Intent:
     """The single payload the model emits — *what* it wants, never *how*."""
 
     about: str                      # ontology type / entity (adapter-agnostic)
     where: tuple[Binding, ...] = ()
-    seek: str = "all"               # the | all | count | summary  (read shapes; change spec later)
+    seek: str = "all"               # the | all | count | summary  (read shapes)
+    change: Change | None = None    # present → a write intent (governed via propose→commit→tier)
     limit: int = 50
     cursor: str | None = None
 

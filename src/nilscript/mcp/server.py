@@ -316,8 +316,8 @@ def _register_tools(server: Any, provider: ToolsProvider) -> None:
     async def nil_query(verb: str, args: dict[str, Any] | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         return await provider.get(ctx).query(verb, args)
 
-    async def nil_intent(about: str, where: list[dict[str, Any]] | None = None, seek: str = "all", limit: int = 50, cursor: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        return await provider.get(ctx).intent(about, where, seek, limit, cursor)
+    async def nil_intent(about: str, where: list[dict[str, Any]] | None = None, seek: str = "all", change: dict[str, Any] | None = None, limit: int = 50, cursor: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        return await provider.get(ctx).intent(about, where, seek, change, limit, cursor, session_id=session_key(ctx))
 
     async def nil_search(target: str, filter: list[dict[str, Any]] | None = None, fields: list[str] | None = None, limit: int = 50, cursor: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         return await provider.get(ctx).search(target, filter, fields, limit, cursor)
@@ -362,9 +362,11 @@ def _register_tools(server: Any, provider: ToolsProvider) -> None:
         nil_intent, name="nil_intent",
         description="THE primary tool. Express WHAT you want as one payload — about (an entity, e.g. "
         "res.partner), where ([{attr, rel, value}] with rel ∈ is|contains|gt|gte|lt|lte|between|in), and "
-        "seek (the|all|count|summary). The system resolves + executes it and returns a lean result or a "
-        "structured refusal. You NEVER pick a verb, build a filter, or list to scan. "
-        "Find a contact named دينا → about='res.partner', where=[{attr:'name',rel:'contains',value:'دينا'}], seek='the'.",
+        "either seek (the|all|count|summary, a read) OR change ({op:create|update|remove, set:{...}}, a "
+        "governed write). Reads return a lean result; a change returns a PREVIEW the gate/owner commits. "
+        "You NEVER pick a verb, build a filter, or list to scan. "
+        "Find دينا → about='res.partner', where=[{attr:'name',rel:'contains',value:'دينا'}], seek='the'. "
+        "Update her phone → about='res.partner', where=[{attr:'name',rel:'contains',value:'دينا'}], change={op:'update', set:{phone:'…'}}.",
     )
     server.add_tool(
         nil_search, name="nil_search",
