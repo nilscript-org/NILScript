@@ -369,6 +369,51 @@ def create_app(
         )
         return {"ok": True, "adapter": _redact(rec)}
 
+    @app.post("/tenants/provision")
+    async def provision_tenant(request: Request, authorization: str | None = Header(default=None)) -> Any:
+        """One-call onboarding for a company: save its secrets (encrypted) ONCE, then register +
+        activate its adapter — a new tenant is stood up in a single privileged call. Auth-protected
+        (registry token); never called from the browser (the OS BFF brokers it behind keycloak)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        ws = body.get("workspace", "") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        steps: dict[str, Any] = {}
+        secrets = body.get("secrets") or {}
+        if secrets:
+            try:
+                store.put_secrets(ws, secrets)  # adapter creds + llm key, encrypted at rest
+                steps["secrets"] = sorted(secrets.keys())
+            except RuntimeError as exc:  # vault disabled (no NIL_VAULT_KEY)
+                return JSONResponse({"error": str(exc)}, status_code=503)
+        adapter = body.get("adapter") or {}
+        if adapter.get("adapter_id") and adapter.get("url"):
+            store.register_adapter(
+                ws, adapter["adapter_id"], label=adapter.get("label", "") or "",
+                url=adapter["url"], bearer=adapter.get("bearer", "") or "",
+                system=adapter.get("system", "") or "",
+            )
+            store.activate_adapter(ws, adapter["adapter_id"])
+            steps["adapter"] = f"{adapter['adapter_id']} registered+activated"
+        return {"ok": True, "workspace": ws, "provisioned": steps}
+
+    @app.get("/tenants/{workspace}/secret/{name}")
+    def get_tenant_secret(workspace: str, name: str, authorization: str | None = Header(default=None)) -> Any:
+        """Server-to-server secret fetch for the platform (e.g. the MCP needs a tenant's LLM key).
+        Registry-token-gated; returns the DECRYPTED value to the authenticated platform caller only —
+        never reachable from the browser, never logged."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        value = store.get_secret(workspace, name)
+        if value is None:
+            return JSONResponse({"error": "no such secret"}, status_code=404)
+        return {"workspace": workspace, "name": name, "value": value}
+
     @app.post("/adapters/{workspace}/{adapter_id}/activate")
     def activate_adapter(workspace: str, adapter_id: str, authorization: str | None = Header(default=None)) -> Any:
         """Make this adapter the active backend for the workspace (auth-protected)."""

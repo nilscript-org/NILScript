@@ -59,6 +59,15 @@ CREATE TABLE IF NOT EXISTS adapters (
     PRIMARY KEY (workspace, adapter_id)
 );
 
+-- Per-tenant secret vault: a company's adapter creds + LLM key, saved ONCE at onboarding. The value
+-- is ENCRYPTED at rest (Fernet, master key from NIL_VAULT_KEY) — a leaked row is ciphertext, never
+-- credentials. Keyed by workspace; the control-plane decrypts only to use, never echoes to the browser.
+CREATE TABLE IF NOT EXISTS tenant_secrets (
+    workspace   TEXT    NOT NULL PRIMARY KEY,
+    ciphertext  BLOB    NOT NULL,
+    updated_at  TEXT    NOT NULL
+);
+
 -- Automation Registry (SSOT): one row per VERSION of one automation. Append-only — "editing" an
 -- automation writes a new version and archives the prior one (superseded_by). `content_hash` is the
 -- version lock (sha256 over the validated plan). See docs/PLAN-dynamic-automation-ssot.md.
@@ -155,6 +164,15 @@ class EventStore:
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        # The secret vault is enabled only when a master key is configured; otherwise secret storage
+        # fails closed (a tenant's creds are never stored in plaintext as a fallback).
+        self._vault = None
+        try:
+            from nilscript.secrets import SecretVault
+
+            self._vault = SecretVault.from_env()  # NIL_VAULT_KEY; raises if unset → stays None
+        except Exception:  # noqa: BLE001 — no/invalid key ⇒ vault disabled, not crashed
+            self._vault = None
         with self._lock:
             self._conn.executescript(_DDL)
             # Existing DBs (volume) predate event_id — add it idempotently.
@@ -501,6 +519,51 @@ class EventStore:
             )
             self._conn.commit()
         return self._adapter(workspace, adapter_id) or {}
+
+    # ── per-tenant secret vault (encrypted at rest) ──────────────────────────────────────────────
+    @property
+    def vault_enabled(self) -> bool:
+        return self._vault is not None
+
+    def put_secrets(self, workspace: str, secrets: dict[str, Any]) -> None:
+        """Save (replace) a workspace's secret bundle, ENCRYPTED. Raises if the vault is unconfigured —
+        the platform never stores a tenant's creds in plaintext as a fallback."""
+        if self._vault is None:
+            raise RuntimeError("secret vault disabled — set NIL_VAULT_KEY to store tenant secrets")
+        if not workspace:
+            raise ValueError("workspace is required")
+        blob = self._vault._fernet.encrypt(  # encrypt here, persist ciphertext (vault store is the DB)
+            json.dumps(secrets, separators=(",", ":")).encode("utf-8")
+        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO tenant_secrets (workspace, ciphertext, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(workspace) DO UPDATE SET ciphertext=excluded.ciphertext, "
+                "updated_at=excluded.updated_at",
+                (workspace, blob, _now()),
+            )
+            self._conn.commit()
+
+    def get_secrets(self, workspace: str) -> dict[str, Any] | None:
+        """Decrypt a workspace's secret bundle (by-tenant only), or None. Raises on tamper/wrong key."""
+        if self._vault is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ciphertext FROM tenant_secrets WHERE workspace = ?", (workspace,)
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(self._vault._fernet.decrypt(row["ciphertext"]).decode("utf-8"))
+
+    def get_secret(self, workspace: str, name: str) -> Any | None:
+        bundle = self.get_secrets(workspace)
+        return bundle.get(name) if bundle else None
+
+    def delete_secrets(self, workspace: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM tenant_secrets WHERE workspace = ?", (workspace,))
+            self._conn.commit()
 
     def activate_adapter(self, workspace: str, adapter_id: str) -> bool:
         """Make `adapter_id` the active backend for `workspace`, deactivating its siblings.
