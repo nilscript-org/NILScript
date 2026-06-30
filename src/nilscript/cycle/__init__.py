@@ -15,6 +15,8 @@ from nilscript.cycle.authoring import (
 )
 from nilscript.cycle.compile import CompileResult, compile_cycle
 from nilscript.cycle.hash import cycle_content_hash
+from nilscript.cycle.nil_parser import NilSyntaxError, parse_nil
+from nilscript.cycle.nil_printer import print_nil
 from nilscript.cycle.models import (
     ActionStep,
     ApprovalStep,
@@ -30,6 +32,13 @@ from nilscript.cycle.models import (
     RoleRef,
     VariableBinding,
 )
+from nilscript.cycle.projections import (
+    governance_report,
+    simulate,
+    to_markdown,
+    to_mermaid,
+)
+from nilscript.cycle.registry import DeadReference, ProtocolRegistry, Symbol
 
 __all__ = [
     "Cycle",
@@ -48,6 +57,16 @@ __all__ = [
     "CompileResult",
     "compile_cycle",
     "cycle_content_hash",
+    "print_nil",
+    "parse_nil",
+    "NilSyntaxError",
+    "ProtocolRegistry",
+    "Symbol",
+    "DeadReference",
+    "to_mermaid",
+    "to_markdown",
+    "simulate",
+    "governance_report",
     "CycleDraftResult",
     "cycle_slug",
     "draft_cycle",
