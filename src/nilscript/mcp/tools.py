@@ -104,6 +104,10 @@ class NilTools:
                 # the human preview (e.g. {"summary": "delete contact AHMED (43)"}) so the owner's
                 # approval screen can show WHAT they're approving, not a bare proposal id.
                 "preview": proposal.preview,
+                # the resolved field values + which are editable, so the decision card can show a
+                # filled-in, editable form — approving with edits re-proposes the tweaked values.
+                "resolved": proposal.resolved or {},
+                "modifiable": list(proposal.modifiable or ()),
             }
 
     async def describe(self) -> dict[str, Any]:
@@ -366,7 +370,16 @@ class NilTools:
             async with httpx.AsyncClient(timeout=5.0) as c:
                 await c.post(
                     f"{base}/proposals/{proposal_id}/await",
-                    json={"verb": prop.get("verb"), "tier": tier, "preview": prop.get("preview")},
+                    json={
+                        "verb": prop.get("verb"),
+                        "tier": tier,
+                        "preview": prop.get("preview"),
+                        "workspace": self._workspace,  # SaaS isolation: the hold carries its tenant
+                        # the editable field values, so the owner's card is a filled-in form and an
+                        # approve-with-edits can re-propose exactly the tweaked args.
+                        "resolved": prop.get("resolved") or {},
+                        "modifiable": prop.get("modifiable") or [],
+                    },
                 )
         except httpx.HTTPError:
             pass

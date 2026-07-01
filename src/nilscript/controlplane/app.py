@@ -38,6 +38,22 @@ from nilscript.automation import (
 )
 from nilscript.automation.compose import StageRunner
 from nilscript.controlplane.store import EventStore
+from nilscript.cycle import (
+    Cycle,
+    NilSyntaxError,
+    completions as lsp_completions,
+    diagnostics as lsp_diagnostics,
+    draft_cycle,
+    governance_report,
+    hover as lsp_hover,
+    parse_nil,
+    print_nil,
+    register_cycle,
+    semantic_tokens as lsp_semantic_tokens,
+    simulate,
+    to_markdown,
+    to_mermaid,
+)
 from nilscript.kernel.diagnostics import ValidationResult
 from nilscript.kernel.executor import LocalExecutor
 from nilscript.sdk.client import NilClient
@@ -56,6 +72,7 @@ def _plan_scopes(plan: dict[str, Any]) -> frozenset[str]:
             scopes.add(verb)
             scopes.add(verb.split(".", 1)[0] + ".*")
     return frozenset(scopes) or frozenset({"*"})
+
 
 # An async source of a workspace's live adapter skeleton ({verbs, targets, ...}), or None when there
 # is no reachable/conformant active adapter. Injectable so the draft gate is testable without a backend.
@@ -81,7 +98,8 @@ def _redact(adapter: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_app(
-    store: EventStore | None = None, *,
+    store: EventStore | None = None,
+    *,
     secret: str | None = None,
     registry_token: str | None = None,
     skeleton_provider: SkeletonProvider | None = None,
@@ -92,7 +110,8 @@ def create_app(
     store = store if store is not None else EventStore()
     secret = secret if secret is not None else os.environ.get("NIL_EVENTS_SECRET", "")
     registry_token = (
-        registry_token if registry_token is not None
+        registry_token
+        if registry_token is not None
         else os.environ.get("NIL_REGISTRY_TOKEN", "")
     )
     app = FastAPI(title="nilscript control plane", version="0.1.0")
@@ -102,7 +121,9 @@ def create_app(
         otherwise require `Authorization: Bearer <NIL_REGISTRY_TOKEN>`."""
         if not registry_token:
             return True
-        return bool(authorization) and hmac.compare_digest(authorization, f"Bearer {registry_token}")
+        return bool(authorization) and hmac.compare_digest(
+            authorization, f"Bearer {registry_token}"
+        )
 
     async def _live_skeleton(workspace: str) -> dict[str, Any] | None:
         """Default skeleton source: discover the workspace's active adapter over NIL. None when there
@@ -110,7 +131,9 @@ def create_app(
         active = store.active_adapter(workspace)
         if not active or not active.get("url"):
             return None
-        transport = NilTransport(base_url=active["url"], bearer_secret=active.get("bearer", "") or "")
+        transport = NilTransport(
+            base_url=active["url"], bearer_secret=active.get("bearer", "") or ""
+        )
         try:
             report = await handshake(transport)
         finally:
@@ -133,13 +156,18 @@ def create_app(
         bearer = active.get("bearer", "") or ""
         transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
         grant = GrantRef.from_secret(
-            grant_id="control-plane", workspace=ws, secret=bearer or "cp",
+            grant_id="control-plane",
+            workspace=ws,
+            secret=bearer or "cp",
             scopes=_plan_scopes(plan),
         )
         client = NilClient(transport=transport, grant=grant)
         try:
             executor = LocalExecutor(
-                client, run_id=run_id, session_id=run_id, locale=plan.get("locale", "ar")
+                client,
+                run_id=run_id,
+                session_id=run_id,
+                locale=plan.get("locale", "ar"),
             )
             return await executor.execute(plan)
         finally:
@@ -147,30 +175,45 @@ def create_app(
 
     run_exec: Runner = runner or _live_runner
 
-    async def _live_adapter_skeleton(workspace: str, adapter_id: str) -> dict[str, Any] | None:
+    async def _live_adapter_skeleton(
+        workspace: str, adapter_id: str
+    ) -> dict[str, Any] | None:
         """Discover a SPECIFIC registered adapter (by id) over NIL — for composed-plan validation,
         where each stage names its own backend (which may not be the workspace's active one)."""
         match = next(
-            (a for a in store.list_adapters(workspace)
-             if a.get("adapter_id") == adapter_id and a.get("url")),
+            (
+                a
+                for a in store.list_adapters(workspace)
+                if a.get("adapter_id") == adapter_id and a.get("url")
+            ),
             None,
         )
         if match is None:
             return None
-        transport = NilTransport(base_url=match["url"], bearer_secret=match.get("bearer", "") or "")
+        transport = NilTransport(
+            base_url=match["url"], bearer_secret=match.get("bearer", "") or ""
+        )
         try:
             report = await handshake(transport)
         finally:
             await transport.aclose()
         return report if report.get("reachable") and report.get("conformant") else None
 
-    adapter_skeletons: AdapterSkeletonProvider = adapter_skeleton_provider or _live_adapter_skeleton
+    adapter_skeletons: AdapterSkeletonProvider = (
+        adapter_skeleton_provider or _live_adapter_skeleton
+    )
 
-    async def _live_stage_runner(adapter: str, plan: dict[str, Any], *, run_id: str, input: dict[str, Any]) -> Any:
+    async def _live_stage_runner(
+        adapter: str, plan: dict[str, Any], *, run_id: str, input: dict[str, Any]
+    ) -> Any:
         """Run one composed stage against the named adapter (by id) via a headless LocalExecutor."""
         ws = plan.get("workspace", "") if isinstance(plan, dict) else ""
         match = next(
-            (a for a in store.list_adapters(ws) if a.get("adapter_id") == adapter and a.get("url")),
+            (
+                a
+                for a in store.list_adapters(ws)
+                if a.get("adapter_id") == adapter and a.get("url")
+            ),
             None,
         )
         if match is None:
@@ -178,18 +221,26 @@ def create_app(
         bearer = match.get("bearer", "") or ""
         transport = NilTransport(base_url=match["url"], bearer_secret=bearer)
         grant = GrantRef.from_secret(
-            grant_id="control-plane", workspace=ws, secret=bearer or "cp", scopes=_plan_scopes(plan),
+            grant_id="control-plane",
+            workspace=ws,
+            secret=bearer or "cp",
+            scopes=_plan_scopes(plan),
         )
         client = NilClient(transport=transport, grant=grant)
         try:
             return await LocalExecutor(
-                client, run_id=run_id, session_id=run_id, locale=plan.get("locale", "ar")
+                client,
+                run_id=run_id,
+                session_id=run_id,
+                locale=plan.get("locale", "ar"),
             ).execute(plan, input=input or None)
         finally:
             await transport.aclose()
 
     stage_exec: StageRunner = stage_runner or _live_stage_runner
-    _bg_tasks: set[asyncio.Task[Any]] = set()  # keep fire-and-forget dispatch tasks from being GC'd
+    _bg_tasks: set[asyncio.Task[Any]] = (
+        set()
+    )  # keep fire-and-forget dispatch tasks from being GC'd
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
@@ -205,13 +256,19 @@ def create_app(
         raw = await request.body()
         if secret:
             expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-            if not x_nil_signature or not hmac.compare_digest(x_nil_signature, expected):
+            if not x_nil_signature or not hmac.compare_digest(
+                x_nil_signature, expected
+            ):
                 return JSONResponse({"error": "bad signature"}, status_code=401)
         try:
             envelope = json.loads(raw)
         except (ValueError, TypeError):
             return JSONResponse({"error": "bad json"}, status_code=400)
-        seq = int(x_nil_sequence) if (x_nil_sequence and x_nil_sequence.lstrip("-").isdigit()) else None
+        seq = (
+            int(x_nil_sequence)
+            if (x_nil_sequence and x_nil_sequence.lstrip("-").isdigit())
+            else None
+        )
         new = store.ingest(envelope, seq, source=x_nil_source or "mcp")
         if new:
             # Fire event-triggered automations off the request path — ingest must stay fast and must
@@ -223,8 +280,10 @@ def create_app(
         return {"ok": True, "new": new}
 
     @app.get("/api/events")
-    def events(limit: int = 100) -> dict[str, Any]:
-        return {"events": store.recent(limit)}
+    def events(limit: int = 100, workspace: str | None = None) -> dict[str, Any]:
+        # SaaS: a workspace query param scopes the timeline to that tenant (the BFF passes the
+        # authenticated workspace); omitted = operator/global view.
+        return {"events": store.recent(limit, workspace=workspace)}
 
     @app.get("/api/events/{event_id}")
     def event_detail(event_id: int) -> Any:
@@ -247,7 +306,13 @@ def create_app(
         except (ValueError, TypeError):
             body = {}
         return store.await_approval(
-            proposal_id, verb=body.get("verb"), tier=body.get("tier"), preview=body.get("preview"),
+            proposal_id,
+            verb=body.get("verb"),
+            tier=body.get("tier"),
+            preview=body.get("preview"),
+            workspace=body.get("workspace") or "",
+            resolved=body.get("resolved"),
+            modifiable=body.get("modifiable"),
         )
 
     @app.get("/proposals/{proposal_id}/decision")
@@ -255,14 +320,21 @@ def create_app(
         """Polled by the gate before it commits a held proposal."""
         return {"proposal_id": proposal_id, "status": store.decision(proposal_id)}
 
-    async def _execute_approved(proposal_id: str) -> dict[str, Any]:
+    async def _execute_approved(
+        proposal_id: str, edits: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """The owner approved a HELD proposal → the CONTROL PLANE commits it against the active adapter.
         This is the SSOT keystone: approval DRIVES execution (the agent never re-commits), so an approve
         click actually performs the deletion/effect. Reuses the `_live_runner` client pattern; the
         proposal detail (verb) rides on the approval row (threaded at hold-time), so no MCP memory is
-        needed — survives MCP restarts. Honest on failure (expired / already committed / unreachable)."""
+        needed — survives MCP restarts. Honest on failure (expired / already committed / unreachable).
+
+        If the owner EDITED the fields on the decision card, `edits` holds the full amended args. We
+        re-PROPOSE those against the adapter (a fresh preview + id) and commit THAT — so the commit
+        still executes exactly what was previewed. The NIL invariant holds even under a human tweak."""
         appr = store.approval(proposal_id) or {}
-        active = store.any_active_adapter()
+        ws = store.proposal_workspace(proposal_id) or ""
+        active = store.active_adapter(ws) if ws else store.any_active_adapter()
         if not active or not active.get("url"):
             return {"executed": False, "error": "no active adapter to commit against"}
         ws = active.get("workspace", "") or ""
@@ -270,14 +342,37 @@ def create_app(
         bearer = active.get("bearer", "") or ""
         transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
         grant = GrantRef.from_secret(
-            grant_id="control-plane-approval", workspace=ws, secret=bearer or "cp",
+            grant_id="control-plane-approval",
+            workspace=ws,
+            secret=bearer or "cp",
             scopes=frozenset({verb}) if verb else frozenset(),
         )
         client = NilClient(transport=transport, grant=grant)
         try:
-            key = commit_idempotency_key(f"cp-approve:{proposal_id}", proposal_id)
-            outcome = await client.commit(proposal_id, idempotency_key=key)
-            return {"executed": True, "outcome": outcome.model_dump(mode="json", exclude_none=True)}
+            commit_id = proposal_id
+            edited = False
+            if edits and verb:
+                # amended args → re-propose (fresh dry-run + preview), then commit the NEW proposal.
+                reproposed = await client.propose(
+                    verb,
+                    edits,
+                    session_id=f"cp-approve:{proposal_id}",
+                    request_timestamp=_dt.datetime.now(_dt.UTC),
+                )
+                if reproposed.is_refusal or not reproposed.id:
+                    return {
+                        "executed": False,
+                        "error": "edited args rejected at re-propose: "
+                        f"{reproposed.code or 'refused'} {reproposed.message or ''}".strip(),
+                    }
+                commit_id, edited = reproposed.id, True
+            key = commit_idempotency_key(f"cp-approve:{commit_id}", commit_id)
+            outcome = await client.commit(commit_id, idempotency_key=key)
+            return {
+                "executed": True,
+                "edited": edited,
+                "outcome": outcome.model_dump(mode="json", exclude_none=True),
+            }
         except Exception as exc:  # noqa: BLE001 — adapter unreachable / proposal expired / already done
             return {"executed": False, "error": f"{type(exc).__name__}: {exc}"}
         finally:
@@ -294,16 +389,29 @@ def create_app(
             body = {}
         status = body.get("status")
         if status not in ("approved", "rejected"):
-            return JSONResponse({"error": "status must be 'approved' or 'rejected'"}, status_code=400)
-        ok = store.decide(proposal_id, status, actor=body.get("actor", "owner"), reason=body.get("reason", ""))
-        result: dict[str, Any] = {"ok": ok, "proposal_id": proposal_id, "status": store.decision(proposal_id)}
+            return JSONResponse(
+                {"error": "status must be 'approved' or 'rejected'"}, status_code=400
+            )
+        ok = store.decide(
+            proposal_id,
+            status,
+            actor=body.get("actor", "owner"),
+            reason=body.get("reason", ""),
+        )
+        result: dict[str, Any] = {
+            "ok": ok,
+            "proposal_id": proposal_id,
+            "status": store.decision(proposal_id),
+        }
         if ok and status == "approved":
-            result["execution"] = await _execute_approved(proposal_id)
+            edits = body.get("edits") if isinstance(body.get("edits"), dict) else None
+            result["execution"] = await _execute_approved(proposal_id, edits)
         return result
 
     @app.get("/api/pending")
-    def pending() -> dict[str, Any]:
-        return {"pending": store.pending()}
+    def pending(workspace: str | None = None) -> dict[str, Any]:
+        # SaaS: scope held proposals to the tenant (joined to its events' workspace); omitted = global.
+        return {"pending": store.pending(workspace=workspace)}
 
     @app.get("/api/adapters")
     def adapters() -> dict[str, Any]:
@@ -311,7 +419,9 @@ def create_app(
 
     @app.get("/api/adapter-skeleton")
     async def api_adapter_skeleton(
-        workspace: str = "", adapter_id: str = "", authorization: str | None = Header(default=None),
+        workspace: str = "",
+        adapter_id: str = "",
+        authorization: str | None = Header(default=None),
     ) -> Any:
         """The verbs (and target names) a specific adapter declares — feeds the UI compose form's verb
         dropdowns. Token-gated: it triggers a live handshake using the adapter's bearer."""
@@ -319,7 +429,9 @@ def create_app(
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         skeleton = await adapter_skeletons(workspace, adapter_id)
         if skeleton is None:
-            return JSONResponse({"error": "adapter not reachable/conformant"}, status_code=503)
+            return JSONResponse(
+                {"error": "adapter not reachable/conformant"}, status_code=503
+            )
         return {
             "verbs": skeleton.get("verbs", []),
             "targets": sorted((skeleton.get("targets") or {}).keys()),
@@ -336,23 +448,35 @@ def create_app(
                 stages = plan.get("stages") or []
                 summary = {
                     "stages": len(stages),
-                    "adapters": sorted({s.get("adapter") for s in stages if isinstance(s, dict)}),
+                    "adapters": sorted(
+                        {s.get("adapter") for s in stages if isinstance(s, dict)}
+                    ),
                 }
             else:
                 summary = {"nodes": len(plan.get("pipeline") or [])}
-            out.append({
-                "workspace": a["workspace"], "automation_id": a["automation_id"],
-                "version": a["version"], "content_hash": a["content_hash"],
-                "kind": a.get("kind", "single"), "name": a.get("name") or {},
-                "state": a["state"], "trigger": a.get("trigger") or {},
-                "approved_by": a.get("approved_by"), "authored_by": a.get("authored_by"),
-                "created_at": a.get("created_at"), "plan_summary": summary,
-            })
+            out.append(
+                {
+                    "workspace": a["workspace"],
+                    "automation_id": a["automation_id"],
+                    "version": a["version"],
+                    "content_hash": a["content_hash"],
+                    "kind": a.get("kind", "single"),
+                    "name": a.get("name") or {},
+                    "state": a["state"],
+                    "trigger": a.get("trigger") or {},
+                    "approved_by": a.get("approved_by"),
+                    "authored_by": a.get("authored_by"),
+                    "created_at": a.get("created_at"),
+                    "plan_summary": summary,
+                }
+            )
         return {"automations": out}
 
     # ── active-adapter registry (multi-tenant routing) ───────────────────────────────────────
     @app.post("/adapters/register")
-    async def register_adapter(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def register_adapter(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Register/refresh an adapter the MCP can route to (auth-protected — carries a bearer)."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -360,17 +484,85 @@ def create_app(
             body = await request.json()
         except (ValueError, TypeError):
             return JSONResponse({"error": "bad json"}, status_code=400)
-        ws, aid, url = body.get("workspace", "") or "", body.get("adapter_id"), body.get("url")
+        ws, aid, url = (
+            body.get("workspace", "") or "",
+            body.get("adapter_id"),
+            body.get("url"),
+        )
         if not aid or not url:
-            return JSONResponse({"error": "adapter_id and url are required"}, status_code=400)
+            return JSONResponse(
+                {"error": "adapter_id and url are required"}, status_code=400
+            )
         rec = store.register_adapter(
-            ws, aid, label=body.get("label", "") or "", url=url,
-            bearer=body.get("bearer", "") or "", system=body.get("system", "") or "",
+            ws,
+            aid,
+            label=body.get("label", "") or "",
+            url=url,
+            bearer=body.get("bearer", "") or "",
+            system=body.get("system", "") or "",
         )
         return {"ok": True, "adapter": _redact(rec)}
 
+    @app.post("/tenants/provision")
+    async def provision_tenant(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """One-call onboarding for a company: save its secrets (encrypted) ONCE, then register +
+        activate its adapter — a new tenant is stood up in a single privileged call. Auth-protected
+        (registry token); never called from the browser (the OS BFF brokers it behind keycloak)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        ws = body.get("workspace", "") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        steps: dict[str, Any] = {}
+        secrets = body.get("secrets") or {}
+        if secrets:
+            try:
+                store.put_secrets(
+                    ws, secrets
+                )  # adapter creds + llm key, encrypted at rest
+                steps["secrets"] = sorted(secrets.keys())
+            except RuntimeError as exc:  # vault disabled (no NIL_VAULT_KEY)
+                return JSONResponse({"error": str(exc)}, status_code=503)
+        adapter = body.get("adapter") or {}
+        if adapter.get("adapter_id") and adapter.get("url"):
+            store.register_adapter(
+                ws,
+                adapter["adapter_id"],
+                label=adapter.get("label", "") or "",
+                url=adapter["url"],
+                bearer=adapter.get("bearer", "") or "",
+                system=adapter.get("system", "") or "",
+            )
+            store.activate_adapter(ws, adapter["adapter_id"])
+            steps["adapter"] = f"{adapter['adapter_id']} registered+activated"
+        return {"ok": True, "workspace": ws, "provisioned": steps}
+
+    @app.get("/tenants/{workspace}/secret/{name}")
+    def get_tenant_secret(
+        workspace: str, name: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Server-to-server secret fetch for the platform (e.g. the MCP needs a tenant's LLM key).
+        Registry-token-gated; returns the DECRYPTED value to the authenticated platform caller only —
+        never reachable from the browser, never logged."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        value = store.get_secret(workspace, name)
+        if value is None:
+            return JSONResponse({"error": "no such secret"}, status_code=404)
+        return {"workspace": workspace, "name": name, "value": value}
+
     @app.post("/adapters/{workspace}/{adapter_id}/activate")
-    def activate_adapter(workspace: str, adapter_id: str, authorization: str | None = Header(default=None)) -> Any:
+    def activate_adapter(
+        workspace: str,
+        adapter_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """Make this adapter the active backend for the workspace (auth-protected)."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -379,23 +571,41 @@ def create_app(
         return {"ok": True, "workspace": workspace, "adapter_id": adapter_id}
 
     @app.post("/adapters/{workspace}/{adapter_id}/enable")
-    def enable_adapter(workspace: str, adapter_id: str, authorization: str | None = Header(default=None)) -> Any:
+    def enable_adapter(
+        workspace: str,
+        adapter_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """Enable an adapter WITHOUT deactivating siblings — several can be active at once (e.g.
         PocketBase + Odoo for a cross-system automation). Operator-gated."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if not store.set_adapter_active(workspace, adapter_id, True):
             return JSONResponse({"error": "no such adapter"}, status_code=404)
-        return {"ok": True, "workspace": workspace, "adapter_id": adapter_id, "active": True}
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "adapter_id": adapter_id,
+            "active": True,
+        }
 
     @app.post("/adapters/{workspace}/{adapter_id}/disable")
-    def disable_adapter(workspace: str, adapter_id: str, authorization: str | None = Header(default=None)) -> Any:
+    def disable_adapter(
+        workspace: str,
+        adapter_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """Disable one adapter (leaves siblings untouched). Operator-gated."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if not store.set_adapter_active(workspace, adapter_id, False):
             return JSONResponse({"error": "no such adapter"}, status_code=404)
-        return {"ok": True, "workspace": workspace, "adapter_id": adapter_id, "active": False}
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "adapter_id": adapter_id,
+            "active": False,
+        }
 
     @app.get("/adapters")
     def list_adapters(workspace: str = "") -> dict[str, Any]:
@@ -408,10 +618,15 @@ def create_app(
         for the owner workspace, bearer REDACTED. No write controls live in the browser — activation
         is operator-only via `nilscript adapters activate` (token never reaches the client)."""
         ws = os.environ.get("NIL_WORKSPACE", "")
-        return {"workspace": ws, "adapters": [_redact(a) for a in store.list_adapters(ws)]}
+        return {
+            "workspace": ws,
+            "adapters": [_redact(a) for a in store.list_adapters(ws)],
+        }
 
     @app.get("/adapters/active")
-    def get_active_adapter(workspace: str = "", authorization: str | None = Header(default=None)) -> Any:
+    def get_active_adapter(
+        workspace: str = "", authorization: str | None = Header(default=None)
+    ) -> Any:
         """The workspace's active adapter WITH bearer — for the MCP to route. Auth-protected."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -426,31 +641,48 @@ def create_app(
         or (None, JSONResponse-error). The plan's own `workspace` selects the adapter to validate
         against, so the lowered plan is bounded by the backend that will actually run it."""
         plan = body.get("plan")
-        aid, name, trigger = body.get("automation_id"), body.get("name"), body.get("trigger")
+        aid, name, trigger = (
+            body.get("automation_id"),
+            body.get("name"),
+            body.get("trigger"),
+        )
         if not isinstance(plan, dict) or not aid or name is None or trigger is None:
             return None, JSONResponse(
-                {"error": "automation_id, name, plan, trigger are required"}, status_code=400
+                {"error": "automation_id, name, plan, trigger are required"},
+                status_code=400,
             )
         ws = plan.get("workspace")
         if not ws:
-            return None, JSONResponse({"error": "plan.workspace is required"}, status_code=400)
+            return None, JSONResponse(
+                {"error": "plan.workspace is required"}, status_code=400
+            )
         skeleton = await provider(ws)
         if skeleton is None:
             return None, JSONResponse(
-                {"error": "no reachable active adapter for this workspace"}, status_code=503
+                {"error": "no reachable active adapter for this workspace"},
+                status_code=503,
             )
         ctx = context_from_skeleton(ws, skeleton)
         try:
             res = draft_automation(
-                automation_id=aid, name=name, raw_plan=plan, trigger=trigger, ctx=ctx,
-                authored_by=body.get("authored_by", "") or "", description=body.get("description"),
+                automation_id=aid,
+                name=name,
+                raw_plan=plan,
+                trigger=trigger,
+                ctx=ctx,
+                authored_by=body.get("authored_by", "") or "",
+                description=body.get("description"),
             )
         except (ValidationError, ValueError) as exc:
-            return None, JSONResponse({"error": f"malformed request: {exc}"}, status_code=400)
+            return None, JSONResponse(
+                {"error": f"malformed request: {exc}"}, status_code=400
+            )
         return res, None
 
     @app.post("/automations/draft")
-    async def automation_draft(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def automation_draft(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Preview: lower the agent's candidate plan against the live skeleton. No side effect.
         Returns the validator verdict + content-hash, or a structured refusal."""
         if not _registry_authed(authorization):
@@ -471,7 +703,9 @@ def create_app(
         }
 
     @app.post("/automations/register")
-    async def automation_register(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def automation_register(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Persist a passing draft to the SSOT as `pending_approval` (never auto-armed). Re-registering
         an identical plan is an idempotent no-op. A failing plan is refused — never stored."""
         if not _registry_authed(authorization):
@@ -484,23 +718,248 @@ def create_app(
         if err is not None:
             return err
         if not res.ok:
-            return JSONResponse({"ok": False, "refusal": _diag_list(res.diagnostics)}, status_code=400)
+            return JSONResponse(
+                {"ok": False, "refusal": _diag_list(res.diagnostics)}, status_code=400
+            )
         stored = register(store, res.definition)  # lands in pending_approval
         return {"ok": True, "definition": stored.model_dump(by_alias=True, mode="json")}
+
+    # ── Cycle AST (the visual surface registers THROUGH the kernel) ──────────────────────────
+    async def _cycle_draft_from_body(body: dict[str, Any]) -> tuple[Any, Any]:
+        """Compile a candidate Cycle AST against the workspace's live skeleton. Returns
+        (CycleDraftResult, None) or (None, JSONResponse-error). Same governance path as a plain
+        automation draft — lower → V1–V6 → AST content-hash — so a drawn cycle cannot talk past a
+        refusal (a hallucinated verb has nothing to bind to)."""
+        cycle = body.get("cycle")
+        if not isinstance(cycle, dict):
+            return None, JSONResponse({"error": "cycle (AST object) is required"}, status_code=400)
+        ws = cycle.get("workspace")
+        if not ws:
+            return None, JSONResponse({"error": "cycle.workspace is required"}, status_code=400)
+        skeleton = await provider(ws)
+        if skeleton is None:
+            return None, JSONResponse(
+                {"error": "no reachable active adapter for this workspace"}, status_code=503
+            )
+        ctx = context_from_skeleton(ws, skeleton)
+        try:
+            res = draft_cycle(raw_cycle=cycle, ctx=ctx)
+        except (ValidationError, ValueError) as exc:
+            return None, JSONResponse({"error": f"malformed cycle: {exc}"}, status_code=400)
+        return res, None
+
+    @app.post("/cycles/draft")
+    async def cycle_draft_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Preview: lower a drawn cycle against the live skeleton. No side effect. Returns the
+        validator verdict + AST content-hash + approval gates, or a structured refusal."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        res, err = await _cycle_draft_from_body(body)
+        if err is not None:
+            return err
+        if not res.ok:
+            return {"ok": False, "refusal": _diag_list(res.diagnostics)}
+        return {"ok": True, "content_hash": res.content_hash, "gates": list(res.gates)}
+
+    @app.post("/cycles/register")
+    async def cycle_register_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Persist a passing cycle to the SSOT as `pending_approval` (kind='cycle', Cycle AST in
+        `source`). A failing cycle is refused — never stored. Re-registering an identical cycle is an
+        idempotent no-op."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        res, err = await _cycle_draft_from_body(body)
+        if err is not None:
+            return err
+        if not res.ok:
+            return JSONResponse(
+                {"ok": False, "refusal": _diag_list(res.diagnostics)}, status_code=400
+            )
+        stored = register_cycle(store, res, authored_by=body.get("authored_by", "") or "")
+        return {"ok": True, "definition": stored}
+
+    @app.get("/cycles")
+    def cycles_list(workspace: str = "") -> dict[str, Any]:
+        """The latest version of every registered cycle in a workspace (kind='cycle')."""
+        cycles = [a for a in store.list_automations(workspace) if a.get("kind") == "cycle"]
+        return {"cycles": cycles}
+
+    # ── Cycle .nil surface + language services (the LSP brain — a projection, no state) ────────
+    async def _read_body(request: Request) -> tuple[dict[str, Any] | None, Any]:
+        try:
+            return await request.json(), None
+        except (ValueError, TypeError):
+            return None, JSONResponse({"error": "bad json"}, status_code=400)
+
+    async def _lsp_ctx(workspace: str | None) -> ValidationContext | None:
+        """Build a verb-catalog context from the workspace's live skeleton, or None when no workspace
+        is given or no reachable active adapter answers (the LSP then skips V4/V5 verb checks)."""
+        if not workspace:
+            return None
+        skeleton = await provider(workspace)
+        if skeleton is None:
+            return None
+        return context_from_skeleton(workspace, skeleton)
+
+    @app.post("/cycles/parse")
+    async def cycle_parse_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """`.nil` text → the validated Cycle AST, or a structured `{message, line, col}` syntax error."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        text = (body or {}).get("text", "")
+        try:
+            cycle = parse_nil(text)
+        except NilSyntaxError as exc:
+            return {
+                "ok": False,
+                "error": {"message": exc.message, "line": exc.line, "col": exc.col},
+            }
+        return {"ok": True, "cycle": cycle.model_dump(by_alias=True, mode="json")}
+
+    @app.post("/cycles/print")
+    async def cycle_print_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """A Cycle AST → its canonical `.nil` text. 400 on a malformed cycle."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        try:
+            cycle = Cycle.model_validate((body or {}).get("cycle"))
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse({"error": f"malformed cycle: {exc}"}, status_code=400)
+        return {"ok": True, "text": print_nil(cycle)}
+
+    @app.post("/cycles/lsp/diagnostics")
+    async def cycle_lsp_diagnostics(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Live diagnostics for `.nil` text. With a reachable `workspace` the verbs are validated
+        (V4/V5); without one the verb checks are skipped (an info diag says so)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        ctx = await _lsp_ctx(body.get("workspace"))
+        return {"diagnostics": lsp_diagnostics(body.get("text", ""), ctx)}
+
+    @app.post("/cycles/lsp/completions")
+    async def cycle_lsp_completions(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Context-aware completions at (line, col) in `.nil` text."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        ctx = await _lsp_ctx(body.get("workspace"))
+        items = lsp_completions(
+            body.get("text", ""), int(body.get("line", 1)), int(body.get("col", 1)), ctx
+        )
+        return {"completions": items}
+
+    @app.post("/cycles/lsp/hover")
+    async def cycle_lsp_hover(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Hover detail for the identifier under the cursor (may be null)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        ctx = await _lsp_ctx(body.get("workspace"))
+        info = lsp_hover(
+            body.get("text", ""), int(body.get("line", 1)), int(body.get("col", 1)), ctx
+        )
+        return {"hover": info}
+
+    @app.post("/cycles/lsp/semantic-tokens")
+    async def cycle_lsp_semantic_tokens(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Deterministic token classification for syntax highlighting."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        return {"tokens": lsp_semantic_tokens((body or {}).get("text", ""))}
+
+    @app.post("/cycles/projections")
+    async def cycle_projections_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """A read-only projection of a Cycle AST: a mermaid diagram, markdown docs, a happy-path
+        simulation, or the governance trust summary."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        kind = body.get("kind")
+        projections = {
+            "mermaid": to_mermaid,
+            "markdown": to_markdown,
+            "simulate": simulate,
+            "governance": governance_report,
+        }
+        fn = projections.get(kind)
+        if fn is None:
+            return JSONResponse(
+                {"error": f"unknown projection kind {kind!r}"}, status_code=400
+            )
+        try:
+            cycle = Cycle.model_validate(body.get("cycle"))
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse({"error": f"malformed cycle: {exc}"}, status_code=400)
+        return {"result": fn(cycle)}
 
     # ── cross-system composed automations (P3) ──────────────────────────────────────────────
     async def _validate_composed_body(body: dict[str, Any]) -> tuple[Any, Any]:
         """Validate a composed-plan request: each stage against ITS adapter's live skeleton + handoff
         well-formedness + a valid trigger. Returns ((composed_raw, report), None) or (None, error)."""
         composed = body.get("composed")
-        aid, name, trigger = body.get("automation_id"), body.get("name"), body.get("trigger")
+        aid, name, trigger = (
+            body.get("automation_id"),
+            body.get("name"),
+            body.get("trigger"),
+        )
         if not isinstance(composed, dict) or not aid or name is None or trigger is None:
             return None, JSONResponse(
-                {"error": "automation_id, name, composed, trigger are required"}, status_code=400
+                {"error": "automation_id, name, composed, trigger are required"},
+                status_code=400,
             )
         ws = composed.get("workspace")
         if not ws:
-            return None, JSONResponse({"error": "composed.workspace is required"}, status_code=400)
+            return None, JSONResponse(
+                {"error": "composed.workspace is required"}, status_code=400
+            )
         try:
             parse_trigger(trigger)
         except (ValidationError, ValueError, TypeError) as exc:
@@ -512,18 +971,24 @@ def create_app(
             skeleton = await adapter_skeletons(ws, adapter_id)
             if skeleton is None:
                 return None, JSONResponse(
-                    {"error": f"no reachable adapter {adapter_id!r} in workspace {ws!r}"},
+                    {
+                        "error": f"no reachable adapter {adapter_id!r} in workspace {ws!r}"
+                    },
                     status_code=503,
                 )
             skeletons[adapter_id] = skeleton
         try:
             parsed = parse_composed(composed)
         except (KeyError, TypeError) as exc:
-            return None, JSONResponse({"error": f"malformed composed plan: {exc}"}, status_code=400)
+            return None, JSONResponse(
+                {"error": f"malformed composed plan: {exc}"}, status_code=400
+            )
         return (composed, validate_composed(parsed, skeletons)), None
 
     @app.post("/automations/compose/draft")
-    async def compose_draft(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def compose_draft(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Preview: validate a cross-system composed plan, each stage against its adapter. No effect."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -540,7 +1005,9 @@ def create_app(
         return {"ok": True, "content_hash": composed_hash(composed), "report": report}
 
     @app.post("/automations/compose/register")
-    async def compose_register(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def compose_register(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Persist a passing composed plan as `pending_approval` (kind='composed')."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -555,10 +1022,16 @@ def create_app(
         if not report["ok"]:
             return JSONResponse({"ok": False, "report": report}, status_code=400)
         stored = store.register_automation(
-            workspace=composed["workspace"], automation_id=body["automation_id"],
-            content_hash=composed_hash(composed), name=body["name"], plan=composed,
-            trigger=body["trigger"], state="pending_approval", kind="composed",
-            authored_by=body.get("authored_by", "") or "", description=body.get("description"),
+            workspace=composed["workspace"],
+            automation_id=body["automation_id"],
+            content_hash=composed_hash(composed),
+            name=body["name"],
+            plan=composed,
+            trigger=body["trigger"],
+            state="pending_approval",
+            kind="composed",
+            authored_by=body.get("authored_by", "") or "",
+            description=body.get("description"),
         )
         return {"ok": True, "definition": stored}
 
@@ -568,7 +1041,9 @@ def create_app(
         return {"automations": store.list_automations(workspace)}
 
     @app.get("/automations/{workspace}/{automation_id}")
-    def automation_get(workspace: str, automation_id: str, version: int | None = None) -> Any:
+    def automation_get(
+        workspace: str, automation_id: str, version: int | None = None
+    ) -> Any:
         a = store.get_automation(workspace, automation_id, version)
         if a is None:
             return JSONResponse({"error": "no such automation"}, status_code=404)
@@ -576,7 +1051,10 @@ def create_app(
 
     @app.post("/automations/{workspace}/{automation_id}/{version}/state")
     async def automation_set_state(
-        workspace: str, automation_id: str, version: int, request: Request,
+        workspace: str,
+        automation_id: str,
+        version: int,
+        request: Request,
         authorization: str | None = Header(default=None),
     ) -> Any:
         """Arm/disarm/approve an automation (operator-gated). Approving (→ active) records the owner.
@@ -590,18 +1068,30 @@ def create_app(
         state = body.get("state")
         if state not in ("pending_approval", "active", "paused", "archived"):
             return JSONResponse(
-                {"error": "state must be pending_approval|active|paused|archived"}, status_code=400
+                {"error": "state must be pending_approval|active|paused|archived"},
+                status_code=400,
             )
         ok = store.set_automation_state(
-            workspace, automation_id, version, state, approved_by=body.get("approved_by")
+            workspace,
+            automation_id,
+            version,
+            state,
+            approved_by=body.get("approved_by"),
         )
         if not ok:
-            return JSONResponse({"error": "no such automation version"}, status_code=404)
-        return {"ok": True, "automation": store.get_automation(workspace, automation_id, version)}
+            return JSONResponse(
+                {"error": "no such automation version"}, status_code=404
+            )
+        return {
+            "ok": True,
+            "automation": store.get_automation(workspace, automation_id, version),
+        }
 
     @app.post("/automations/{workspace}/{automation_id}/run")
     async def automation_run(
-        workspace: str, automation_id: str, request: Request,
+        workspace: str,
+        automation_id: str,
+        request: Request,
         authorization: str | None = Header(default=None),
     ) -> Any:
         """Fire the active automation now (manual trigger). Requires an `idempotency_key` so a
@@ -621,13 +1111,21 @@ def create_app(
         auto = store.get_automation(workspace, automation_id)
         if auto is not None and auto.get("kind") == "composed":
             out = await fire_composed(
-                store, workspace=workspace, automation_id=automation_id,
-                idempotency_key=str(idem), stage_runner=stage_exec, fired_by=fired_by,
+                store,
+                workspace=workspace,
+                automation_id=automation_id,
+                idempotency_key=str(idem),
+                stage_runner=stage_exec,
+                fired_by=fired_by,
             )
         else:
             out = await fire_manual(
-                store, workspace=workspace, automation_id=automation_id,
-                idempotency_key=str(idem), runner=run_exec, fired_by=fired_by,
+                store,
+                workspace=workspace,
+                automation_id=automation_id,
+                idempotency_key=str(idem),
+                runner=run_exec,
+                fired_by=fired_by,
             )
         if not out.get("ok"):
             return JSONResponse(out, status_code=out.pop("status", 400))
@@ -649,7 +1147,9 @@ def create_app(
         }
 
     @app.get("/automations/{workspace}/{automation_id}/runs")
-    def automation_runs(workspace: str, automation_id: str, limit: int = 50) -> dict[str, Any]:
+    def automation_runs(
+        workspace: str, automation_id: str, limit: int = 50
+    ) -> dict[str, Any]:
         """Newest-first run history for one automation (trace omitted — fetch via /runs/{run_id})."""
         return {"runs": store.list_runs(workspace, automation_id, limit)}
 
