@@ -313,6 +313,33 @@ def create_app(
             workspace=body.get("workspace") or "",
             resolved=body.get("resolved"),
             modifiable=body.get("modifiable"),
+            plan_id=body.get("plan_id"),
+            seq=int(body.get("seq") or 0),
+            depends_on=body.get("depends_on"),
+        )
+
+    @app.post("/plans/{plan_id}/steps")
+    async def register_planned_step(plan_id: str, request: Request) -> dict[str, Any]:
+        """Register a dependent step that is NOT yet proposed to the adapter (its handoff reference
+        can't resolve until its prerequisite commits) — governed dependent plans. Carries a synthetic
+        proposal_id so the UI can render a blocked card; the executor materializes it on the
+        prerequisite's commit."""
+        body: dict[str, Any] = {}
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = {}
+        return store.register_planned_step(
+            body.get("proposal_id"),
+            plan_id=plan_id,
+            seq=int(body.get("seq") or 0),
+            depends_on=body.get("depends_on"),
+            verb=body.get("verb") or "",
+            args=body.get("args") or {},
+            handoff=body.get("handoff") or {},
+            preview=body.get("preview"),
+            tier=body.get("tier"),
+            workspace=body.get("workspace") or "",
         )
 
     @app.get("/proposals/{proposal_id}/decision")
@@ -368,15 +395,94 @@ def create_app(
                 commit_id, edited = reproposed.id, True
             key = commit_idempotency_key(f"cp-approve:{commit_id}", commit_id)
             outcome = await client.commit(commit_id, idempotency_key=key)
+            dumped = outcome.model_dump(mode="json", exclude_none=True)
+            # The committed backend id (result.entity.id) — a dependent step's handoff placeholder
+            # ($.step0.id) resolves to this when the ordered executor materializes it.
+            committed_id = ((dumped.get("result") or {}).get("entity") or {}).get("id")
             return {
                 "executed": True,
                 "edited": edited,
-                "outcome": outcome.model_dump(mode="json", exclude_none=True),
+                "committed_id": committed_id,
+                "outcome": dumped,
             }
         except Exception as exc:  # noqa: BLE001 — adapter unreachable / proposal expired / already done
             return {"executed": False, "error": f"{type(exc).__name__}: {exc}"}
         finally:
             await transport.aclose()
+
+    def _resolve_handoff(
+        args: dict[str, Any], handoff: dict[str, Any], committed_ids: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve a dependent step's handoff placeholders into its args. A handoff maps an arg field
+        to a reference of the form `$.step<i>.<field>` — today the only produced field is the committed
+        id (`$.step0.id`), so it resolves to the prerequisite's committed backend id. Mirrors the
+        composed-automation `$.input.X` handoff. Unresolvable refs are left as-is (the propose refuses)."""
+        resolved = dict(args)
+        for arg_field, ref in (handoff or {}).items():
+            if not isinstance(ref, str) or not ref.startswith("$.step"):
+                continue
+            # `$.step0.id` → seq 0, field 'id'. We resolve by the committed id of the referenced step.
+            rest = ref[len("$.step"):]
+            seq_str, _, _field = rest.partition(".")
+            value = committed_ids.get(seq_str)
+            if value is not None:
+                resolved[arg_field] = value
+        return resolved
+
+    async def _materialize_dependents(
+        plan_id: str, prerequisite_id: str, prereq_seq: Any, committed_id: Any
+    ) -> list[dict[str, Any]]:
+        """A prerequisite step committed → find the plan's PLANNED steps that depend on it, resolve
+        their handoff placeholders to its committed id, PROPOSE them now against the active adapter, and
+        register each HELD as a real plan card (unblocking it). This 'materialize dependent on
+        prerequisite commit' is the core of governed dependent plans."""
+        materialized: list[dict[str, Any]] = []
+        store.record_committed(prerequisite_id, str(committed_id) if committed_id is not None else None)
+        planned = store.next_planned_steps(plan_id, prerequisite_id)
+        if not planned:
+            return materialized
+        ws = store.proposal_workspace(prerequisite_id) or ""
+        active = store.active_adapter(ws) if ws else store.any_active_adapter()
+        if not active or not active.get("url"):
+            return materialized
+        ws = active.get("workspace", "") or ""
+        bearer = active.get("bearer", "") or ""
+        # Map the referenced step's seq → committed id, so `$.step<prereq_seq>.id` resolves.
+        committed_ids = {str(prereq_seq): committed_id}
+        for step in planned:
+            verb = step.get("verb") or ""
+            args = _resolve_handoff(step.get("args") or {}, step.get("handoff") or {}, committed_ids)
+            transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
+            grant = GrantRef.from_secret(
+                grant_id="control-plane-plan", workspace=ws, secret=bearer or "cp",
+                scopes=frozenset({verb}) if verb else frozenset(),
+            )
+            client = NilClient(transport=transport, grant=grant)
+            try:
+                proposal = await client.propose(
+                    verb, args, session_id=f"cp-plan:{step['proposal_id']}",
+                    request_timestamp=_dt.datetime.now(_dt.UTC),
+                )
+            except Exception as exc:  # noqa: BLE001 — adapter unreachable during materialization
+                materialized.append({"seq": step.get("seq"), "error": f"{type(exc).__name__}: {exc}"})
+                await transport.aclose()
+                continue
+            await transport.aclose()
+            if proposal.is_refusal or not proposal.id:
+                materialized.append({
+                    "seq": step.get("seq"),
+                    "error": f"materialize refused: {proposal.code or 'refused'} {proposal.message or ''}".strip(),
+                })
+                continue
+            store.promote_planned_step(
+                step["proposal_id"], real_proposal_id=proposal.id, verb=proposal.verb,
+                tier=proposal.tier.value if proposal.tier is not None else None,
+                preview=proposal.preview, workspace=ws, plan_id=plan_id, seq=int(step.get("seq") or 0),
+                depends_on=prerequisite_id, resolved=proposal.resolved or {},
+                modifiable=list(proposal.modifiable or ()),
+            )
+            materialized.append({"seq": step.get("seq"), "proposal_id": proposal.id, "verb": proposal.verb})
+        return materialized
 
     @app.post("/proposals/{proposal_id}/decision")
     async def post_decision(proposal_id: str, request: Request) -> Any:
@@ -392,6 +498,24 @@ def create_app(
             return JSONResponse(
                 {"error": "status must be 'approved' or 'rejected'"}, status_code=400
             )
+        # Governed dependent plans: a step's approval order is enforced here. Approving a BLOCKED step
+        # (its prerequisite not yet committed) is refused; the owner must approve the prerequisite
+        # first. This never touches standalone proposals (plan_id/depends_on are NULL).
+        appr = store.approval(proposal_id) or {}
+        plan_id = appr.get("plan_id")
+        depends_on = appr.get("depends_on")
+        if status == "approved" and depends_on:
+            prereq = store.approval(depends_on) or {}
+            if not (prereq.get("status") == "approved" and prereq.get("committed_id") is not None):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "proposal_id": proposal_id,
+                        "error": "step is BLOCKED: its prerequisite must be approved and committed first",
+                        "depends_on": depends_on,
+                    },
+                    status_code=409,
+                )
         ok = store.decide(
             proposal_id,
             status,
@@ -403,9 +527,19 @@ def create_app(
             "proposal_id": proposal_id,
             "status": store.decision(proposal_id),
         }
+        if ok and status == "rejected" and plan_id:
+            # Rejecting ANY step cancels the whole plan (no orphan): reject its pending holds and
+            # cancel its not-yet-proposed planned steps.
+            result["plan_cancelled"] = {"plan_id": plan_id, "steps": store.cancel_plan(plan_id)}
         if ok and status == "approved":
             edits = body.get("edits") if isinstance(body.get("edits"), dict) else None
-            result["execution"] = await _execute_approved(proposal_id, edits)
+            execution = await _execute_approved(proposal_id, edits)
+            result["execution"] = execution
+            # On a prerequisite's successful commit, materialize the dependents that were waiting on it.
+            if plan_id and execution.get("executed"):
+                result["materialized"] = await _materialize_dependents(
+                    plan_id, proposal_id, appr.get("seq") or 0, execution.get("committed_id")
+                )
         return result
 
     @app.get("/api/pending")

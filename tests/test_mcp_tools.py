@@ -406,3 +406,60 @@ async def test_intent_graph_write_routes_to_brain_assert() -> None:
                              change={"op": "update", "set": {"threshold": 5000}})
     assert out["asserted"] == "policy.update"
     assert out["facts"] == {"threshold": 5000, "name": "payment-approval"}
+
+
+# ── governed dependent plans: nil_plan holds the prerequisite (even at MEDIUM) + a blocked dependent ──
+
+CP = "http://cp.test"
+
+PROPOSAL_MEDIUM = {
+    "outcome": "proposal", "id": "prop-root", "verb": "commerce.create_client", "tier": "MEDIUM",
+    "preview": {"en": "create client Ahmed Co"}, "expires_at": "2026-06-20T07:00:00Z",
+}
+
+
+@respx.mock
+async def test_plan_holds_medium_prerequisite_and_registers_blocked_dependent(monkeypatch) -> None:
+    monkeypatch.setenv("NIL_APPROVAL_URL", CP)
+    # Step 0 is proposed to the adapter (it comes back MEDIUM — normally auto-commits).
+    respx.post(f"{BASE}/nil/v0.1/propose").mock(
+        return_value=httpx.Response(200, json=server_envelope("PROPOSAL", PROPOSAL_MEDIUM))
+    )
+    # The prerequisite is registered HELD (even at MEDIUM) via /await; the dependent via /plans/*/steps.
+    awaited = respx.post(f"{CP}/proposals/prop-root/await").mock(
+        return_value=httpx.Response(200, json={"status": "pending"})
+    )
+    planned = respx.post(url__regex=rf"{CP}/plans/.+/steps").mock(
+        return_value=httpx.Response(200, json={"status": "planned"})
+    )
+    tools, _ = make_tools()
+    out = await tools.plan([
+        {"verb": "commerce.create_client", "args": {"name": "Ahmed Co"}},
+        {"verb": "commerce.create_invoice", "args": {"client_id": "$.step0.id", "amount": 100},
+         "handoff": {"client_id": "$.step0.id"}},
+    ])
+    assert out["outcome"] == "plan" and out["plan_id"].startswith("plan_")
+    assert awaited.called and planned.called          # prereq HELD, dependent PLANNED
+    root, dep = out["steps"]
+    assert root["seq"] == 0 and root["proposal_id"] == "prop-root" and root["tier"] == "MEDIUM"
+    assert root["blocked"] is False                   # prerequisite is a visible held card, not blocked
+    assert dep["seq"] == 1 and dep["blocked"] is True and dep["planned"] is True
+    assert dep["depends_on"] == "prop-root"           # dependent points at the prereq's real id
+    # The dependent registration carried the handoff placeholder unresolved (resolved at commit-time).
+    body = json.loads(planned.calls.last.request.content)
+    assert body["depends_on"] == "prop-root"
+    assert body["args"]["client_id"] == "$.step0.id" and body["handoff"] == {"client_id": "$.step0.id"}
+
+
+async def test_plan_refuses_without_control_plane(monkeypatch) -> None:
+    monkeypatch.delenv("NIL_APPROVAL_URL", raising=False)
+    tools, _ = make_tools()
+    out = await tools.plan([{"verb": "commerce.create_client", "args": {"name": "x"}}])
+    assert out["outcome"] == "refused" and out["code"] == "NO_CONTROL_PLANE"
+
+
+async def test_plan_refuses_empty(monkeypatch) -> None:
+    monkeypatch.setenv("NIL_APPROVAL_URL", CP)
+    tools, _ = make_tools()
+    out = await tools.plan([])
+    assert out["outcome"] == "refused" and out["code"] == "EMPTY_PLAN"

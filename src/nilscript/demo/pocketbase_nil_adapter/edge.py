@@ -35,6 +35,63 @@ SYSTEM = "pocketbase"
 _CURATED_BY_DOCTYPE = {v.doctype: v for v in WRITE_VERBS.values()}
 _READ_VERBS = ("nil.intent", "nil.get", "nil.count", "resource.read")
 
+# An agent may name an entity in Odoo/generic terms (res.partner, client, customer). We resolve it to
+# whatever THIS backend actually DECLARES — never a hardcoded per-backend table. A noun maps to a
+# concept; a concept matches any declared target whose name carries one of the concept's words. So the
+# SAME logic works for pocketbase (`clients`), odoo (`res.partner`), erpnext (`Customer`), etc.
+_NOUN_CONCEPT = {
+    "client": "client", "customer": "client", "contact": "client", "partner": "client",
+    "res.partner": "client", "company": "client", "account": "client", "party": "client",
+    "invoice": "invoice", "bill": "invoice", "account.move": "invoice",
+    "product": "product", "item": "product", "product.product": "product",
+    "supplier": "supplier", "vendor": "supplier",
+    "payment": "payment", "purchase": "purchase", "purchase_invoice": "purchase",
+}
+_CONCEPT_WORDS = {
+    "client": ("client", "customer", "partner", "contact", "party"),
+    "invoice": ("invoice", "bill", "move"),
+    "product": ("product", "item"),
+    "supplier": ("supplier", "vendor"),
+    "payment": ("payment",),
+    "purchase": ("purchase",),
+}
+
+
+def _resolve_target(name: Any) -> Any:
+    """Normalize an entity noun to a DECLARED target — generic, driven by this adapter's own targets:
+    exact (case-insensitive), singular↔plural, concept synonym, then substring. Never a per-backend
+    hardcode, so the identical logic is portable to every adapter."""
+    if not isinstance(name, str) or not name:
+        return name
+    declared = sorted({v.doctype for v in WRITE_VERBS.values()})
+    if name in declared:
+        return name
+    low = name.strip().lower()
+    for d in declared:  # case-insensitive exact, then singular↔plural
+        dl = d.lower()
+        if dl == low or dl == low + "s" or low == dl + "s":
+            return d
+    concept = _NOUN_CONCEPT.get(low)  # concept synonym → a declared target that carries the concept
+    if concept:
+        for d in declared:
+            if any(w in d.lower() for w in _CONCEPT_WORDS.get(concept, ())):
+                return d
+    for d in declared:  # last resort: substring either way
+        if low in d.lower() or d.lower() in low:
+            return d
+    return name
+
+
+def _apply_match(rows: list[dict[str, Any]], match: dict[str, Any]) -> list[dict[str, Any]]:
+    """Client-side substring filter, tolerant to differing field names — a `name` query also matches
+    `business_name`/`first_name`/`last_name` (backends store the display name under different fields)."""
+    out = rows
+    for key, value in (match or {}).items():
+        fields = ("business_name", "name", "first_name", "last_name") if key == "name" else (key,)
+        needle = str(value).lower()
+        out = [r for r in out if any(needle in str(r.get(f, "")).lower() for f in fields)]
+    return out
+
 
 def _resource_data(args: dict[str, Any]) -> dict[str, Any]:
     """The write payload from a resource.* arg bag: an explicit `data` dict, else the flat fields
@@ -231,7 +288,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             op = verb_name.split(".", 1)[1]
             if op not in ("create", "update", "delete"):
                 return _refusal(env, "UNKNOWN_VERB", f"unknown resource op: {op}")
-            target = args.get("target")
+            target = _resolve_target(args.get("target"))
             if not target:
                 return _refusal(env, "INVALID_ARGS", "missing required arg: target", field="target")
             # Skeleton bound (advertised ≡ committable): resource.* may only touch a DECLARED target
@@ -259,7 +316,9 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 if gap is not None:
                     return _refusal(env, "INVALID_ARGS", gap[0], field=gap[1])
             pid = uuid4().hex[:16]
-            state.proposals[pid] = {"verb": verb_name, "args": args, "data": data, "resource": True}
+            # Persist the RESOLVED target (e.g. client→clients) so COMMIT — which reads the stored
+            # target — writes to the real declared collection, not the raw noun the agent used.
+            state.proposals[pid] = {"verb": verb_name, "args": {**args, "target": target}, "data": data, "resource": True}
             en, ar = _resource_phrase(op, target, {"data": data})
             # Governance is NOT downgraded by the generic spine: a create inherits the curated verb's
             # tier for this target (an invoice stays HIGH → held for approval), so routing through
@@ -448,14 +507,16 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         # records/ids in realtime. `about` (nil.*) or `target` (resource.read) names the entity.
         if verb_name in _READ_VERBS:
             qargs = body.get("args", {}) or {}
-            target = qargs.get("about") or qargs.get("target")
+            target = _resolve_target(qargs.get("about") or qargs.get("target"))
             if not target or target not in {v.doctype for v in WRITE_VERBS.values()} or not client.exists(target):
                 raise HTTPException(status_code=404, detail=f"unknown or undeclared target: {target}")
             if verb_name == "nil.get" and qargs.get("id"):
                 rec = client.get(target, str(qargs["id"]))
                 return {"data": {"target": target, "item": rec}}
             match = _match_from(qargs.get("where") or qargs.get("filter") or qargs.get("match"))
-            rows = client.list(target, match or None)
+            # Fetch, then match CLIENT-SIDE — tolerant to backend field names (a `name` search also
+            # matches business_name/first_name/last_name), and robust to unreliable server filtering.
+            rows = _apply_match(client.list(target, None), match)
             if verb_name == "nil.count" or qargs.get("seek") == "count":
                 return {"data": {"target": target, "count": len(rows)}}
             rows = rows[: int(qargs.get("limit") or 50)]

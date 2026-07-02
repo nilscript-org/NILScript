@@ -436,6 +436,11 @@ def _register_tools(
     ) -> dict[str, Any]:  # type: ignore[assignment]
         return await provider.get(ctx).export(target, filter, fields, approved)
 
+    async def nil_plan(
+        steps: list[dict[str, Any]], ctx: Context = None
+    ) -> dict[str, Any]:  # type: ignore[assignment]
+        return await provider.get(ctx).plan(steps, session_id=session_key(ctx))
+
     async def nil_status(proposal_id: str, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         return await provider.get(ctx).status(proposal_id)
 
@@ -474,6 +479,18 @@ def _register_tools(
         "Find دينا → about='res.partner', where=[{attr:'name',rel:'contains',value:'دينا'}], seek='the'. "
         "Show policies → about='policy', seek='all'. Show business cycles → about='cycle', seek='all'. "
         "Update her phone → about='res.partner', where=[{attr:'name',rel:'contains',value:'دينا'}], change={op:'update', set:{phone:'…'}}.",
+    )
+    server.add_tool(
+        nil_plan,
+        name="nil_plan",
+        description="Propose an ORDERED, LINKED dependent plan when a write needs a brand-NEW referenced "
+        "entity (e.g. invoice for a NEW client). `steps` is an ordered list; each step = {verb, args, "
+        "depends_on?: int (index of the prerequisite step), handoff?: {arg_field: \"$.step<i>.<field>\"}}. "
+        "The default handoff for a dependent create is the referenced FK ← the prerequisite's committed "
+        "id ($.step0.id). Only step 0 (the prerequisite) is proposed now and HELD as a card (even at "
+        "MEDIUM, because it belongs to a gated plan); dependents are registered as BLOCKED planned cards "
+        "and materialized on the prerequisite's commit — so the referenced id is real before the "
+        "dependent is validated. Use this instead of two separate writes when one references the other.",
     )
     server.add_tool(
         nil_status,

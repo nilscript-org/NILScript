@@ -45,6 +45,27 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_at  TEXT
 );
 
+-- Governed dependent plans (ordered, linked approval cards). A `planned_step` is a dependent step
+-- that is NOT yet proposed to the adapter — its handoff reference (e.g. invoice.client_id) can't be
+-- resolved until its prerequisite is committed. It carries a SYNTHETIC proposal_id so the UI can show
+-- a blocked card; on the prerequisite's commit the executor resolves the handoff, proposes it for
+-- real, and promotes it into `approvals` as a held plan card. Universal (kernel/CP only).
+CREATE TABLE IF NOT EXISTS planned_steps (
+    proposal_id TEXT    NOT NULL PRIMARY KEY,   -- synthetic id (planned:<plan_id>:<seq>)
+    plan_id     TEXT    NOT NULL,
+    seq         INTEGER NOT NULL,
+    depends_on  TEXT,                            -- prerequisite's (real) proposal_id
+    verb        TEXT    NOT NULL,
+    args        TEXT    NOT NULL,                -- JSON args WITH $.step<i> handoff placeholders
+    handoff     TEXT,                            -- JSON {arg_field: "$.step<i>.<field>"}
+    preview     TEXT,
+    tier        TEXT,
+    workspace   TEXT    NOT NULL DEFAULT '',
+    status      TEXT    NOT NULL DEFAULT 'planned',  -- planned | materialized | cancelled
+    created_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_planned_plan ON planned_steps(plan_id);
+
 -- Active-adapter registry: which backend the hosted MCP routes to per workspace. This is the ONE
 -- piece of mutable state the kernel keeps; `bearer` reaches the (tenant-owned) adapter, never the
 -- backend's own creds. Activating one adapter deactivates its siblings in the same workspace.
@@ -213,6 +234,20 @@ class EventStore:
                     # and which are editable, so the owner's card is a filled-in form and an
                     # approve-with-edits can re-propose exactly the tweaked args before commit.
                     self._conn.execute(f"ALTER TABLE approvals ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass  # column already present
+            # Governed dependent plans: an approval MAY belong to an ordered plan. `plan_id` groups a
+            # plan's cards; `seq` orders them; `depends_on` points at the prerequisite step this one
+            # needs committed first. NULL for standalone proposals (unchanged behavior). `committed_id`
+            # records an approved step's backend id so a dependent's handoff placeholder resolves.
+            for _ddl in (
+                "ALTER TABLE approvals ADD COLUMN plan_id TEXT",
+                "ALTER TABLE approvals ADD COLUMN seq INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE approvals ADD COLUMN depends_on TEXT",
+                "ALTER TABLE approvals ADD COLUMN committed_id TEXT",
+            ):
+                try:
+                    self._conn.execute(_ddl)
                 except sqlite3.OperationalError:
                     pass  # column already present
             self._conn.commit()
@@ -550,13 +585,18 @@ class EventStore:
         workspace: str = "",
         resolved: Any = None,
         modifiable: Any = None,
+        plan_id: str | None = None,
+        seq: int = 0,
+        depends_on: str | None = None,
     ) -> dict[str, Any]:
         """Register a proposal as awaiting human approval (idempotent — keeps an existing decision).
 
         `verb`/`tier`/`preview` are passed by the gate at hold-time (a held proposal has no ledger
         event yet, so `_enrich` finds nothing). They win over enrichment; `preview` (a dict) is stored
         as JSON so the owner's Decisions screen can show exactly what the proposal does. `resolved`
-        (the field values) + `modifiable` (which keys are editable) drive the editable decision card."""
+        (the field values) + `modifiable` (which keys are editable) drive the editable decision card.
+        `plan_id`/`seq`/`depends_on` link this hold into an ordered dependent plan (NULL = standalone).
+        """
         with self._lock:
             existing = self._conn.execute(
                 "SELECT status FROM approvals WHERE proposal_id = ?", (proposal_id,)
@@ -571,8 +611,9 @@ class EventStore:
             )
             self._conn.execute(
                 "INSERT INTO approvals "
-                "(proposal_id, status, workspace, verb, tier, preview, resolved, modifiable, created_at) "
-                "VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
+                "(proposal_id, status, workspace, verb, tier, preview, resolved, modifiable, "
+                " plan_id, seq, depends_on, created_at) "
+                "VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     proposal_id,
                     workspace or "",
@@ -581,6 +622,9 @@ class EventStore:
                     preview_str,
                     json.dumps(resolved) if resolved is not None else None,
                     json.dumps(list(modifiable)) if modifiable is not None else None,
+                    plan_id,
+                    int(seq),
+                    depends_on,
                     _now(),
                 ),
             )
@@ -615,7 +659,15 @@ class EventStore:
         # gate at hold-time, so a tenant sees only its holds by a DIRECT column filter — no fragile
         # join to the ledger by proposal_id. The legacy events-join is kept ONLY as a fallback for
         # pre-migration rows whose workspace is still ''. None = operator/global view.
-        cols = "proposal_id, verb, tier, preview, resolved, modifiable, created_at"
+        #
+        # Governed dependent plans: each row carries plan_id/seq/depends_on and a computed `blocked`
+        # boolean (true while its prerequisite is not yet committed). Not-yet-proposed PLANNED steps
+        # (a dependent whose handoff can't resolve until its prerequisite commits) are included too,
+        # as blocked cards with a synthetic proposal_id — so the UI can render the whole ordered plan.
+        cols = (
+            "proposal_id, verb, tier, preview, resolved, modifiable, created_at, "
+            "plan_id, seq, depends_on"
+        )
         if workspace is None:
             sql = (
                 f"SELECT {cols} FROM approvals "
@@ -634,11 +686,35 @@ class EventStore:
             params = (workspace, workspace)
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
-        return [self._shape_pending(r) for r in rows]
+            # A prerequisite is "done" once its own approval is committed (approved + committed_id set).
+            committed = {
+                r["proposal_id"]
+                for r in self._conn.execute(
+                    "SELECT proposal_id FROM approvals WHERE status = 'approved'"
+                ).fetchall()
+            }
+            if workspace is None:
+                planned = self._conn.execute(
+                    "SELECT proposal_id, verb, tier, preview, plan_id, seq, depends_on, created_at "
+                    "FROM planned_steps WHERE status = 'planned' ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                planned = self._conn.execute(
+                    "SELECT proposal_id, verb, tier, preview, plan_id, seq, depends_on, created_at "
+                    "FROM planned_steps WHERE status = 'planned' AND workspace = ? "
+                    "ORDER BY created_at DESC",
+                    (workspace,),
+                ).fetchall()
+        out = [self._shape_pending(r, committed) for r in rows]
+        out.extend(self._shape_pending(r, committed, planned=True) for r in planned)
+        return out
 
     @staticmethod
-    def _shape_pending(row: Any) -> dict[str, Any]:
-        """Decode a pending row, exposing `resolved`/`modifiable` as real JSON for the editable card."""
+    def _shape_pending(
+        row: Any, committed: set[str] | None = None, *, planned: bool = False
+    ) -> dict[str, Any]:
+        """Decode a pending row, exposing `resolved`/`modifiable` as real JSON for the editable card,
+        and compute the plan `blocked` flag (true while a step's prerequisite is not yet committed)."""
         rec = dict(row)
         for key in ("resolved", "modifiable"):
             raw = rec.get(key)
@@ -647,6 +723,19 @@ class EventStore:
                     rec[key] = json.loads(raw)
                 except json.JSONDecodeError:
                     rec[key] = None
+        if isinstance(rec.get("preview"), str) and rec["preview"]:
+            try:
+                rec["preview"] = json.loads(rec["preview"])
+            except json.JSONDecodeError:
+                pass
+        dep = rec.get("depends_on")
+        # A planned (not-yet-proposed) step is always blocked; a proposed step is blocked while its
+        # prerequisite hasn't committed. Standalone proposals (no depends_on) are never blocked.
+        if planned:
+            rec["blocked"] = True
+            rec["planned"] = True
+        else:
+            rec["blocked"] = bool(dep) and (committed is None or dep not in committed)
         return rec
 
     # ── active-adapter registry (multi-tenant routing) ───────────────────────────────────────
@@ -792,14 +881,166 @@ class EventStore:
 
     def approval(self, proposal_id: str) -> dict[str, Any] | None:
         """The full approval row (verb/tier/preview/status) — the executor reads the verb to scope the
-        control-plane grant when it commits the approved proposal."""
+        control-plane grant when it commits the approved proposal. Carries the plan link so the ordered
+        executor can refuse a blocked step and materialize the next steps on a prerequisite's commit."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT proposal_id, status, verb, tier, preview, resolved, modifiable "
+                "SELECT proposal_id, status, verb, tier, preview, resolved, modifiable, "
+                "plan_id, seq, depends_on, committed_id "
                 "FROM approvals WHERE proposal_id = ?",
                 (proposal_id,),
             ).fetchone()
         return self._shape_pending(row) if row is not None else None
+
+    # ── governed dependent plans (ordered, linked approval cards) ────────────────────────────────
+    def register_planned_step(
+        self,
+        proposal_id: str,
+        *,
+        plan_id: str,
+        seq: int,
+        depends_on: str | None,
+        verb: str,
+        args: dict[str, Any],
+        handoff: dict[str, Any] | None = None,
+        preview: Any = None,
+        tier: str | None = None,
+        workspace: str = "",
+    ) -> dict[str, Any]:
+        """Register a dependent step that is NOT yet proposed to the adapter (its handoff ref can't
+        resolve until the prerequisite commits). Idempotent by synthetic proposal_id."""
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT status FROM planned_steps WHERE proposal_id = ?", (proposal_id,)
+            ).fetchone()
+            if existing is not None:
+                return {"proposal_id": proposal_id, "status": existing["status"]}
+            self._conn.execute(
+                "INSERT INTO planned_steps (proposal_id, plan_id, seq, depends_on, verb, args, "
+                "handoff, preview, tier, workspace, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?)",
+                (
+                    proposal_id,
+                    plan_id,
+                    int(seq),
+                    depends_on,
+                    verb,
+                    json.dumps(args, ensure_ascii=False),
+                    json.dumps(handoff, ensure_ascii=False) if handoff is not None else None,
+                    json.dumps(preview, ensure_ascii=False)
+                    if isinstance(preview, (dict, list))
+                    else preview,
+                    tier,
+                    workspace or "",
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+        return {"proposal_id": proposal_id, "status": "planned"}
+
+    def record_committed(self, proposal_id: str, committed_id: str | None) -> None:
+        """Record an approved step's backend result id so its dependents' handoff placeholders can
+        resolve to the real id when they are materialized."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE approvals SET committed_id = ? WHERE proposal_id = ?",
+                (committed_id, proposal_id),
+            )
+            self._conn.commit()
+
+    def next_planned_steps(self, plan_id: str, depends_on: str) -> list[dict[str, Any]]:
+        """The plan's planned (not-yet-proposed) steps whose prerequisite is `depends_on` — the ones to
+        materialize now that `depends_on` has committed. Args/handoff decoded from JSON."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT proposal_id, plan_id, seq, depends_on, verb, args, handoff, preview, tier, "
+                "workspace FROM planned_steps WHERE plan_id = ? AND depends_on = ? AND status = 'planned' "
+                "ORDER BY seq",
+                (plan_id, depends_on),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            rec = dict(r)
+            rec["args"] = _loads(rec.get("args"))
+            rec["handoff"] = _loads(rec.get("handoff")) if rec.get("handoff") else {}
+            if isinstance(rec.get("preview"), str) and rec["preview"]:
+                try:
+                    rec["preview"] = json.loads(rec["preview"])
+                except json.JSONDecodeError:
+                    pass
+            out.append(rec)
+        return out
+
+    def promote_planned_step(
+        self,
+        synthetic_id: str,
+        *,
+        real_proposal_id: str,
+        verb: str,
+        tier: str | None,
+        preview: Any,
+        workspace: str,
+        plan_id: str,
+        seq: int,
+        depends_on: str | None,
+        resolved: dict[str, Any] | None = None,
+        modifiable: Any = None,
+    ) -> dict[str, Any]:
+        """A planned step has been proposed for real → mark it materialized and register the real
+        proposal as a HELD plan card (unblocked once its prerequisite is committed)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE planned_steps SET status = 'materialized' WHERE proposal_id = ?",
+                (synthetic_id,),
+            )
+            self._conn.commit()
+        return self.await_approval(
+            real_proposal_id,
+            verb=verb,
+            tier=tier,
+            preview=preview,
+            workspace=workspace,
+            resolved=resolved,
+            modifiable=modifiable,
+            plan_id=plan_id,
+            seq=seq,
+            depends_on=depends_on,
+        )
+
+    def cancel_plan(self, plan_id: str, *, reason: str = "plan cancelled") -> int:
+        """Reject/cancel every un-decided step of a plan — both held approvals (pending) and planned
+        (not-yet-proposed) steps — so rejecting ANY step leaves no orphan. Returns the count affected."""
+        with self._lock:
+            cur1 = self._conn.execute(
+                "UPDATE approvals SET status = 'rejected', reason = ?, decided_at = ? "
+                "WHERE plan_id = ? AND status = 'pending'",
+                (reason, _now(), plan_id),
+            )
+            cur2 = self._conn.execute(
+                "UPDATE planned_steps SET status = 'cancelled' "
+                "WHERE plan_id = ? AND status = 'planned'",
+                (plan_id,),
+            )
+            self._conn.commit()
+            return cur1.rowcount + cur2.rowcount
+
+    def plan_steps(self, plan_id: str) -> list[dict[str, Any]]:
+        """All steps of a plan (held approvals + planned), ordered by seq — for inspection/tests."""
+        with self._lock:
+            appr = self._conn.execute(
+                "SELECT proposal_id, verb, tier, plan_id, seq, depends_on, status, committed_id "
+                "FROM approvals WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchall()
+            plan = self._conn.execute(
+                "SELECT proposal_id, verb, tier, plan_id, seq, depends_on, status "
+                "FROM planned_steps WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchall()
+        steps = [{**dict(r), "planned": False} for r in appr]
+        steps.extend({**dict(r), "planned": True} for r in plan)
+        steps.sort(key=lambda s: s.get("seq") or 0)
+        return steps
 
     def list_adapters(self, workspace: str) -> list[dict[str, Any]]:
         """All registered adapters for a workspace (active first, then most-recent). Carries the
