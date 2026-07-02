@@ -39,6 +39,11 @@ from nilscript.automation import (
     validate_composed,
 )
 from nilscript.automation.compose import StageRunner
+from nilscript.capability import (
+    Capability,
+    capability_content_hash,
+    parse_capability_nil,
+)
 from nilscript.controlplane.store import EventStore
 from nilscript.cycle import (
     Cycle,
@@ -58,6 +63,12 @@ from nilscript.cycle import (
 )
 from nilscript.kernel.diagnostics import ValidationResult
 from nilscript.kernel.executor import LocalExecutor
+from nilscript.strategy import (
+    Strategy,
+    parse_strategy_nil,
+    strategy_content_hash,
+    validate_strategy,
+)
 from nilscript.sdk.client import NilClient
 from nilscript.sdk.idempotency import commit_idempotency_key
 from nilscript.sdk.connect import handshake
@@ -978,6 +989,174 @@ def create_app(
         """The latest version of every registered cycle in a workspace (kind='cycle')."""
         cycles = [a for a in store.list_automations(workspace) if a.get("kind") == "cycle"]
         return {"cycles": cycles}
+
+    # ── Capability + Strategy registries (plan B1): same disciplines as automations ──────────
+    def _capability_from_body(body: dict[str, Any]) -> tuple[Capability | None, Any]:
+        """Accept either `capability` (AST object) or `text` (.capability.nil source). Returns
+        (Capability, None) or (None, JSONResponse-refusal) — an invalid shape never reaches the
+        registry (refused, not stored)."""
+        text = body.get("text")
+        if isinstance(text, str) and text:
+            try:
+                return parse_capability_nil(text), None
+            except NilSyntaxError as exc:
+                return None, JSONResponse(
+                    {"error": exc.message, "line": exc.line, "col": exc.col}, status_code=400
+                )
+        raw = body.get("capability")
+        if not isinstance(raw, dict):
+            return None, JSONResponse(
+                {"error": "capability (AST object) or text (.nil source) is required"},
+                status_code=400,
+            )
+        try:
+            return Capability.model_validate(raw), None
+        except (ValidationError, ValueError) as exc:
+            return None, JSONResponse({"error": f"invalid capability: {exc}"}, status_code=400)
+
+    def _strategy_from_body(body: dict[str, Any]) -> tuple[Strategy | None, Any]:
+        """Same dual-surface intake for strategies. A reserved form's V9_UNSUPPORTED_FORM message
+        passes through verbatim — the refusal IS the answer."""
+        text = body.get("text")
+        if isinstance(text, str) and text:
+            try:
+                return parse_strategy_nil(text), None
+            except NilSyntaxError as exc:
+                return None, JSONResponse(
+                    {"error": exc.message, "line": exc.line, "col": exc.col}, status_code=400
+                )
+        raw = body.get("strategy")
+        if not isinstance(raw, dict):
+            return None, JSONResponse(
+                {"error": "strategy (AST object) or text (.nil source) is required"},
+                status_code=400,
+            )
+        try:
+            return Strategy.model_validate(raw), None
+        except (ValidationError, ValueError) as exc:
+            return None, JSONResponse({"error": f"invalid strategy: {exc}"}, status_code=400)
+
+    @app.post("/capabilities")
+    async def capability_register_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Register a capability version (state=draft — publishing is a separate governed act).
+        Idempotent on the same content-hash; a new hash supersedes, never edits."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        capability, cap_err = _capability_from_body(body or {})
+        if cap_err is not None:
+            return cap_err
+        stored = store.register_capability(
+            workspace=capability.workspace,
+            capability_id=capability.capability_id,
+            content_hash=capability_content_hash(capability),
+            body=capability.model_dump(by_alias=True, mode="json"),
+        )
+        return {"ok": True, "definition": stored}
+
+    @app.get("/capabilities")
+    def capabilities_list(workspace: str = "") -> Any:
+        """The latest version of every capability in a workspace. Workspace-pinned, fail closed:
+        no workspace, no list."""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        return {"capabilities": store.list_capabilities(workspace)}
+
+    @app.get("/capabilities/{capability_id}")
+    def capability_get(
+        capability_id: str, workspace: str = "", version: int | None = None
+    ) -> Any:
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rec = store.get_capability(workspace, capability_id, version)
+        if rec is None:
+            return JSONResponse({"error": "unknown capability"}, status_code=404)
+        return rec
+
+    @app.post("/capabilities/{capability_id}/publish")
+    async def capability_publish(
+        capability_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """draft -> published for one version (default: the latest). A governed act — auth-gated
+        like every registry write."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        workspace = (body or {}).get("workspace") or ""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rec = store.get_capability(workspace, capability_id, (body or {}).get("version"))
+        if rec is None:
+            return JSONResponse({"error": "unknown capability"}, status_code=404)
+        store.set_capability_state(workspace, capability_id, rec["version"], "published")
+        return {"ok": True, "definition": store.get_capability(workspace, capability_id, rec["version"])}
+
+    @app.post("/strategies")
+    async def strategy_register_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Register a strategy version. V9 well-formedness gates admission (capability-independent
+        rules — the SoD/risk rules re-run at bind time with the owning capability): a failing
+        strategy is refused with the structured diagnostics, never stored."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        strategy, strat_err = _strategy_from_body(body or {})
+        if strat_err is not None:
+            return strat_err
+        verdict = validate_strategy(strategy)
+        if not verdict.ok:
+            return JSONResponse(
+                {"ok": False, "refusal": _diag_list(verdict)}, status_code=400
+            )
+        stored = store.register_strategy(
+            workspace=strategy.workspace,
+            strategy_id=strategy.strategy_id,
+            content_hash=strategy_content_hash(strategy),
+            body=strategy.model_dump(by_alias=True, mode="json"),
+        )
+        return {"ok": True, "definition": stored}
+
+    @app.get("/strategies")
+    def strategies_list(workspace: str = "") -> Any:
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        return {"strategies": store.list_strategies(workspace)}
+
+    @app.get("/strategies/{strategy_id}")
+    def strategy_get(strategy_id: str, workspace: str = "", version: int | None = None) -> Any:
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rec = store.get_strategy(workspace, strategy_id, version)
+        if rec is None:
+            return JSONResponse({"error": "unknown strategy"}, status_code=404)
+        return rec
+
+    @app.post("/strategies/{strategy_id}/publish")
+    async def strategy_publish(
+        strategy_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        workspace = (body or {}).get("workspace") or ""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rec = store.get_strategy(workspace, strategy_id, (body or {}).get("version"))
+        if rec is None:
+            return JSONResponse({"error": "unknown strategy"}, status_code=404)
+        store.set_strategy_state(workspace, strategy_id, rec["version"], "published")
+        return {"ok": True, "definition": store.get_strategy(workspace, strategy_id, rec["version"])}
 
     # ── Cycle .nil surface + language services (the LSP brain — a projection, no state) ────────
     async def _read_body(request: Request) -> tuple[dict[str, Any] | None, Any]:

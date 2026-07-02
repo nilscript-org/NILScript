@@ -128,6 +128,37 @@ CREATE TABLE IF NOT EXISTS automation_runs (
 );
 CREATE INDEX IF NOT EXISTS ix_runs_auto ON automation_runs(workspace, automation_id, started_at DESC);
 
+-- Capability registry (SSOT): one row per VERSION of one capability — the business-contract
+-- object (CAPABILITY-SHIFT plan B1). Exactly the automation-registry disciplines: content_hash is
+-- the lock, re-registering the same hash is an idempotent no-op, a new hash supersedes (never
+-- edits) the prior version, and every read is workspace-pinned (fail closed). Lifecycle:
+-- draft -> published -> deprecated (a superseded version is deprecated by its successor).
+CREATE TABLE IF NOT EXISTS capabilities (
+    workspace     TEXT    NOT NULL DEFAULT '',
+    capability_id TEXT    NOT NULL,
+    version       INTEGER NOT NULL,
+    content_hash  TEXT    NOT NULL,
+    body_json     TEXT    NOT NULL,
+    state         TEXT    NOT NULL DEFAULT 'draft',
+    created_at    TEXT    NOT NULL,
+    superseded_by INTEGER,
+    PRIMARY KEY (workspace, capability_id, version)
+);
+
+-- Strategy registry (SSOT): same disciplines, for the approval-strategy objects capabilities
+-- reference by id (a capability without its strategy is a dangling governance pointer).
+CREATE TABLE IF NOT EXISTS strategies (
+    workspace     TEXT    NOT NULL DEFAULT '',
+    strategy_id   TEXT    NOT NULL,
+    version       INTEGER NOT NULL,
+    content_hash  TEXT    NOT NULL,
+    body_json     TEXT    NOT NULL,
+    state         TEXT    NOT NULL DEFAULT 'draft',
+    created_at    TEXT    NOT NULL,
+    superseded_by INTEGER,
+    PRIMARY KEY (workspace, strategy_id, version)
+);
+
 -- Parked runs: a run that stopped mid-walk to wait for an external signal. Row-backed so a
 -- decision (or a matching event / the deadline) resumes the run DETERMINISTICALLY across process
 -- restarts — never an in-memory await. `kind`='approval' waits on a human decision for
@@ -1247,6 +1278,191 @@ class EventStore:
                 )
             self._conn.commit()
             return cur.rowcount > 0
+
+    # ── capability + strategy registries (SSOT, append-only versions — plan B1) ──────────────
+    # One generic engine, two tables: the disciplines (idempotent same-hash register, supersede
+    # never edit, workspace-pinned reads) are identical by construction, so they cannot drift.
+
+    @staticmethod
+    def _object_row(row: sqlite3.Row) -> dict[str, Any]:
+        """Deserialize a registry row: `body_json` (the canonical AST) comes back as `body`."""
+        rec = dict(row)
+        rec["body"] = _loads(rec.pop("body_json", None))
+        return rec
+
+    def _register_object(
+        self,
+        table: str,
+        id_col: str,
+        *,
+        workspace: str,
+        object_id: str,
+        content_hash: str,
+        body: dict[str, Any],
+        state: str = "draft",
+    ) -> dict[str, Any]:
+        """Append a new version. Re-registering an identical body (same `content_hash` as the
+        latest version) is an idempotent no-op — returns the existing row, no new version.
+        Otherwise the prior latest is marked `superseded_by` the new version and `deprecated`."""
+        if not workspace:
+            raise ValueError("workspace is required")  # fail closed: no tenant, no write
+        cols = f"workspace, {id_col}, version, content_hash, body_json, state, created_at, superseded_by"
+        with self._lock:
+            latest = self._conn.execute(
+                f"SELECT version, content_hash FROM {table} "
+                f"WHERE workspace = ? AND {id_col} = ? ORDER BY version DESC LIMIT 1",
+                (workspace, object_id),
+            ).fetchone()
+            if latest is not None and latest["content_hash"] == content_hash:
+                row = self._conn.execute(
+                    f"SELECT {cols} FROM {table} "
+                    f"WHERE workspace = ? AND {id_col} = ? AND version = ?",
+                    (workspace, object_id, latest["version"]),
+                ).fetchone()
+                return self._object_row(row)
+            version = (latest["version"] + 1) if latest is not None else 1
+            if latest is not None:
+                self._conn.execute(
+                    f"UPDATE {table} SET superseded_by = ?, state = 'deprecated' "
+                    f"WHERE workspace = ? AND {id_col} = ? AND version = ?",
+                    (version, workspace, object_id, latest["version"]),
+                )
+            self._conn.execute(
+                f"INSERT INTO {table} (workspace, {id_col}, version, content_hash, body_json, "
+                "state, created_at, superseded_by) VALUES (?,?,?,?,?,?,?,NULL)",
+                (
+                    workspace,
+                    object_id,
+                    version,
+                    content_hash,
+                    json.dumps(body, ensure_ascii=False),
+                    state,
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                f"SELECT {cols} FROM {table} WHERE workspace = ? AND {id_col} = ? AND version = ?",
+                (workspace, object_id, version),
+            ).fetchone()
+        return self._object_row(row)
+
+    def _get_object(
+        self, table: str, id_col: str, workspace: str, object_id: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        """A specific version, or the latest when `version` is None. Workspace-pinned: an id that
+        exists only in another tenant is None here (fail closed)."""
+        cols = f"workspace, {id_col}, version, content_hash, body_json, state, created_at, superseded_by"
+        with self._lock:
+            if version is None:
+                row = self._conn.execute(
+                    f"SELECT {cols} FROM {table} "
+                    f"WHERE workspace = ? AND {id_col} = ? ORDER BY version DESC LIMIT 1",
+                    (workspace, object_id),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    f"SELECT {cols} FROM {table} "
+                    f"WHERE workspace = ? AND {id_col} = ? AND version = ?",
+                    (workspace, object_id, version),
+                ).fetchone()
+        return self._object_row(row) if row is not None else None
+
+    def _list_objects(self, table: str, id_col: str, workspace: str) -> list[dict[str, Any]]:
+        """The latest version of every object in the workspace, by id."""
+        cols = f"workspace, {id_col}, version, content_hash, body_json, state, created_at, superseded_by"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {cols} FROM {table} a WHERE workspace = ? AND version = "
+                f"(SELECT MAX(version) FROM {table} b "
+                f" WHERE b.workspace = a.workspace AND b.{id_col} = a.{id_col}) "
+                f"ORDER BY {id_col}",
+                (workspace,),
+            ).fetchall()
+        return [self._object_row(r) for r in rows]
+
+    def _set_object_state(
+        self, table: str, id_col: str, workspace: str, object_id: str, version: int, state: str
+    ) -> bool:
+        """Transition one version's lifecycle state (draft -> published -> deprecated). Returns
+        False if no such version exists in THIS workspace."""
+        if state not in ("draft", "published", "deprecated"):
+            raise ValueError("state must be draft|published|deprecated")
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE {table} SET state = ? WHERE workspace = ? AND {id_col} = ? AND version = ?",
+                (state, workspace, object_id, version),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def register_capability(
+        self,
+        *,
+        workspace: str,
+        capability_id: str,
+        content_hash: str,
+        body: dict[str, Any],
+        state: str = "draft",
+    ) -> dict[str, Any]:
+        return self._register_object(
+            "capabilities",
+            "capability_id",
+            workspace=workspace,
+            object_id=capability_id,
+            content_hash=content_hash,
+            body=body,
+            state=state,
+        )
+
+    def get_capability(
+        self, workspace: str, capability_id: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        return self._get_object("capabilities", "capability_id", workspace, capability_id, version)
+
+    def list_capabilities(self, workspace: str) -> list[dict[str, Any]]:
+        return self._list_objects("capabilities", "capability_id", workspace)
+
+    def set_capability_state(
+        self, workspace: str, capability_id: str, version: int, state: str
+    ) -> bool:
+        return self._set_object_state(
+            "capabilities", "capability_id", workspace, capability_id, version, state
+        )
+
+    def register_strategy(
+        self,
+        *,
+        workspace: str,
+        strategy_id: str,
+        content_hash: str,
+        body: dict[str, Any],
+        state: str = "draft",
+    ) -> dict[str, Any]:
+        return self._register_object(
+            "strategies",
+            "strategy_id",
+            workspace=workspace,
+            object_id=strategy_id,
+            content_hash=content_hash,
+            body=body,
+            state=state,
+        )
+
+    def get_strategy(
+        self, workspace: str, strategy_id: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        return self._get_object("strategies", "strategy_id", workspace, strategy_id, version)
+
+    def list_strategies(self, workspace: str) -> list[dict[str, Any]]:
+        return self._list_objects("strategies", "strategy_id", workspace)
+
+    def set_strategy_state(
+        self, workspace: str, strategy_id: str, version: int, state: str
+    ) -> bool:
+        return self._set_object_state(
+            "strategies", "strategy_id", workspace, strategy_id, version, state
+        )
 
     # ── automation runs (P2 dispatcher) ──────────────────────────────────────────────────────
     def start_run(
