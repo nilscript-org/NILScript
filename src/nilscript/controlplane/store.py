@@ -182,6 +182,34 @@ CREATE TABLE IF NOT EXISTS parked_runs (
     PRIMARY KEY (run_id, node_id)
 );
 CREATE INDEX IF NOT EXISTS ix_parked_proposal ON parked_runs(proposal_id);
+
+-- Strategy signature slots (plan B3): ONE approval subject, N signature slots. Each row is one
+-- unit of the flattened strategy — who may sign (role/person), which Seq stage it belongs to,
+-- and its lifecycle. `planned` mirrors planned_steps: a later Seq stage's slot exists but is not
+-- yet actionable; it materializes to `pending` on the prior stage's approval. `superseded` is a
+-- VOIDED signature (a material edit re-held the card); the row keeps actor/decided_at as the
+-- audit trail and a fresh slot re-holds the unit. `deadline` follows the parked_runs pattern:
+-- the /automations/tick sweep escalates or rejects due slots.
+CREATE TABLE IF NOT EXISTS strategy_signatures (
+    execution_id  TEXT    NOT NULL,
+    unit_idx      INTEGER NOT NULL,
+    unit_key      TEXT    NOT NULL DEFAULT '',
+    stage         INTEGER NOT NULL DEFAULT 0,
+    by_kind       TEXT    NOT NULL DEFAULT 'role',    -- role | person | policy
+    role          TEXT    NOT NULL DEFAULT '',        -- the addressed role/person/policy name
+    distinct_from TEXT,                                -- JSON list (SoD constraints)
+    quorum_k      INTEGER NOT NULL DEFAULT 1,          -- k for this slot's stage
+    quorum_distinct INTEGER NOT NULL DEFAULT 0,
+    workspace     TEXT    NOT NULL DEFAULT '',
+    actor         TEXT,
+    decided_at    TEXT,
+    status        TEXT    NOT NULL DEFAULT 'pending',  -- planned|pending|signed|rejected|superseded|cancelled|escalated|timed_out
+    deadline      TEXT,                                -- ISO UTC; NULL = no timeout
+    timeout_route TEXT,                                -- JSON {"kind":"escalate","to":...}|{"kind":"reject"}
+    created_at    TEXT    NOT NULL,
+    PRIMARY KEY (execution_id, unit_idx)
+);
+CREATE INDEX IF NOT EXISTS ix_sig_deadline ON strategy_signatures(status, deadline);
 """
 
 # Columns surfaced by the automation registry reads (JSON columns parsed back by `_automation_row`).
@@ -1655,3 +1683,153 @@ class EventStore:
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    # ── strategy signature slots (plan B3 — one subject, N signature slots) ──────────────────
+    _SIG_COLS = (
+        "execution_id, unit_idx, unit_key, stage, by_kind, role, distinct_from, quorum_k, "
+        "quorum_distinct, workspace, actor, decided_at, status, deadline, timeout_route, created_at"
+    )
+
+    @staticmethod
+    def _sig_row(row: sqlite3.Row) -> dict[str, Any]:
+        rec = dict(row)
+        # NOT _loads(): that helper is dict-only, and distinct_from is a JSON LIST.
+        try:
+            parsed = json.loads(rec.get("distinct_from") or "[]")
+        except (ValueError, TypeError):
+            parsed = []
+        rec["distinct_from"] = parsed if isinstance(parsed, list) else []
+        rec["timeout_route"] = (
+            _loads(rec.get("timeout_route")) if rec.get("timeout_route") else None
+        )
+        rec["quorum_distinct"] = bool(rec.get("quorum_distinct"))
+        return rec
+
+    def add_signature_slot(
+        self,
+        execution_id: str,
+        *,
+        unit_idx: int,
+        unit_key: str,
+        stage: int,
+        by_kind: str,
+        role: str,
+        distinct_from: list[str] | tuple[str, ...] = (),
+        quorum_k: int = 1,
+        quorum_distinct: bool = False,
+        workspace: str = "",
+        status: str = "pending",
+        actor: str | None = None,
+        decided_at: str | None = None,
+        deadline: str | None = None,
+        timeout_route: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Insert one signature slot (idempotent by (execution_id, unit_idx) — a re-delivered
+        materialization keeps the existing row and its status)."""
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT status FROM strategy_signatures WHERE execution_id = ? AND unit_idx = ?",
+                (execution_id, unit_idx),
+            ).fetchone()
+            if existing is not None:
+                return {"execution_id": execution_id, "unit_idx": unit_idx, "status": existing["status"]}
+            self._conn.execute(
+                "INSERT INTO strategy_signatures (execution_id, unit_idx, unit_key, stage, by_kind, "
+                "role, distinct_from, quorum_k, quorum_distinct, workspace, actor, decided_at, "
+                "status, deadline, timeout_route, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    execution_id,
+                    int(unit_idx),
+                    unit_key,
+                    int(stage),
+                    by_kind,
+                    role,
+                    json.dumps(list(distinct_from), ensure_ascii=False),
+                    int(quorum_k),
+                    1 if quorum_distinct else 0,
+                    workspace or "",
+                    actor,
+                    decided_at,
+                    status,
+                    deadline,
+                    json.dumps(timeout_route, ensure_ascii=False)
+                    if timeout_route is not None
+                    else None,
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+        return {"execution_id": execution_id, "unit_idx": unit_idx, "status": status}
+
+    def signature_slots(self, execution_id: str) -> list[dict[str, Any]]:
+        """Every slot of one execution, in unit order — the full signature audit trail."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._SIG_COLS} FROM strategy_signatures "
+                "WHERE execution_id = ? ORDER BY unit_idx",
+                (execution_id,),
+            ).fetchall()
+        return [self._sig_row(r) for r in rows]
+
+    def set_signature_status(
+        self,
+        execution_id: str,
+        unit_idx: int,
+        status: str,
+        *,
+        actor: str | None = None,
+        expect: str | tuple[str, ...] = ("pending", "planned"),
+    ) -> bool:
+        """Guarded slot transition (only from `expect`) — the single-decision guard, so a
+        re-delivered signature never double-signs a slot. Stamps actor/decided_at on a decision."""
+        expected = (expect,) if isinstance(expect, str) else tuple(expect)
+        ph = ",".join("?" * len(expected))
+        with self._lock:
+            if actor is not None:
+                cur = self._conn.execute(
+                    f"UPDATE strategy_signatures SET status = ?, actor = ?, decided_at = ? "
+                    f"WHERE execution_id = ? AND unit_idx = ? AND status IN ({ph})",
+                    (status, actor, _now(), execution_id, unit_idx, *expected),
+                )
+            else:
+                cur = self._conn.execute(
+                    f"UPDATE strategy_signatures SET status = ? "
+                    f"WHERE execution_id = ? AND unit_idx = ? AND status IN ({ph})",
+                    (status, execution_id, unit_idx, *expected),
+                )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def activate_signature_slot(
+        self, execution_id: str, unit_idx: int, *, deadline: str | None
+    ) -> bool:
+        """Materialize a planned slot (planned → pending), stamping its deadline NOW — a Seq
+        stage's timeout clock starts when the stage becomes actionable, not at prepare time."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE strategy_signatures SET status = 'pending', deadline = ? "
+                "WHERE execution_id = ? AND unit_idx = ? AND status = 'planned'",
+                (deadline, execution_id, unit_idx),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def next_signature_unit_idx(self, execution_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(unit_idx) AS m FROM strategy_signatures WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+        return int(row["m"]) + 1 if row is not None and row["m"] is not None else 0
+
+    def due_signature_slots(self, now_iso: str) -> list[dict[str, Any]]:
+        """PENDING slots whose deadline has passed — the /automations/tick sweep escalates or
+        rejects each per its declared route (the parked_runs deadline pattern)."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._SIG_COLS} FROM strategy_signatures "
+                "WHERE status = 'pending' AND deadline IS NOT NULL AND deadline <= ? "
+                "ORDER BY deadline",
+                (now_iso,),
+            ).fetchall()
+        return [self._sig_row(r) for r in rows]
