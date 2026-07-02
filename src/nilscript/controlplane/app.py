@@ -43,12 +43,14 @@ from nilscript.capability import (
     Capability,
     capability_content_hash,
     parse_capability_nil,
+    wrap_cycle,
 )
 from nilscript.controlplane.store import EventStore
 from nilscript.cycle import (
     Cycle,
     NilSyntaxError,
     completions as lsp_completions,
+    cycle_slug,
     diagnostics as lsp_diagnostics,
     draft_cycle,
     governance_report,
@@ -1157,6 +1159,57 @@ def create_app(
             return JSONResponse({"error": "unknown strategy"}, status_code=404)
         store.set_strategy_state(workspace, strategy_id, rec["version"], "published")
         return {"ok": True, "definition": store.get_strategy(workspace, strategy_id, rec["version"])}
+
+    # ── Auto-wrap (plan B8): every registered cycle gets a v0 capability ─────────────────────
+    @app.post("/capabilities/wrap")
+    async def capability_wrap_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Derive + register the v0 capability (and its owner-approval strategy) for a registered
+        cycle. Risk comes from the live adapter's DECLARED verb metadata; with no reachable
+        adapter every verb is undeclared and the floor is HIGH (fail closed, never guess).
+        Deterministic: re-wrapping an unchanged cycle is a same-hash idempotent no-op."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        workspace = (body or {}).get("workspace") or ""
+        cycle_id = (body or {}).get("cycle_id") or ""
+        if not workspace or not cycle_id:
+            return JSONResponse(
+                {"error": "workspace and cycle_id are required"}, status_code=400
+            )
+        row = store.get_automation(workspace, cycle_slug(cycle_id))
+        if row is None or row.get("kind") != "cycle" or not row.get("source"):
+            return JSONResponse({"error": "unknown cycle"}, status_code=404)
+        try:
+            cycle = Cycle.model_validate(row["source"])
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse({"error": f"stored cycle is invalid: {exc}"}, status_code=400)
+        skeleton = await provider(workspace)
+        details: dict[str, dict[str, Any]] = {
+            d["verb"]: d
+            for d in (skeleton or {}).get("verb_details", [])
+            if isinstance(d, dict) and d.get("verb")
+        }
+        try:
+            wrapped = wrap_cycle(cycle, details.get)
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse({"error": f"cycle cannot be wrapped: {exc}"}, status_code=400)
+        strategy_row = store.register_strategy(
+            workspace=workspace,
+            strategy_id=wrapped.strategy.strategy_id,
+            content_hash=strategy_content_hash(wrapped.strategy),
+            body=wrapped.strategy.model_dump(by_alias=True, mode="json"),
+        )
+        capability_row = store.register_capability(
+            workspace=workspace,
+            capability_id=wrapped.capability.capability_id,
+            content_hash=capability_content_hash(wrapped.capability),
+            body=wrapped.capability.model_dump(by_alias=True, mode="json"),
+        )
+        return {"ok": True, "capability": capability_row, "strategy": strategy_row}
 
     # ── Cycle .nil surface + language services (the LSP brain — a projection, no state) ────────
     async def _read_body(request: Request) -> tuple[dict[str, Any] | None, Any]:

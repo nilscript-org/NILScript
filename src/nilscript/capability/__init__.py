@@ -21,6 +21,7 @@ from nilscript.capability.models import (
 )
 from nilscript.capability.nil_parser import parse_capability_nil
 from nilscript.capability.nil_printer import print_capability_nil
+from nilscript.capability.wrap import WrappedCapability, wrap_cycle
 from nilscript.cycle.nil_parser import NilSyntaxError
 
 __all__ = [
@@ -32,7 +33,9 @@ __all__ = [
     "Metrics",
     "NilSyntaxError",
     "Sod",
+    "WrappedCapability",
     "capability_content_hash",
     "parse_capability_nil",
     "print_capability_nil",
+    "wrap_cycle",
 ]
