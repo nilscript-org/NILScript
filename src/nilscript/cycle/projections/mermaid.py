@@ -15,6 +15,7 @@ from nilscript.cycle.models import (
     DecisionStep,
     NotifyStep,
     QueryStep,
+    WaitForEventStep,
 )
 from nilscript.cycle.projections._shared import text
 
@@ -29,6 +30,8 @@ def _label(step: object) -> str:
         return f"{step.id}: decide"
     if isinstance(step, NotifyStep):
         return f"{step.id}: notify"
+    if isinstance(step, WaitForEventStep):
+        return f"{step.id}: wait for {step.on_event}"
     return getattr(step, "id", "?")
 
 
@@ -65,6 +68,10 @@ def to_mermaid(cycle: Cycle) -> str:
             edges.append(_edge(step.id, step.on_true, "true"))
             if step.on_false is not None:
                 edges.append(_edge(step.id, step.on_false, "false"))
+        elif isinstance(step, WaitForEventStep):
+            if step.next is not None:
+                edges.append(_edge(step.id, step.next, "event"))
+            edges.append(_edge(step.id, step.on_timeout, "timeout"))
         else:
             nxt = getattr(step, "next", None)
             if nxt is not None:

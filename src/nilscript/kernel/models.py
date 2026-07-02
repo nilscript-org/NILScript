@@ -126,6 +126,23 @@ class WaitNode(DslModel):
     next: str | None = Field(default=None, pattern=NODE_ID_PATTERN)
 
 
+class WaitForEventNode(DslModel):
+    """Park the run until a ledger event named `on_event` arrives whose fields shallow-match
+    `match` (values may be data references, resolved from the run context at park time), or until
+    `timeout_seconds` passes — then the run takes `on_timeout`. Unlike `wait` (a clock sleep),
+    this is a durable, row-backed park: the control plane resumes the run on match/deadline.
+    `on_timeout` is REQUIRED (positive timeout ⇒ a route it leads to); `next` is the on-event
+    continuation, with the event payload bound as this node's output."""
+
+    id: str = Field(pattern=NODE_ID_PATTERN)
+    type: Literal["wait_for_event"]
+    on_event: str = Field(min_length=1)
+    match: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: int = Field(ge=1, le=2_592_000)
+    on_timeout: str = Field(pattern=NODE_ID_PATTERN)
+    next: str | None = Field(default=None, pattern=NODE_ID_PATTERN)
+
+
 class NotifyNode(DslModel):
     id: str = Field(pattern=NODE_ID_PATTERN)
     type: Literal["notify"]
@@ -143,6 +160,7 @@ NodeType = (
     | ForeachNode
     | AwaitApprovalNode
     | WaitNode
+    | WaitForEventNode
     | NotifyNode
 )
 Node = Annotated[NodeType, Field(discriminator="type")]

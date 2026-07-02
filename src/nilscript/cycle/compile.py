@@ -26,6 +26,7 @@ from nilscript.cycle.models import (
     DecisionStep,
     NotifyStep,
     QueryStep,
+    WaitForEventStep,
 )
 from nilscript.kernel.context import ValidationContext
 from nilscript.kernel.diagnostics import ValidationResult
@@ -80,6 +81,27 @@ def _resolve(value: object, outputs: dict[str, str], variables: dict[str, str]) 
     if head in variables:
         return variables[head] + suffix
     return value  # a literal (e.g. "default", an event name)
+
+
+def _resolve_match(
+    match: dict[str, object], outputs: dict[str, str], variables: dict[str, str]
+) -> dict[str, object]:
+    """wait_for_event `match` values: EXPLICIT `$name(.tail)` references resolve like `_resolve`
+    heads; everything else stays a literal. Match fields are equality values, so the bare-path
+    rewriting actions get would wrongly capture literals here — the `$` marks intent."""
+    resolved: dict[str, object] = {}
+    for key, value in match.items():
+        if isinstance(value, str) and value.startswith("$") and _PATH.match(value[1:]):
+            head, _, tail = value[1:].partition(".")
+            suffix = f".{tail}" if tail else ""
+            if head in outputs:
+                resolved[key] = f"$.{outputs[head]}.output{suffix}"
+                continue
+            if head in variables:
+                resolved[key] = variables[head] + suffix
+                continue
+        resolved[key] = value
+    return resolved
 
 
 def _lower(cycle: Cycle) -> tuple[dict, dict[str, str], tuple[str, ...]]:
@@ -151,6 +173,22 @@ def _lower(cycle: Cycle) -> tuple[dict, dict[str, str], tuple[str, ...]]:
             if step.next is not None:
                 node["next"] = nid(step.next)
             pipeline.append(node)
+        elif isinstance(step, WaitForEventStep):
+            node = {
+                "id": sid,
+                "type": "wait_for_event",
+                "on_event": step.on_event,
+                "match": _resolve_match(step.match, outputs, variables),
+                "timeout_seconds": step.timeout_seconds,
+                # An unknown route name lowers to None and V1 refuses (on_timeout is required in
+                # the IR) — a deadline with nowhere to go is unrepresentable in an admitted plan.
+                "on_timeout": nid(step.on_timeout),
+            }
+            if step.next is not None:
+                node["next"] = nid(step.next)
+            pipeline.append(node)
+            if step.output:
+                outputs[step.output] = sid  # the event payload binds as this step's output
 
     raw = {
         "wosool": "0.1",

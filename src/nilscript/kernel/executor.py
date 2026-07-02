@@ -207,6 +207,19 @@ class LocalExecutor:
             return {"count": len(capped)}
         if node_type == "await_approval":
             return await self._do_await_approval(node, item)
+        if node_type == "wait_for_event":
+            # PARK until a matching ledger event (or the deadline). The match filter is resolved
+            # NOW against the run context ($.step_N.output.* / $.input.*), so the persisted park
+            # row carries literal values the event dispatcher can compare with shallow equality.
+            raise _Park(
+                {
+                    "kind": "event",
+                    "node": node["id"],
+                    "on_event": node["on_event"],
+                    "match": resolve(node.get("match", {}), self._ctx, item=item),
+                    "timeout_seconds": node.get("timeout_seconds"),
+                }
+            )
         raise ValueError(f"unknown node type {node_type!r}")  # validator forbids this
 
     async def _do_action(self, node: dict[str, Any], item: Any) -> dict[str, Any]:

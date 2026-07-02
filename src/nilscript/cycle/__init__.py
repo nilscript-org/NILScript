@@ -37,6 +37,7 @@ from nilscript.cycle.models import (
     QueryStep,
     RoleRef,
     VariableBinding,
+    WaitForEventStep,
 )
 from nilscript.cycle.projections import (
     governance_report,
@@ -60,6 +61,7 @@ __all__ = [
     "DecisionStep",
     "ApprovalStep",
     "NotifyStep",
+    "WaitForEventStep",
     "CompileResult",
     "compile_cycle",
     "cycle_content_hash",

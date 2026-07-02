@@ -31,6 +31,7 @@ from nilscript.cycle.models import (
     DecisionStep,
     NotifyStep,
     QueryStep,
+    WaitForEventStep,
 )
 from nilscript.kernel.context import ValidationContext
 
@@ -112,7 +113,10 @@ def _expr_refs(expression: str | None) -> list[str]:
 def _step_target_fields(step: CycleStepType) -> list[tuple[str, str]]:
     """(field, target-step-name) pairs where the step references ANOTHER step by name."""
     out: list[tuple[str, str]] = []
-    if isinstance(step, (ActionStep, QueryStep, DecisionStep, NotifyStep)) and step.next:
+    if (
+        isinstance(step, (ActionStep, QueryStep, DecisionStep, NotifyStep, WaitForEventStep))
+        and step.next
+    ):
         out.append(("next", step.next))
     if isinstance(step, DecisionStep):
         out.append(("on_true", step.on_true))
@@ -124,6 +128,8 @@ def _step_target_fields(step: CycleStepType) -> list[tuple[str, str]]:
             out.append(("on_reject", step.on_reject))
         if step.on_timeout:
             out.append(("on_timeout", step.on_timeout))
+    if isinstance(step, WaitForEventStep):
+        out.append(("on_timeout", step.on_timeout))
     return out
 
 
@@ -143,6 +149,13 @@ def _value_refs_dotted(step: CycleStepType) -> list[tuple[str, bool]]:
         return [(h, True) for h in _expr_refs(step.when)]  # an expr operand is a real reference
     if isinstance(step, ApprovalStep):
         return [(step.approver, True)]  # a direct context-entity reference
+    if isinstance(step, WaitForEventStep):
+        # `$name` match values are DEFINITE references to variables/outputs.
+        return [
+            (v[1:].partition(".")[0], True)
+            for v in step.match.values()
+            if isinstance(v, str) and v.startswith("$") and len(v) > 1
+        ]
     return []
 
 
@@ -359,6 +372,8 @@ def _step_detail(step: CycleStepType) -> str:
         return f"approval step (approver: {step.approver})"
     if isinstance(step, NotifyStep):
         return "notify step"
+    if isinstance(step, WaitForEventStep):
+        return f"wait_for_event step (on {step.on_event})"
     return "step"
 
 

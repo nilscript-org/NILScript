@@ -15,6 +15,7 @@ from nilscript.cycle.models import (
     DecisionStep,
     NotifyStep,
     QueryStep,
+    WaitForEventStep,
 )
 from nilscript.cycle.projections._shared import text
 
@@ -48,6 +49,13 @@ def _step_sentence(step: object) -> str:
         return f"Decides `{step.when}` → if true **{step.on_true}**{false_target}"
     if isinstance(step, NotifyStep):
         return f"Notifies: {text(step.message)}"
+    if isinstance(step, WaitForEventStep):
+        return (
+            f"Waits for event `{step.on_event}`"
+            + (f" matching `{step.match}`" if step.match else "")
+            + f" → **{step.next}**" * bool(step.next)
+            + f", after {step.timeout_seconds}s goes to **{step.on_timeout}**"
+        )
     return ""
 
 

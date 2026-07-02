@@ -33,9 +33,10 @@ class NilSyntaxError(ValueError):
 # Punctuation that forms its own token. `->` must be matched before `-` would be (we never emit a
 # bare `-`, so order only matters for the arrow).
 _PUNCT = ("->", "{", "}", "(", ")", "[", "]", ":", ";", ",", "=")
-# A bare word: identifier, dotted verb/path, tier, number. We keep it loose and let the model
-# validate the shape — the tokenizer only splits the stream.
-_WORD_RE = re.compile(r"[A-Za-z0-9_.\-+]+")
+# A bare word: identifier, dotted verb/path, tier, number, or a `$name` variable reference (the
+# wait_for_event match sugar). We keep it loose and let the model validate the shape — the
+# tokenizer only splits the stream.
+_WORD_RE = re.compile(r"[A-Za-z0-9_.\-+$]+")
 _WS_RE = re.compile(r"[ \t\r\n]+")
 
 
@@ -183,6 +184,11 @@ class _Reader:
         self._expect_punct("}")
         if self._peek().kind != "eof":
             self._fail(f"unexpected trailing token {self._peek().value!r}")
+        # The dialect is content-determined (no surface marker): a wait_for_event step means
+        # cycle/0.3, otherwise cycle/0.2 — the model's two-way rule makes this an exact bijection.
+        steps = (raw.get("flow") or {}).get("steps") or []
+        if any(isinstance(s, dict) and s.get("type") == "wait_for_event" for s in steps):
+            raw["nil"] = "cycle/0.3"
         return raw
 
     def _trigger_header(self) -> dict:
@@ -382,6 +388,8 @@ class _Reader:
             step = self._approval(step_id)
         elif head.value == "notify":
             step = self._notify(step_id)
+        elif head.value == "wait_for_event":
+            step = self._wait_for_event(step_id)
         else:
             self._fail(f"unknown step type {head.value!r}", head)
         self._expect_punct("}")
@@ -446,6 +454,33 @@ class _Reader:
                 step["on_timeout"] = target
             else:
                 self._fail(f"unknown approval branch {branch!r}")
+        return step
+
+    def _wait_for_event(self, step_id: str) -> dict:
+        """`wait_for_event { on_event: "mail.received"; match { order_ref: $po };
+        timeout_seconds: 604800 -> route Escalate }` then optional `output` / `next` (v0.3)."""
+        self._expect_word("wait_for_event")
+        self._expect_punct("{")
+        step: dict[str, Any] = {"id": step_id, "type": "wait_for_event"}
+        while not self._is_punct("}"):
+            key = self._word()
+            if key == "on_event":
+                self._expect_punct(":")
+                step["on_event"] = self._string()
+            elif key == "match":
+                step["match"] = self._arg_map()
+            elif key == "timeout_seconds":
+                self._expect_punct(":")
+                step["timeout_seconds"] = self._number()
+                self._expect_punct("->")
+                self._expect_word("route")
+                step["on_timeout"] = self._word()
+            else:
+                self._fail(f"unknown wait_for_event field {key!r}")
+            if self._is_punct(";"):
+                self._next()
+        self._expect_punct("}")
+        self._read_output_and_next(step)
         return step
 
     def _notify(self, step_id: str) -> dict:

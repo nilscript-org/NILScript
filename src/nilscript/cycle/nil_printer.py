@@ -35,6 +35,7 @@ from nilscript.cycle.models import (
     QueryStep,
     RoleRef,
     VariableBinding,
+    WaitForEventStep,
 )
 from nilscript.kernel.models import BilingualText
 
@@ -149,6 +150,8 @@ class _Printer:
             body._approval(step)
         elif isinstance(step, NotifyStep):
             body._notify(step)
+        elif isinstance(step, WaitForEventStep):
+            body._wait_for_event(step)
         else:  # pragma: no cover - the union is closed
             raise TypeError(f"unprintable step {type(step).__name__}")
         self.lines.extend(body.lines)
@@ -181,6 +184,22 @@ class _Printer:
             self._emit(f"on reject -> {step.on_reject}")
         if step.on_timeout is not None:
             self._emit(f"on timeout -> {step.on_timeout}")
+
+    def _wait_for_event(self, step: WaitForEventStep) -> None:
+        """v0.3: the park-until-event step. The timeout and its route print on ONE line
+        (`timeout_seconds: N -> route Step`) — a deadline without a route is unrepresentable."""
+        self._emit("wait_for_event {")
+        inner = _Printer(self.level + 1)
+        inner._emit(f"on_event: {_string(step.on_event)};")
+        if step.match:
+            inner._emit(f"match {_arg_map(step.match)};")
+        inner._emit(f"timeout_seconds: {step.timeout_seconds} -> route {step.on_timeout}")
+        self.lines.extend(inner.lines)
+        self._emit("}")
+        if step.output is not None:
+            self._emit(f"output {step.output}")
+        if step.next is not None:
+            self._emit(f"next {step.next}")
 
     def _notify(self, step: NotifyStep) -> None:
         self._emit(f"notify {_bilingual(step.message)}")

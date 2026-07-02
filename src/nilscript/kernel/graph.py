@@ -27,6 +27,13 @@ def next_after(node: dict[str, Any], output: Any) -> str | None:
         return node.get("on_false") if node.get("on_false") is not None else node.get("next")
     if node_type == "await_approval":
         return node.get(f"on_{output}")  # on_approved / on_rejected / on_timeout (None = terminal)
+    if node_type == "wait_for_event":
+        # A deadline resume binds {"timed_out": True} → the timeout route; a matched event binds
+        # the event payload → the on-event continuation. Routing lives HERE so a resumed walk
+        # needs no resume-only control flow.
+        if isinstance(output, dict) and output.get("timed_out"):
+            return node.get("on_timeout")
+        return node.get("next")
     return node.get("next")
 
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from nilscript.automation.models import TriggerSpec  # REUSE the closed trigger union
 from nilscript.kernel.models import BilingualText, DslModel
@@ -148,7 +148,24 @@ class NotifyStep(DslModel):
     next: str | None = Field(default=None, pattern=STEP_ID_PATTERN)
 
 
-CycleStepType = ActionStep | QueryStep | DecisionStep | ApprovalStep | NotifyStep
+class WaitForEventStep(DslModel):
+    """v0.3 (ADDITIVE — v0.2 is frozen and unchanged): park the run until a matching ledger event
+    arrives, or route to `on_timeout` when the deadline passes. `match` values may reference cycle
+    variables / named outputs with a `$name` prefix (`order_ref: "$po"`); they lower to IR data
+    references and resolve from the run context at park time. The arriving event's payload binds
+    as this step's output; `next` is the on-event continuation."""
+
+    id: str = Field(pattern=STEP_ID_PATTERN)
+    type: Literal["wait_for_event"]
+    on_event: str = Field(min_length=1)  # "mail.received"
+    match: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: int = Field(ge=1, le=2_592_000)
+    on_timeout: str = Field(pattern=STEP_ID_PATTERN)  # the `-> route` deadline target
+    output: str | None = Field(default=None, pattern=VAR_PATTERN)
+    next: str | None = Field(default=None, pattern=STEP_ID_PATTERN)
+
+
+CycleStepType = ActionStep | QueryStep | DecisionStep | ApprovalStep | NotifyStep | WaitForEventStep
 CycleStep = Annotated[CycleStepType, Field(discriminator="type")]
 
 
@@ -158,7 +175,10 @@ class Flow(DslModel):
 
 
 class Cycle(DslModel):
-    nil: Literal["cycle/0.2"]
+    # The dialect seam: "cycle/0.2" is FROZEN; "cycle/0.3" adds exactly the wait_for_event step.
+    # The dialect is fully determined by content (see `_dialect_gates_wait_for_event`), which is
+    # what keeps the .nil printer/parser an EXACT bijection with no surface version marker.
+    nil: Literal["cycle/0.2", "cycle/0.3"]
     cycle_id: str = Field(pattern=CYCLE_ID_PATTERN)
     workspace: str = Field(min_length=1)
     metadata: CycleMetadata
@@ -172,3 +192,20 @@ class Cycle(DslModel):
     outcomes: tuple[Outcome, ...] = ()
     flow: Flow
     documentation: BilingualText | None = None
+
+    @model_validator(mode="after")
+    def _dialect_gates_wait_for_event(self) -> Cycle:
+        """The v0.3 step is only valid in the v0.3 dialect — and v0.3 means exactly "uses
+        wait_for_event", so dialect is content-determined in BOTH directions. That two-way rule is
+        what lets the .nil parser infer the dialect (no surface marker) while `parse(print(ast))
+        == ast` stays an exact bijection."""
+        has_wait = any(step.type == "wait_for_event" for step in self.flow.steps)
+        if has_wait and self.nil != "cycle/0.3":
+            raise ValueError(
+                "wait_for_event steps require the 'cycle/0.3' dialect (cycle/0.2 is frozen)"
+            )
+        if self.nil == "cycle/0.3" and not has_wait:
+            raise ValueError(
+                "'cycle/0.3' adds only wait_for_event; a cycle without one is 'cycle/0.2'"
+            )
+        return self

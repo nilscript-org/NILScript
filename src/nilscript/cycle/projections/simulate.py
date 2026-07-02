@@ -15,6 +15,7 @@ from nilscript.cycle.models import (
     DecisionStep,
     NotifyStep,
     QueryStep,
+    WaitForEventStep,
 )
 from nilscript.cycle.projections._shared import step_map
 
@@ -37,6 +38,9 @@ def _entry(step: object) -> tuple[dict, str | None]:
         next_name = step.on_true  # happy path takes the true branch
     elif isinstance(step, NotifyStep):
         next_name = step.next
+    elif isinstance(step, WaitForEventStep):
+        record["on_event"] = step.on_event
+        next_name = step.next  # happy path: the awaited event arrives
     else:
         next_name = None
     return record, next_name
