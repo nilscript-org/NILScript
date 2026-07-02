@@ -603,11 +603,80 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         for t in names:
             s = client.schema(t)  # the live skeleton: field list, or None if not provisioned
             targets[t] = {"exists": s is not None, "fields": s or []}
+
+        # Per-verb governance metadata, DECLARED by this adapter (the only authority on its own
+        # verbs). Consumers must use these fields instead of guessing tier/type from verb names —
+        # a verb absent here is metadata-unknown and must be treated fail-closed downstream.
+        # Reversibility comes from COMPENSATIONS; omission = IRREVERSIBLE (the honest default).
+        verb_details: list[dict[str, Any]] = []
+        for verb_name in sorted(WRITE_VERBS):
+            v = WRITE_VERBS[verb_name]
+            comp = COMPENSATIONS.get(verb_name) or {}
+            verb_details.append(
+                {
+                    "verb": verb_name,
+                    "type": "write",
+                    "tier": v.tier,
+                    "reversibility": comp.get("reversibility", "IRREVERSIBLE"),
+                    "doctype": v.doctype,
+                    "entity_type": v.entity_type,
+                    "required_args": list(v.required),
+                    # older WriteVerb tables predate declared references — tolerate both
+                    "references": dict(getattr(v, "references", {}) or {}),
+                }
+            )
+        for verb_name in sorted(QUERY_VERBS):
+            verb_details.append(
+                {
+                    "verb": verb_name,
+                    "type": "query",
+                    "tier": "LOW",
+                    "reversibility": "REVERSIBLE",
+                    "doctype": "",
+                    "entity_type": "",
+                    "required_args": [],
+                    "references": {},
+                }
+            )
+        for verb_name in ("resource.read",):
+            verb_details.append(
+                {
+                    "verb": verb_name,
+                    "type": "query",
+                    "tier": "LOW",
+                    "reversibility": "REVERSIBLE",
+                    "doctype": "",
+                    "entity_type": "",
+                    "required_args": ["target"],
+                    "references": {},
+                }
+            )
+        for verb_name, tier in (
+            ("resource.create", "MEDIUM"),
+            ("resource.update", "MEDIUM"),
+            ("resource.delete", "HIGH"),
+        ):
+            # Generic CRUD over any declared target: reversibility is synthesized by the
+            # resource layer (create→delete, update→restore, delete→recreate).
+            verb_details.append(
+                {
+                    "verb": verb_name,
+                    "type": "write",
+                    "tier": tier,
+                    "reversibility": "REVERSIBLE",
+                    "doctype": "",
+                    "entity_type": "",
+                    "required_args": ["target"],
+                    "references": {},
+                }
+            )
+
         return {
             "nil": NIL,
             "system": SYSTEM,
             "verbs": ["resource.create", "resource.read", "resource.update", "resource.delete"]
                      + sorted(WRITE_VERBS) + sorted(QUERY_VERBS),
+            "verb_details": verb_details,
             "targets": targets,
         }
 

@@ -568,6 +568,9 @@ def create_app(
             )
         return {
             "verbs": skeleton.get("verbs", []),
+            # Declared governance metadata per verb (optional; [] when the adapter doesn't
+            # declare). The BFF/UI must prefer these over any name-based guessing.
+            "verb_details": skeleton.get("verb_details", []),
             "targets": sorted((skeleton.get("targets") or {}).keys()),
         }
 

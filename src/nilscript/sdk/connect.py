@@ -41,6 +41,10 @@ async def handshake(transport: NilTransport) -> dict[str, Any]:
         "system": d.get("system"),
         "nil": d.get("nil"),
         "verbs": d.get("verbs", []),
+        # DECLARED per-verb governance metadata (type/tier/reversibility/args). Optional in
+        # NIL 0.1 — an adapter that doesn't declare it yields [], and consumers must treat
+        # its verbs as metadata-unknown (fail closed), never guess from verb names.
+        "verb_details": d.get("verb_details", []),
         "targets": targets,  # {name: {exists, fields:[{name,type,required}]}}
         "ready": [t for t, v in targets.items() if _ready(v)],
         "missing": [t for t, v in targets.items() if not _ready(v)],
