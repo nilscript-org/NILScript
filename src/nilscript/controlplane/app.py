@@ -45,6 +45,8 @@ from nilscript.capability import (
     parse_capability_nil,
     wrap_cycle,
 )
+from nilscript.controlplane import prepared as prepared_cards
+from nilscript.controlplane import strategy_exec
 from nilscript.controlplane.store import EventStore
 from nilscript.cycle import (
     Cycle,
@@ -160,7 +162,11 @@ def create_app(
     provider: SkeletonProvider = skeleton_provider or _live_skeleton
 
     async def _live_runner(
-        plan: dict[str, Any], *, run_id: str, resume: dict[str, Any] | None = None
+        plan: dict[str, Any],
+        *,
+        run_id: str,
+        resume: dict[str, Any] | None = None,
+        input: dict[str, Any] | None = None,
     ) -> Any:
         """Default runner: walk the pinned plan against the workspace's active adapter via a headless
         LocalExecutor. The adapter bearer is the transport auth; the grant scopes are the plan's own
@@ -187,7 +193,7 @@ def create_app(
                 session_id=run_id,
                 locale=plan.get("locale", "ar"),
             )
-            return await executor.execute(plan, resume=resume)
+            return await executor.execute(plan, resume=resume, input=input)
         finally:
             await transport.aclose()
 
@@ -1211,6 +1217,255 @@ def create_app(
         )
         return {"ok": True, "capability": capability_row, "strategy": strategy_row}
 
+    # ── Prepared executions (plans B2+B3): prepare → sign(strategy) → commit ──────────────────
+    def _prepared_refusal(refusal: dict[str, Any], status_code: int = 409, **extra: Any) -> Any:
+        return JSONResponse({"ok": False, "refusal": refusal, **extra}, status_code=status_code)
+
+    def _prepared_strategy_body(row: dict[str, Any]) -> dict[str, Any]:
+        rec = store.get_strategy(row["workspace"], row["strategy_id"], row["strategy_version"])
+        return (rec or {}).get("body") or {}
+
+    async def _commit_prepared(row: dict[str, Any]) -> dict[str, Any]:
+        """A FULLY APPROVED prepared execution commits by firing the capability's default
+        implementing cycle with the seeded inputs bound as $.input — the ONLY effect path.
+        Honest on failure (cycle not registered/armed, runner blow-up): the row stays
+        'approved' with the error recorded, retryable via /execute."""
+        cap = (
+            store.get_capability(
+                row["workspace"], row["capability_id"], row["capability_version"]
+            )
+            or {}
+        )
+        cycle_id = ((cap.get("body") or {}).get("implemented_by") or {}).get("default") or ""
+        if not cycle_id:
+            result: dict[str, Any] = {
+                "committed": False,
+                "error": "capability has no default implementation to commit through",
+            }
+        else:
+            fired = await fire_manual(
+                store,
+                workspace=row["workspace"],
+                automation_id=cycle_slug(cycle_id),
+                idempotency_key=f"prep:{row['prepared_id']}",
+                runner=run_exec,
+                fired_by=f"prepared:{row['prepared_id']}",
+                input=row["inputs"] or None,
+            )
+            run = fired.get("run") or {}
+            result = {
+                "committed": bool(fired.get("ok")),
+                "run_id": run.get("run_id"),
+                "replayed": bool(fired.get("replayed")),
+                "error": fired.get("error"),
+            }
+        store.record_prepared_commit(
+            row["prepared_id"], result, "committed" if result["committed"] else "approved"
+        )
+        return result
+
+    @app.post("/prepared")
+    async def prepared_create(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Prepare one capability invocation: validate the inputs against the typed contract,
+        pin the registry versions, stamp the preparer (SoD), and hold the strategy's first
+        stage. Returns the deterministic Permission Card. NO effect fires here."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        out = prepared_cards.prepare(
+            store,
+            workspace=body.get("workspace") or "",
+            capability_id=body.get("capability_id") or "",
+            inputs=body.get("inputs") if isinstance(body.get("inputs"), dict) else {},
+            prepared_by=body.get("prepared_by") or "",
+            version=body.get("version"),
+        )
+        if "refusal" in out:
+            return _prepared_refusal(out["refusal"], status_code=400)
+        return out
+
+    @app.get("/prepared/{prepared_id}")
+    def prepared_get(prepared_id: str, workspace: str = "") -> Any:
+        """The Permission Card. Workspace-pinned, fail closed: another tenant's prepared_id
+        is a 404 here, and no workspace means no card."""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        row = store.get_prepared(prepared_id, workspace)
+        if row is None:
+            return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
+        return prepared_cards.card_view(store, row)
+
+    @app.post("/prepared/{prepared_id}/sign")
+    async def prepared_sign(
+        prepared_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """One unit's decision on the card — the strategy-aware decision surface. SoD refusals
+        (the preparer, distinct_from) come back as answers with code SOD_VIOLATION; an
+        approve-with-edits inside `modifiable` VOIDS previously collected signatures
+        (superseded) and re-holds the affected units before this signature lands; on the
+        strategy's full approval the commit fires — the ONLY effect path."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        ws = body.get("workspace") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        decision = body.get("status")
+        if decision not in ("approved", "rejected"):
+            return JSONResponse(
+                {"error": "status must be 'approved' or 'rejected'"}, status_code=400
+            )
+        row = store.get_prepared(prepared_id, ws)
+        if row is None:
+            return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
+        if row["status"] != "pending":
+            return _prepared_refusal(
+                {
+                    "code": "ALREADY_DECIDED",
+                    "message": f"this prepared execution is already {row['status']}",
+                    "status": row["status"],
+                }
+            )
+        actor = body.get("actor") or ""
+        # SoD is checked BEFORE the edits path too — otherwise the preparer could void
+        # everyone's signatures with an edit they are not even allowed to sign.
+        if actor and actor == row["prepared_by"]:
+            return _prepared_refusal(
+                {
+                    "code": "SOD_VIOLATION",
+                    "message": f"{actor!r} prepared this card and cannot sign it "
+                    "(preparer-not-approver, invariant I6)",
+                    "actor": actor,
+                },
+                status_code=403,
+            )
+        strat_body = _prepared_strategy_body(row)
+        superseded = 0
+        edits = body.get("edits") if isinstance(body.get("edits"), dict) else None
+        if decision == "approved" and edits:
+            material = {k: v for k, v in edits.items() if row["inputs"].get(k) != v}
+            if material:
+                locked = sorted(k for k in material if k not in row["modifiable"])
+                if locked:
+                    return _prepared_refusal(
+                        {
+                            "code": "FIELD_NOT_MODIFIABLE",
+                            "message": "these fields are locked on this card — edits are "
+                            "lawful only inside `modifiable`",
+                            "fields": locked,
+                        }
+                    )
+                new_inputs = {**row["inputs"], **material}
+                cap = (
+                    store.get_capability(ws, row["capability_id"], row["capability_version"])
+                    or {}
+                )
+                contract = prepared_cards.validate_inputs(cap.get("body") or {}, new_inputs)
+                if contract is not None:
+                    return _prepared_refusal(contract, status_code=400)
+                held = strategy_exec.rehold(
+                    store, prepared_id, strat_body, inputs=new_inputs,
+                    risk=row["risk"], workspace=ws,
+                )
+                if "refusal" in held:
+                    return _prepared_refusal(held["refusal"], status_code=400)
+                store.update_prepared_inputs(prepared_id, new_inputs, branch=held.get("branch"))
+                row = store.get_prepared(prepared_id, ws) or row
+                superseded = int(held.get("superseded") or 0)
+                if held["status"] == "approved":  # the edit re-routed onto an auto branch
+                    store.set_prepared_status(prepared_id, "approved", expect="pending")
+                    execution = await _commit_prepared(store.get_prepared(prepared_id, ws) or row)
+                    return {
+                        "ok": True, "status": "approved", "superseded": superseded,
+                        "execution": execution,
+                        "prepared": prepared_cards.card_view(
+                            store, store.get_prepared(prepared_id, ws) or row
+                        ),
+                    }
+        signed = strategy_exec.sign(
+            store, prepared_id, strat_body, inputs=row["inputs"], actor=actor,
+            role=body.get("role"), decision=decision, prepared_by=row["prepared_by"],
+        )
+        if "refusal" in signed:
+            code = (signed["refusal"] or {}).get("code")
+            return _prepared_refusal(
+                signed["refusal"],
+                status_code=403 if code == "SOD_VIOLATION" else 409,
+                superseded=superseded,
+            )
+        result: dict[str, Any] = {"ok": True, "status": signed["status"], "superseded": superseded}
+        if signed["status"] == "rejected":
+            store.set_prepared_status(prepared_id, "rejected", expect="pending")
+        elif signed["status"] == "approved":
+            store.set_prepared_status(prepared_id, "approved", expect="pending")
+            result["execution"] = await _commit_prepared(store.get_prepared(prepared_id, ws) or row)
+        result["prepared"] = prepared_cards.card_view(
+            store, store.get_prepared(prepared_id, ws) or row
+        )
+        return result
+
+    @app.post("/prepared/{prepared_id}/execute")
+    async def prepared_execute(
+        prepared_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Commit a FULLY APPROVED prepared execution (the auto/complete path, or a retry after
+        a failed commit). A pending strategy refuses with its pending units — collecting
+        signatures is the only way forward."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        ws = (body or {}).get("workspace") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        row = store.get_prepared(prepared_id, ws)
+        if row is None:
+            return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
+        if row["status"] == "committed":
+            return _prepared_refusal(
+                {
+                    "code": "ALREADY_COMMITTED",
+                    "message": "this prepared execution already committed",
+                    "commit_result": row.get("commit_result"),
+                }
+            )
+        if row["status"] == "rejected":
+            return _prepared_refusal(
+                {"code": "ALREADY_DECIDED", "message": "this prepared execution was rejected"}
+            )
+        if row["status"] == "pending":
+            # The interpreter state is the authority — never a stored flag.
+            st = strategy_exec.state(
+                store, prepared_id, _prepared_strategy_body(row), inputs=row["inputs"]
+            )
+            if st.get("status") != "approved":
+                return _prepared_refusal(
+                    {
+                        "code": "NOT_APPROVED",
+                        "message": "the strategy is not satisfied — collect the pending "
+                        "signatures first (the commit is the only effect path)",
+                        "pending": st.get("pending"),
+                    }
+                )
+            store.set_prepared_status(prepared_id, "approved", expect="pending")
+        execution = await _commit_prepared(store.get_prepared(prepared_id, ws) or row)
+        return {
+            "ok": bool(execution.get("committed")),
+            "execution": execution,
+            "prepared": prepared_cards.card_view(
+                store, store.get_prepared(prepared_id, ws) or row
+            ),
+        }
+
     # ── Cycle .nil surface + language services (the LSP brain — a projection, no state) ────────
     async def _read_body(request: Request) -> tuple[dict[str, Any] | None, Any]:
         try:
@@ -1558,11 +1813,18 @@ def create_app(
         # The same clock resumes parked runs whose deadline passed (await_approval → on_timeout,
         # wait_for_event → its timeout route) — deadlines are rows, so restarts lose nothing.
         timed_out = await resume_due_waits(store, runner=run_exec, now=now)
+        # And strategy unit deadlines (plan B3): escalate re-addresses a fresh signature slot;
+        # reject rejects the whole prepared subject — same clock, same sweep discipline.
+        signature_actions = strategy_exec.sweep_due(store, now=now)
+        for act in signature_actions:
+            if act.get("action") == "rejected":
+                store.set_prepared_status(act["execution_id"], "rejected", expect="pending")
         return {
             "ok": True,
             "fired": len(fired),
             "runs": [f["run"] for f in fired if f.get("ok") and f.get("run")],
             "timed_out": timed_out,
+            "signatures": signature_actions,
         }
 
     @app.get("/automations/{workspace}/{automation_id}/runs")

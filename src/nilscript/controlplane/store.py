@@ -210,6 +210,35 @@ CREATE TABLE IF NOT EXISTS strategy_signatures (
     PRIMARY KEY (execution_id, unit_idx)
 );
 CREATE INDEX IF NOT EXISTS ix_sig_deadline ON strategy_signatures(status, deadline);
+
+-- Prepared executions (plan B2): one row per prepared capability invocation — the SUBJECT the
+-- strategy interpreter drives. Pins the exact registry versions (capability + strategy) at
+-- prepare time so later registry edits never mutate an in-flight card; stamps the preparer for
+-- SoD (invariant I6). The Permission Card is ASSEMBLED BY CODE from this row + the pinned
+-- registry records + the live signature slots — never stored prose, never LLM-assembled (I5).
+CREATE TABLE IF NOT EXISTS prepared_executions (
+    prepared_id        TEXT    PRIMARY KEY,
+    workspace          TEXT    NOT NULL,
+    capability_id      TEXT    NOT NULL,
+    capability_version INTEGER NOT NULL,
+    content_hash       TEXT    NOT NULL,
+    strategy_id        TEXT    NOT NULL DEFAULT '',
+    strategy_version   INTEGER NOT NULL DEFAULT 0,
+    strategy_hash      TEXT    NOT NULL DEFAULT '',
+    inputs             TEXT    NOT NULL DEFAULT '{}',
+    modifiable         TEXT    NOT NULL DEFAULT '[]',
+    prepared_by        TEXT    NOT NULL,
+    branch             TEXT,                              -- resolved Conditional branch
+    risk               TEXT    NOT NULL DEFAULT 'HIGH',
+    reversibility      TEXT    NOT NULL DEFAULT 'IRREVERSIBLE',
+    compensation       TEXT,
+    affected_systems   TEXT    NOT NULL DEFAULT '[]',
+    status             TEXT    NOT NULL DEFAULT 'pending', -- pending|approved|committed|rejected
+    commit_result      TEXT,
+    created_at         TEXT    NOT NULL,
+    decided_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_prepared_ws ON prepared_executions(workspace, created_at DESC);
 """
 
 # Columns surfaced by the automation registry reads (JSON columns parsed back by `_automation_row`).
@@ -1833,3 +1862,143 @@ class EventStore:
                 (now_iso,),
             ).fetchall()
         return [self._sig_row(r) for r in rows]
+
+    # ── prepared executions (plan B2 — the strategy interpreter's subject) ────────────────────
+    _PREPARED_COLS = (
+        "prepared_id, workspace, capability_id, capability_version, content_hash, strategy_id, "
+        "strategy_version, strategy_hash, inputs, modifiable, prepared_by, branch, risk, "
+        "reversibility, compensation, affected_systems, status, commit_result, created_at, "
+        "decided_at"
+    )
+
+    @staticmethod
+    def _prepared_row(row: sqlite3.Row) -> dict[str, Any]:
+        rec = dict(row)
+        rec["inputs"] = _loads(rec.get("inputs"))
+        rec["commit_result"] = _loads(rec.get("commit_result")) if rec.get("commit_result") else None
+        for key in ("modifiable", "affected_systems"):  # JSON LISTS — _loads is dict-only
+            try:
+                parsed = json.loads(rec.get(key) or "[]")
+            except (ValueError, TypeError):
+                parsed = []
+            rec[key] = parsed if isinstance(parsed, list) else []
+        return rec
+
+    def create_prepared(
+        self,
+        prepared_id: str,
+        *,
+        workspace: str,
+        capability_id: str,
+        capability_version: int,
+        content_hash: str,
+        strategy_id: str,
+        strategy_version: int,
+        strategy_hash: str,
+        inputs: dict[str, Any],
+        modifiable: list[str],
+        prepared_by: str,
+        branch: str | None = None,
+        risk: str = "HIGH",
+        reversibility: str = "IRREVERSIBLE",
+        compensation: str | None = None,
+        affected_systems: list[str] | None = None,
+        status: str = "pending",
+    ) -> dict[str, Any]:
+        """Persist one prepared execution. Fail closed: no workspace or no preparer, no row —
+        SoD needs a stamped preparer and every read is workspace-pinned."""
+        if not workspace:
+            raise ValueError("workspace is required")
+        if not prepared_by:
+            raise ValueError("prepared_by is required (SoD stamps the preparer at prepare time)")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO prepared_executions (prepared_id, workspace, capability_id, "
+                "capability_version, content_hash, strategy_id, strategy_version, strategy_hash, "
+                "inputs, modifiable, prepared_by, branch, risk, reversibility, compensation, "
+                "affected_systems, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    prepared_id,
+                    workspace,
+                    capability_id,
+                    int(capability_version),
+                    content_hash,
+                    strategy_id,
+                    int(strategy_version),
+                    strategy_hash,
+                    json.dumps(inputs, ensure_ascii=False),
+                    json.dumps(list(modifiable), ensure_ascii=False),
+                    prepared_by,
+                    branch,
+                    risk,
+                    reversibility,
+                    compensation,
+                    json.dumps(list(affected_systems or []), ensure_ascii=False),
+                    status,
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+        return self.get_prepared(prepared_id, workspace) or {}
+
+    def get_prepared(
+        self, prepared_id: str, workspace: str | None = None
+    ) -> dict[str, Any] | None:
+        """One prepared execution — workspace-pinned when a workspace is given (fail closed:
+        another tenant's prepared_id is None here)."""
+        where = "prepared_id = ?" + (" AND workspace = ?" if workspace is not None else "")
+        params: tuple[Any, ...] = (
+            (prepared_id, workspace) if workspace is not None else (prepared_id,)
+        )
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._PREPARED_COLS} FROM prepared_executions WHERE {where}", params
+            ).fetchone()
+        return self._prepared_row(row) if row is not None else None
+
+    def set_prepared_status(
+        self,
+        prepared_id: str,
+        status: str,
+        *,
+        expect: str | tuple[str, ...] = ("pending", "approved"),
+    ) -> bool:
+        """Guarded lifecycle transition (pending → approved → committed | rejected). Stamps
+        decided_at. Returns False when the row was not in an expected state — the single-decision
+        guard, mirroring `decide`/`settle_park`."""
+        expected = (expect,) if isinstance(expect, str) else tuple(expect)
+        ph = ",".join("?" * len(expected))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE prepared_executions SET status = ?, decided_at = ? "
+                f"WHERE prepared_id = ? AND status IN ({ph})",
+                (status, _now(), prepared_id, *expected),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def update_prepared_inputs(
+        self, prepared_id: str, inputs: dict[str, Any], *, branch: str | None
+    ) -> bool:
+        """A material edit amended the subject's inputs (already validated by the caller against
+        the contract + modifiable set). The signature voiding lives with the interpreter."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE prepared_executions SET inputs = ?, branch = ? "
+                "WHERE prepared_id = ? AND status = 'pending'",
+                (json.dumps(inputs, ensure_ascii=False), branch, prepared_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def record_prepared_commit(
+        self, prepared_id: str, result: dict[str, Any], status: str
+    ) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE prepared_executions SET commit_result = ?, status = ?, decided_at = ? "
+                "WHERE prepared_id = ?",
+                (json.dumps(result, ensure_ascii=False), status, _now(), prepared_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0

@@ -109,6 +109,7 @@ async def fire_manual(
     idempotency_key: str,
     runner: Runner,
     fired_by: str = "manual",
+    input: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fire the latest version of an automation now. Returns a result envelope:
 
@@ -136,7 +137,9 @@ async def fire_manual(
         return {"ok": True, "replayed": True, "run": store.get_run(run_id)}
 
     try:
-        result = await runner(auto["plan"], run_id=run_id)
+        # `input` binds as the run's $.input (a prepared execution's seeded inputs). Passed only
+        # when present so existing runner fakes with narrower signatures stay valid.
+        result = await runner(auto["plan"], run_id=run_id, **({"input": input} if input else {}))
     except Exception as exc:  # noqa: BLE001 — a runner blow-up is a failed run, recorded honestly
         store.finish_run(run_id, "failed", {"error": str(exc)})
         return {"ok": False, "error": str(exc), "status": 500, "run": store.get_run(run_id)}
