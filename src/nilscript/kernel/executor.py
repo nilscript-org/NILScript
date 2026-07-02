@@ -11,7 +11,11 @@ Deviations from the cloud executor (documented, intentional for v1):
   cloud's skill `to_proposes` hint→NIL-arg transform is a cloud/skill-registry feature; locally the
   node's resolved `args` are the NIL args.
 - `notify` is collected (no channel senders); `wait` is a real `asyncio.sleep`.
-- `await_approval` polls `client.status()` with a short local interval (no durable signal).
+- `await_approval` polls `client.status()` with a short local interval; if undecided within the
+  poll budget the run PARKS (`RunResult.waiting`) — the control plane persists the park row and
+  resumes the run via `execute(resume=...)` when the decision (or deadline) arrives. A HIGH-tier
+  commit the System holds parks the same way. Parks inside `parallel` branches are not supported
+  (the gather swallows the signal) — a gate belongs on the main path.
 - Compensation uses the DSL node's own `compensate_with` (verb+args) executed via PROPOSE→COMMIT —
   an honest forward compensation. Full ROLLBACK-performative + tier-based parking is a refinement.
 """
@@ -43,7 +47,13 @@ _MAX_STEPS = 1000
 
 @dataclass
 class RunResult:
-    """The outcome of executing one program: the append-only context + an honest status."""
+    """The outcome of executing one program: the append-only context + an honest status.
+
+    `waiting` (when set) means the run PARKED — it neither completed nor failed. It carries what
+    the caller must persist to resume deterministically: the parked node, and either the proposal
+    a human decision must settle (`kind: "approval"`) or the event filter a matching ledger event
+    must satisfy (`kind: "event"`). The caller resumes via `execute(program, resume=...)`.
+    """
 
     completed: bool
     context: dict[str, Any] = field(default_factory=dict)
@@ -52,6 +62,18 @@ class RunResult:
     partial: bool = False
     blocked_at: str | None = None
     refusal: dict[str, Any] | None = None
+    waiting: dict[str, Any] | None = None
+
+
+class _Park(Exception):
+    """Raised internally when the walk must stop and wait for an external signal — a human
+    decision on a parked proposal, or a matching ledger event. NOT a failure: the caller
+    persists `info` (row-backed at the control plane) and later resumes the run with
+    `execute(program, resume=...)`. Governance outcomes are answers, never crashes."""
+
+    def __init__(self, info: dict[str, Any]) -> None:
+        super().__init__(str(info.get("kind", "park")))
+        self.info = info
 
 
 class CompensationHalt(Exception):
@@ -83,18 +105,46 @@ class LocalExecutor:
         self._poll_interval = approval_poll_interval
         self._max_polls = approval_max_polls
 
-    async def execute(self, program: dict[str, Any], *, input: dict[str, Any] | None = None) -> RunResult:
+    async def execute(
+        self,
+        program: dict[str, Any],
+        *,
+        input: dict[str, Any] | None = None,
+        resume: dict[str, Any] | None = None,
+    ) -> RunResult:
+        """Walk the program from its entry — or RESUME a parked run.
+
+        `resume` is `{"context": <ctx at park>, "node_id": <parked node>, "output": <bound
+        output>}`: the saved context is restored, the output is bound as the parked node's output,
+        and the walk continues at whatever `next_after(node, output)` routes to — so an approved
+        commit continues at the node's continuation and an approval/timeout route follows the
+        node's own branch, with no resume-only routing logic."""
         self._program = program
         self._nodes = node_map(program)
         self._ctx: dict[str, Any] = {}
-        if input is not None:
-            self._ctx["input"] = input  # `$.input.field` references resolve against this
         self._notifications: list[dict[str, str]] = []
         self._committed: list[str] = []  # node ids that COMMITted, in order — for the unwind
         self._ts = datetime.now(timezone.utc)
         on_error = program.get("on_error", "abort")
+        if resume is not None:
+            self._ctx = dict(resume.get("context") or {})
+            node_id = resume["node_id"]
+            output = resume.get("output")
+            self._ctx[node_id] = {"output": output}
+            start = next_after(self._nodes[node_id], output)
+        else:
+            if input is not None:
+                self._ctx["input"] = input  # `$.input.field` references resolve against this
+            start = program["entry"]
         try:
-            await self._walk(program["entry"], item=None)
+            await self._walk(start, item=None)
+        except _Park as park:
+            return RunResult(
+                completed=False,
+                context=self._ctx,
+                notifications=self._notifications,
+                waiting=park.info,
+            )
         except CompensationHalt as halt:
             if on_error == "compensate":
                 done = await self._compensate()
@@ -172,6 +222,15 @@ class LocalExecutor:
         outcome = await self._client.commit(
             proposal.id, idempotency_key=idem_key(self._run_id, node["id"])
         )
+        if not isinstance(outcome, StatusBody):
+            # The System PARKED the commit (HIGH/CRITICAL tier held for a human). The run stops
+            # HERE — nothing executed, so nothing downstream may run on a phantom result. The
+            # decision (via the control plane) resumes the walk at this node's continuation with
+            # the real commit result bound.
+            tier = outcome.tier.value if outcome.tier is not None else None
+            raise _Park(
+                {"kind": "approval", "node": node["id"], "proposal": proposal.id, "tier": tier}
+            )
         self._committed.append(node["id"])
         return _outcome_dict(outcome, proposal.id)
 
@@ -183,7 +242,17 @@ class LocalExecutor:
             if route is not None:
                 return route
             await asyncio.sleep(self._poll_interval)
-        return "timeout"
+        # Undecided within the local poll budget → PARK. Exhausting a poll budget is not a human
+        # "timeout" decision; the control plane resumes the run row-backed when the decision (or
+        # the node's real deadline) arrives, routing on_approved/on_rejected/on_timeout.
+        raise _Park(
+            {
+                "kind": "approval",
+                "node": node["id"],
+                "proposal": proposal_id,
+                "timeout_seconds": node.get("timeout_seconds"),
+            }
+        )
 
     async def _compensate(self) -> list[str]:
         """Honest saga unwind: walk COMMITted steps in reverse; for each with `compensate_with`,

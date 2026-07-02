@@ -33,6 +33,8 @@ from nilscript.automation import (
     parse_composed,
     parse_trigger,
     register,
+    resume_due_waits,
+    resume_on_decision,
     run_due_schedules,
     validate_composed,
 )
@@ -144,10 +146,13 @@ def create_app(
 
     provider: SkeletonProvider = skeleton_provider or _live_skeleton
 
-    async def _live_runner(plan: dict[str, Any], *, run_id: str) -> Any:
+    async def _live_runner(
+        plan: dict[str, Any], *, run_id: str, resume: dict[str, Any] | None = None
+    ) -> Any:
         """Default runner: walk the pinned plan against the workspace's active adapter via a headless
         LocalExecutor. The adapter bearer is the transport auth; the grant scopes are the plan's own
-        verbs. (Production grant minting is the one knob to revisit when CP-initiated runs need a
+        verbs. `resume` continues a PARKED run from its row-backed context (gates / wait_for_event).
+        (Production grant minting is the one knob to revisit when CP-initiated runs need a
         distinct identity from the adapter bearer.)"""
         ws = plan.get("workspace", "") if isinstance(plan, dict) else ""
         active = store.active_adapter(ws)
@@ -169,7 +174,7 @@ def create_app(
                 session_id=run_id,
                 locale=plan.get("locale", "ar"),
             )
-            return await executor.execute(plan)
+            return await executor.execute(plan, resume=resume)
         finally:
             await transport.aclose()
 
@@ -540,6 +545,47 @@ def create_app(
                 result["materialized"] = await _materialize_dependents(
                     plan_id, proposal_id, appr.get("seq") or 0, execution.get("committed_id")
                 )
+        # Gates resume runs: the SAME decision that executes the approved proposal resumes every
+        # run parked on it (row-backed — survives restarts). Approve continues the run at the
+        # parked node's continuation with the commit result bound; reject routes the run to its
+        # rejection path (or closes it as rejected with the reason).
+        if ok:
+            parks = store.parked_for_proposal(proposal_id)
+            if parks:
+                execution = result.get("execution") or {}
+                commit_output = None
+                if status == "approved":
+                    outcome = execution.get("outcome") or {}
+                    commit_output = {
+                        "proposal": proposal_id,
+                        "state": outcome.get("state") or "executed",
+                        "committed_id": execution.get("committed_id"),
+                        "result": outcome.get("result"),
+                    }
+                resumed: list[dict[str, Any]] = []
+                for park in parks:
+                    if status == "approved" and not execution.get("executed"):
+                        # The commit itself failed — resuming would bind a phantom result. Honest:
+                        # the run stays parked; the owner sees why and can retry the decision.
+                        resumed.append(
+                            {
+                                "run_id": park["run_id"],
+                                "resumed": False,
+                                "reason": execution.get("error") or "commit failed",
+                            }
+                        )
+                        continue
+                    resumed.append(
+                        await resume_on_decision(
+                            store,
+                            park,
+                            runner=run_exec,
+                            status=status,
+                            commit_output=commit_output,
+                            reason=body.get("reason", ""),
+                        )
+                    )
+                result["resumed"] = resumed
         return result
 
     @app.get("/api/pending")
@@ -1277,10 +1323,14 @@ def create_app(
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         now = _dt.datetime.now(_dt.UTC)
         fired = await run_due_schedules(store, runner=run_exec, now=now)
+        # The same clock resumes parked runs whose deadline passed (await_approval → on_timeout,
+        # wait_for_event → its timeout route) — deadlines are rows, so restarts lose nothing.
+        timed_out = await resume_due_waits(store, runner=run_exec, now=now)
         return {
             "ok": True,
             "fired": len(fired),
             "runs": [f["run"] for f in fired if f.get("ok") and f.get("run")],
+            "timed_out": timed_out,
         }
 
     @app.get("/automations/{workspace}/{automation_id}/runs")

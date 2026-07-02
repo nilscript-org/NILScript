@@ -127,6 +127,30 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     ended_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_runs_auto ON automation_runs(workspace, automation_id, started_at DESC);
+
+-- Parked runs: a run that stopped mid-walk to wait for an external signal. Row-backed so a
+-- decision (or a matching event / the deadline) resumes the run DETERMINISTICALLY across process
+-- restarts — never an in-memory await. `kind`='approval' waits on a human decision for
+-- `proposal_id`; `kind`='event' waits on a ledger event matching (`on_event`, `match`). `context`
+-- is the executor context at park time; `deadline` (ISO) routes the run to its timeout branch.
+CREATE TABLE IF NOT EXISTS parked_runs (
+    run_id        TEXT    NOT NULL,
+    node_id       TEXT    NOT NULL,
+    kind          TEXT    NOT NULL DEFAULT 'approval',   -- approval | event
+    workspace     TEXT    NOT NULL DEFAULT '',
+    automation_id TEXT    NOT NULL DEFAULT '',
+    version       INTEGER NOT NULL DEFAULT 0,
+    proposal_id   TEXT,
+    on_event      TEXT,
+    match         TEXT,                                   -- JSON shallow field filter
+    deadline      TEXT,                                   -- ISO UTC; NULL = no timeout route
+    context       TEXT    NOT NULL DEFAULT '{}',          -- executor context at park time (JSON)
+    status        TEXT    NOT NULL DEFAULT 'waiting',     -- waiting | resumed | rejected | timed_out
+    created_at    TEXT    NOT NULL,
+    settled_at    TEXT,
+    PRIMARY KEY (run_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS ix_parked_proposal ON parked_runs(proposal_id);
 """
 
 # Columns surfaced by the automation registry reads (JSON columns parsed back by `_automation_row`).
@@ -1300,3 +1324,118 @@ class EventStore:
                 (workspace, automation_id, max(1, min(limit, 500))),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── parked runs (gates + wait_for_event resume across restarts) ──────────────────────────
+    _PARK_COLS = (
+        "run_id, node_id, kind, workspace, automation_id, version, proposal_id, "
+        "on_event, match, deadline, context, status, created_at, settled_at"
+    )
+
+    @staticmethod
+    def _park_row(row: sqlite3.Row) -> dict[str, Any]:
+        rec = dict(row)
+        rec["context"] = _loads(rec.get("context"))
+        rec["match"] = _loads(rec.get("match")) if rec.get("match") else {}
+        return rec
+
+    def park_run(
+        self,
+        run_id: str,
+        *,
+        node_id: str,
+        kind: str = "approval",
+        workspace: str = "",
+        automation_id: str = "",
+        version: int = 0,
+        proposal_id: str | None = None,
+        on_event: str | None = None,
+        match: dict[str, Any] | None = None,
+        deadline: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist one parked run (idempotent by (run_id, node_id) — a re-delivered park keeps the
+        existing row and its status). The row is everything a resume needs: the pinned automation
+        version to reload the plan, the node to continue after, and the context at park time."""
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT status FROM parked_runs WHERE run_id = ? AND node_id = ?",
+                (run_id, node_id),
+            ).fetchone()
+            if existing is not None:
+                return {"run_id": run_id, "node_id": node_id, "status": existing["status"]}
+            self._conn.execute(
+                "INSERT INTO parked_runs (run_id, node_id, kind, workspace, automation_id, "
+                "version, proposal_id, on_event, match, deadline, context, status, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?, 'waiting', ?)",
+                (
+                    run_id,
+                    node_id,
+                    kind,
+                    workspace or "",
+                    automation_id or "",
+                    int(version),
+                    proposal_id,
+                    on_event,
+                    json.dumps(match, ensure_ascii=False) if match is not None else None,
+                    deadline,
+                    json.dumps(context or {}, ensure_ascii=False),
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+        return {"run_id": run_id, "node_id": node_id, "status": "waiting"}
+
+    def parked_for_proposal(self, proposal_id: str) -> list[dict[str, Any]]:
+        """Every WAITING parked run gated on `proposal_id` — the rows a decision must resume."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._PARK_COLS} FROM parked_runs "
+                "WHERE proposal_id = ? AND status = 'waiting' ORDER BY created_at",
+                (proposal_id,),
+            ).fetchall()
+        return [self._park_row(r) for r in rows]
+
+    def waiting_parks(
+        self, *, kind: str | None = None, workspace: str | None = None
+    ) -> list[dict[str, Any]]:
+        """WAITING parked runs, optionally filtered by kind and/or workspace (event dispatch scopes
+        to the envelope's workspace so one tenant's event never wakes another tenant's run)."""
+        clauses, params = ["status = 'waiting'"], []
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if workspace is not None:
+            clauses.append("workspace = ?")
+            params.append(workspace)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._PARK_COLS} FROM parked_runs WHERE {' AND '.join(clauses)} "
+                "ORDER BY created_at",
+                params,
+            ).fetchall()
+        return [self._park_row(r) for r in rows]
+
+    def due_parks(self, now_iso: str) -> list[dict[str, Any]]:
+        """WAITING parked runs whose deadline has passed as of `now_iso` — the tick resumes each at
+        its timeout route. ISO-UTC strings compare lexicographically."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._PARK_COLS} FROM parked_runs "
+                "WHERE status = 'waiting' AND deadline IS NOT NULL AND deadline <= ? "
+                "ORDER BY deadline",
+                (now_iso,),
+            ).fetchall()
+        return [self._park_row(r) for r in rows]
+
+    def settle_park(self, run_id: str, node_id: str, status: str) -> bool:
+        """CLAIM a waiting park (waiting → resumed/rejected/timed_out). Returns False when it was
+        already settled — the single-resume guard, so a re-delivered decision/event never resumes
+        the same run twice."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE parked_runs SET status = ?, settled_at = ? "
+                "WHERE run_id = ? AND node_id = ? AND status = 'waiting'",
+                (status, _now(), run_id, node_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0

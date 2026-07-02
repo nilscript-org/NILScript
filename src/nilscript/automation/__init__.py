@@ -20,8 +20,14 @@ from nilscript.automation.compose import (
     run_composed,
     validate_composed,
 )
-from nilscript.automation.dispatch import Runner, fire_composed, fire_manual
-from nilscript.automation.scheduler import dispatch_event, run_due_schedules
+from nilscript.automation.dispatch import (
+    Runner,
+    fire_composed,
+    fire_manual,
+    resume_on_decision,
+    resume_parked_run,
+)
+from nilscript.automation.scheduler import dispatch_event, resume_due_waits, run_due_schedules
 from nilscript.automation.skeleton import context_from_skeleton
 from nilscript.automation.models import (
     AutomationDefinition,
@@ -56,6 +62,9 @@ __all__ = [
     "parse_composed",
     "parse_trigger",
     "register",
+    "resume_due_waits",
+    "resume_on_decision",
+    "resume_parked_run",
     "run_composed",
     "run_due_schedules",
     "validate_composed",

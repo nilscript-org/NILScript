@@ -27,6 +27,22 @@ def event_matches(trigger: EventTrigger, envelope: dict[str, Any]) -> bool:
     return True
 
 
+def wait_matches(
+    on_event: str | None, match: dict[str, Any], envelope: dict[str, Any]
+) -> bool:
+    """True when a ledger envelope satisfies a `wait_for_event` park: exact event-name equality
+    plus SHALLOW field-equality on `match` — each key checked against the body's `args`, falling
+    back to the body itself. Total and side-effect-free, like `event_matches`."""
+    body = envelope.get("body") or {}
+    if body.get("event") != on_event:
+        return False
+    args = body.get("args") or {}
+    for key, value in (match or {}).items():
+        if args.get(key) != value and body.get(key) != value:
+            return False
+    return True
+
+
 def _matches_field(spec: str, value: int, lo: int, hi: int) -> bool:
     """Match one cron field against a value. Supports `*`, `*/n`, `a-b`, `a-b/n`, `a,b`, and exact."""
     for part in spec.split(","):
