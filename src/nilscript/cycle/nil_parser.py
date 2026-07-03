@@ -191,11 +191,12 @@ class _Reader:
         if self._peek().kind != "eof":
             self._fail(f"unexpected trailing token {self._peek().value!r}")
         # The dialect is content-determined (no surface marker): any v0.3 construct — a
-        # wait_for_event step or an `implements` clause — means cycle/0.3, otherwise cycle/0.2.
-        # The model's two-way rule makes this an exact bijection.
+        # wait_for_event/checkpoint step or an `implements` clause — means cycle/0.3, otherwise
+        # cycle/0.2. The model's two-way rule makes this an exact bijection.
         steps = (raw.get("flow") or {}).get("steps") or []
         if "implements" in raw or any(
-            isinstance(s, dict) and s.get("type") == "wait_for_event" for s in steps
+            isinstance(s, dict) and s.get("type") in ("wait_for_event", "checkpoint")
+            for s in steps
         ):
             raw["nil"] = "cycle/0.3"
         return raw
@@ -399,6 +400,8 @@ class _Reader:
             step = self._notify(step_id)
         elif head.value == "wait_for_event":
             step = self._wait_for_event(step_id)
+        elif head.value == "checkpoint":
+            step = self._checkpoint(step_id)
         else:
             self._fail(f"unknown step type {head.value!r}", head)
         self._expect_punct("}")
@@ -490,6 +493,15 @@ class _Reader:
                 self._next()
         self._expect_punct("}")
         self._read_output_and_next(step)
+        return step
+
+    def _checkpoint(self, step_id: str) -> dict:
+        """`checkpoint "order-placed"` then optional `next` (v0.3) — the compensation boundary."""
+        self._expect_word("checkpoint")
+        step: dict[str, Any] = {"id": step_id, "type": "checkpoint", "name": self._string()}
+        if self._is_word("next"):
+            self._next()
+            step["next"] = self._word()
         return step
 
     def _notify(self, step_id: str) -> dict:

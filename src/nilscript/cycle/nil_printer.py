@@ -24,6 +24,7 @@ from typing import Any
 from nilscript.cycle.models import (
     ActionStep,
     ApprovalStep,
+    CheckpointStep,
     Cycle,
     CycleMetadata,
     DecisionStep,
@@ -157,6 +158,8 @@ class _Printer:
             body._notify(step)
         elif isinstance(step, WaitForEventStep):
             body._wait_for_event(step)
+        elif isinstance(step, CheckpointStep):
+            body._checkpoint(step)
         else:  # pragma: no cover - the union is closed
             raise TypeError(f"unprintable step {type(step).__name__}")
         self.lines.extend(body.lines)
@@ -203,6 +206,12 @@ class _Printer:
         self._emit("}")
         if step.output is not None:
             self._emit(f"output {step.output}")
+        if step.next is not None:
+            self._emit(f"next {step.next}")
+
+    def _checkpoint(self, step: CheckpointStep) -> None:
+        """v0.3: the compensation boundary — `checkpoint "order-placed"` (+ optional next)."""
+        self._emit(f"checkpoint {_string(step.name)}")
         if step.next is not None:
             self._emit(f"next {step.next}")
 

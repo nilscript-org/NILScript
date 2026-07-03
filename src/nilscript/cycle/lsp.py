@@ -26,7 +26,17 @@ from nilscript.cycle.registry import ProtocolRegistry
 from nilscript.kernel.context import ValidationContext
 
 # Step-body keywords (the head keyword of a step decides its type).
-_STEP_KEYWORDS = ("use", "query", "decision", "await", "notify", "wait_for_event", "output", "next")
+_STEP_KEYWORDS = (
+    "use",
+    "query",
+    "decision",
+    "await",
+    "notify",
+    "wait_for_event",
+    "checkpoint",
+    "output",
+    "next",
+)
 # Section keywords + structural keywords classified as `keyword` in semantic tokens.
 _KEYWORDS = frozenset(
     {
@@ -60,6 +70,7 @@ _KEYWORDS = frozenset(
         "await",
         "approval",
         "wait_for_event",
+        "checkpoint",
         "on_event",
         "route",
         "notify",

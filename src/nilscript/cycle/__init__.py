@@ -26,6 +26,7 @@ from nilscript.cycle.nil_printer import print_nil
 from nilscript.cycle.models import (
     ActionStep,
     ApprovalStep,
+    CheckpointStep,
     Cycle,
     CycleMetadata,
     DecisionStep,
@@ -59,6 +60,7 @@ __all__ = [
     "RoleRef",
     "VariableBinding",
     "ActionStep",
+    "CheckpointStep",
     "QueryStep",
     "DecisionStep",
     "ApprovalStep",

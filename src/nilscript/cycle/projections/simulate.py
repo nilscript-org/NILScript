@@ -11,6 +11,7 @@ from __future__ import annotations
 from nilscript.cycle.models import (
     ActionStep,
     ApprovalStep,
+    CheckpointStep,
     Cycle,
     DecisionStep,
     NotifyStep,
@@ -41,6 +42,9 @@ def _entry(step: object) -> tuple[dict, str | None]:
     elif isinstance(step, WaitForEventStep):
         record["on_event"] = step.on_event
         next_name = step.next  # happy path: the awaited event arrives
+    elif isinstance(step, CheckpointStep):
+        record["checkpoint"] = step.name  # a marker, never an effect
+        next_name = step.next
     else:
         next_name = None
     return record, next_name

@@ -180,11 +180,32 @@ class WaitForEventStep(DslModel):
     next: str | None = Field(default=None, pattern=STEP_ID_PATTERN)
 
 
-CycleStepType = ActionStep | QueryStep | DecisionStep | ApprovalStep | NotifyStep | WaitForEventStep
+class CheckpointStep(DslModel):
+    """v0.3: `step Phase1Done { checkpoint "order-placed" next Track }` — a COMPENSATION BOUNDARY
+    for per-phase rollback (plan B5). Walking it emits a row-backed ledger marker (no pause;
+    control continues at `next`); `rollback(run_id, to_checkpoint)` later previews the reverse
+    compensation chain of every write committed AFTER the marker as one governed proposal.
+    `name` is required and unique per cycle (see `_checkpoint_names_are_unique`)."""
+
+    id: str = Field(pattern=STEP_ID_PATTERN)
+    type: Literal["checkpoint"]
+    name: str = Field(min_length=1)  # "order-placed"
+    next: str | None = Field(default=None, pattern=STEP_ID_PATTERN)
+
+
+CycleStepType = (
+    ActionStep
+    | QueryStep
+    | DecisionStep
+    | ApprovalStep
+    | NotifyStep
+    | WaitForEventStep
+    | CheckpointStep
+)
 CycleStep = Annotated[CycleStepType, Field(discriminator="type")]
 
 # Step types that exist only in the v0.3 dialect (the additive seam; v0.2 stays frozen).
-_V03_STEP_TYPES = frozenset({"wait_for_event"})
+_V03_STEP_TYPES = frozenset({"wait_for_event", "checkpoint"})
 
 
 class Flow(DslModel):
@@ -231,7 +252,17 @@ class Cycle(DslModel):
             )
         if self.nil == "cycle/0.3" and not constructs:
             raise ValueError(
-                "'cycle/0.3' adds only wait_for_event/implements; a cycle using none of them "
-                "is 'cycle/0.2'"
+                "'cycle/0.3' adds only wait_for_event/checkpoint/implements; a cycle using "
+                "none of them is 'cycle/0.2'"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _checkpoint_names_are_unique(self) -> Cycle:
+        """A checkpoint name is the ROLLBACK address (`rollback(run_id, to_checkpoint)`); two
+        markers sharing one name would make the reversal target ambiguous — unrepresentable."""
+        names = [step.name for step in self.flow.steps if step.type == "checkpoint"]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(f"duplicate checkpoint names: {dupes}")
         return self

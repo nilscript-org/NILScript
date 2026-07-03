@@ -183,6 +183,21 @@ CREATE TABLE IF NOT EXISTS parked_runs (
 );
 CREATE INDEX IF NOT EXISTS ix_parked_proposal ON parked_runs(proposal_id);
 
+-- Run checkpoints (plan B5): one row per WALKED `checkpoint` step — the row-backed ledger marker
+-- a per-phase rollback reverses to. `committed` is the ordered JSON list of IR node ids whose
+-- writes had COMMITTED when the marker was walked (the context-snapshot ref: everything committed
+-- AFTER it is the reversible segment). Idempotent by (run_id, name): a resumed segment
+-- re-emitting the same marker keeps the original row.
+CREATE TABLE IF NOT EXISTS run_checkpoints (
+    run_id     TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    node_id    TEXT NOT NULL DEFAULT '',
+    workspace  TEXT NOT NULL DEFAULT '',
+    committed  TEXT NOT NULL DEFAULT '[]',
+    at         TEXT NOT NULL,
+    PRIMARY KEY (run_id, name)
+);
+
 -- Strategy signature slots (plan B3): ONE approval subject, N signature slots. Each row is one
 -- unit of the flattened strategy — who may sign (role/person), which Seq stage it belongs to,
 -- and its lifecycle. `planned` mirrors planned_steps: a later Seq stage's slot exists but is not
@@ -1598,6 +1613,65 @@ class EventStore:
                 (workspace, automation_id, max(1, min(limit, 500))),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── run checkpoints (B5: the rollback markers) ────────────────────────────────────────────
+    def record_checkpoint(
+        self,
+        run_id: str,
+        *,
+        name: str,
+        node_id: str = "",
+        workspace: str = "",
+        committed: list[str] | None = None,
+        at: str | None = None,
+    ) -> bool:
+        """Persist one walked checkpoint marker. Idempotent by (run_id, name) — a re-recorded
+        marker (resumed segment, re-delivered trace) keeps the original row. Returns True when
+        the row is new."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO run_checkpoints "
+                "(run_id, name, node_id, workspace, committed, at) VALUES (?,?,?,?,?,?)",
+                (
+                    run_id,
+                    name,
+                    node_id or "",
+                    workspace or "",
+                    json.dumps(list(committed or []), ensure_ascii=False),
+                    at or _now(),
+                ),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    @staticmethod
+    def _checkpoint_row(row: sqlite3.Row) -> dict[str, Any]:
+        rec = dict(row)
+        try:
+            parsed = json.loads(rec.get("committed") or "[]")
+        except (ValueError, TypeError):
+            parsed = []
+        rec["committed"] = parsed if isinstance(parsed, list) else []
+        return rec
+
+    def get_checkpoint(self, run_id: str, name: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT run_id, name, node_id, workspace, committed, at FROM run_checkpoints "
+                "WHERE run_id = ? AND name = ?",
+                (run_id, name),
+            ).fetchone()
+        return self._checkpoint_row(row) if row is not None else None
+
+    def list_checkpoints(self, run_id: str) -> list[dict[str, Any]]:
+        """Every marker one run walked, in walk order."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT run_id, name, node_id, workspace, committed, at FROM run_checkpoints "
+                "WHERE run_id = ? ORDER BY at",
+                (run_id,),
+            ).fetchall()
+        return [self._checkpoint_row(r) for r in rows]
 
     # ── parked runs (gates + wait_for_event resume across restarts) ──────────────────────────
     _PARK_COLS = (

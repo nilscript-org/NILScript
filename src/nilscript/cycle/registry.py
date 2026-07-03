@@ -26,6 +26,7 @@ from typing import Literal
 from nilscript.cycle.models import (
     ActionStep,
     ApprovalStep,
+    CheckpointStep,
     Cycle,
     CycleStepType,
     DecisionStep,
@@ -114,7 +115,10 @@ def _step_target_fields(step: CycleStepType) -> list[tuple[str, str]]:
     """(field, target-step-name) pairs where the step references ANOTHER step by name."""
     out: list[tuple[str, str]] = []
     if (
-        isinstance(step, (ActionStep, QueryStep, DecisionStep, NotifyStep, WaitForEventStep))
+        isinstance(
+            step,
+            (ActionStep, QueryStep, DecisionStep, NotifyStep, WaitForEventStep, CheckpointStep),
+        )
         and step.next
     ):
         out.append(("next", step.next))
@@ -374,6 +378,8 @@ def _step_detail(step: CycleStepType) -> str:
         return "notify step"
     if isinstance(step, WaitForEventStep):
         return f"wait_for_event step (on {step.on_event})"
+    if isinstance(step, CheckpointStep):
+        return f"checkpoint step ({step.name!r} — a rollback boundary)"
     return "step"
 
 

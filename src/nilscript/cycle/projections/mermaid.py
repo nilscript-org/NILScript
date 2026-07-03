@@ -11,6 +11,7 @@ from __future__ import annotations
 from nilscript.cycle.models import (
     ActionStep,
     ApprovalStep,
+    CheckpointStep,
     Cycle,
     DecisionStep,
     NotifyStep,
@@ -32,6 +33,8 @@ def _label(step: object) -> str:
         return f"{step.id}: notify"
     if isinstance(step, WaitForEventStep):
         return f"{step.id}: wait for {step.on_event}"
+    if isinstance(step, CheckpointStep):
+        return f"{step.id}: checkpoint {step.name}"
     return getattr(step, "id", "?")
 
 

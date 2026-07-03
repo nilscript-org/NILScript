@@ -11,6 +11,7 @@ from nilscript.automation.models import EventTrigger, ManualTrigger, ScheduleTri
 from nilscript.cycle.models import (
     ActionStep,
     ApprovalStep,
+    CheckpointStep,
     Cycle,
     DecisionStep,
     NotifyStep,
@@ -56,6 +57,8 @@ def _step_sentence(step: object) -> str:
             + f" → **{step.next}**" * bool(step.next)
             + f", after {step.timeout_seconds}s goes to **{step.on_timeout}**"
         )
+    if isinstance(step, CheckpointStep):
+        return f"Marks checkpoint `{step.name}` (a rollback boundary)"
     return ""
 
 

@@ -22,6 +22,7 @@ from nilscript.cycle.hash import cycle_content_hash
 from nilscript.cycle.models import (
     ActionStep,
     ApprovalStep,
+    CheckpointStep,
     Cycle,
     DecisionStep,
     NotifyStep,
@@ -189,6 +190,11 @@ def _lower(cycle: Cycle) -> tuple[dict, dict[str, str], tuple[str, ...]]:
             pipeline.append(node)
             if step.output:
                 outputs[step.output] = sid  # the event payload binds as this step's output
+        elif isinstance(step, CheckpointStep):
+            node = {"id": sid, "type": "checkpoint", "name": step.name}
+            if step.next is not None:
+                node["next"] = nid(step.next)
+            pipeline.append(node)
 
     raw = {
         "wosool": "0.1",

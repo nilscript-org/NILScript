@@ -67,7 +67,9 @@ from nilscript.cycle import (
     to_mermaid,
 )
 from nilscript.kernel.diagnostics import ValidationResult
-from nilscript.kernel.executor import LocalExecutor
+from nilscript.kernel.executor import LocalExecutor, looks_committed
+from nilscript.kernel.graph import node_map
+from nilscript.kernel.references import resolve as resolve_references
 from nilscript.strategy import (
     Strategy,
     parse_strategy_nil,
@@ -435,6 +437,61 @@ def create_app(
         finally:
             await transport.aclose()
 
+    async def _execute_rollback(appr: dict[str, Any]) -> dict[str, Any]:
+        """The owner approved a ROLLBACK PLAN (plan B5) → commit its compensation chain, in the
+        plan's (reverse-commit) order, via PROPOSE→COMMIT against the active adapter — the same
+        honest compensation path the kernel's saga unwind uses (each step is the write's own
+        `compensate_with`). The `rb-{run_id}-{n}` idempotency keys make a crash-window retry
+        replay, never double-compensate. Honest on failure: the chain stops at the first refusal
+        and reports exactly what WAS compensated."""
+        plan = appr.get("resolved") if isinstance(appr.get("resolved"), dict) else {}
+        steps = plan.get("steps") or []
+        ws = plan.get("workspace") or ""
+        active = store.active_adapter(ws) if ws else store.any_active_adapter()
+        if not active or not active.get("url"):
+            return {"executed": False, "error": "no active adapter to commit against"}
+        ws = active.get("workspace", "") or ""
+        bearer = active.get("bearer", "") or ""
+        verbs = frozenset(s.get("verb") for s in steps if s.get("verb"))
+        transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
+        grant = GrantRef.from_secret(
+            grant_id="control-plane-rollback", workspace=ws, secret=bearer or "cp", scopes=verbs
+        )
+        client = NilClient(transport=transport, grant=grant)
+        compensated: list[dict[str, Any]] = []
+        try:
+            for step in steps:
+                proposal = await client.propose(
+                    step["verb"],
+                    step.get("args") or {},
+                    session_id=f"cp-rollback:{plan.get('run_id')}",
+                    request_timestamp=_dt.datetime.now(_dt.UTC),
+                )
+                if proposal.is_refusal or not proposal.id:
+                    return {
+                        "executed": False,
+                        "compensated": compensated,
+                        "error": f"compensation for {step.get('node')} refused: "
+                        f"{proposal.code or 'refused'} {proposal.message or ''}".strip(),
+                    }
+                await client.commit(proposal.id, idempotency_key=step["idempotency_key"])
+                compensated.append(
+                    {"node": step.get("node"), "verb": step.get("verb"), "proposal": proposal.id}
+                )
+            return {
+                "executed": True,
+                "rolled_back_to": plan.get("to_checkpoint"),
+                "compensated": compensated,
+            }
+        except Exception as exc:  # noqa: BLE001 — adapter unreachable mid-chain: honest partial
+            return {
+                "executed": False,
+                "compensated": compensated,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        finally:
+            await transport.aclose()
+
     def _resolve_handoff(
         args: dict[str, Any], handoff: dict[str, Any], committed_ids: dict[str, Any]
     ) -> dict[str, Any]:
@@ -557,8 +614,13 @@ def create_app(
             # cancel its not-yet-proposed planned steps.
             result["plan_cancelled"] = {"plan_id": plan_id, "steps": store.cancel_plan(plan_id)}
         if ok and status == "approved":
-            edits = body.get("edits") if isinstance(body.get("edits"), dict) else None
-            execution = await _execute_approved(proposal_id, edits)
+            if appr.get("verb") == "run.rollback" and proposal_id.startswith("rb:"):
+                # A rollback plan's approval commits its compensation chain (B5) — never the
+                # single-proposal path (there is no adapter proposal named `rb:…` to commit).
+                execution = await _execute_rollback(appr)
+            else:
+                edits = body.get("edits") if isinstance(body.get("edits"), dict) else None
+                execution = await _execute_approved(proposal_id, edits)
             result["execution"] = execution
             # On a prerequisite's successful commit, materialize the dependents that were waiting on it.
             if plan_id and execution.get("executed"):
@@ -1888,6 +1950,114 @@ def create_app(
         if run is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
         return run
+
+    @app.post("/runs/{run_id}/rollback")
+    async def run_rollback(
+        run_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """B5: per-phase rollback. Builds the REVERSE compensation chain of every write COMMITTED
+        after `to_checkpoint` (each step's own `compensate_with` — the same declared inverse the
+        kernel's saga unwind executes) and holds it as ONE governed proposal (`rb:{run}:{name}`).
+        NO effect fires here: the human approves the plan via the normal decision endpoint, and
+        THAT approval commits the compensations in reverse order with `rb-{run_id}-{n}` keys.
+        A committed write in the segment with no compensation refuses honestly
+        (IRREVERSIBLE_SEGMENT, listing the blocking steps) — never a partial pretend-reversal."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        to_checkpoint = body.get("to_checkpoint") or ""
+        if not to_checkpoint:
+            return JSONResponse({"error": "to_checkpoint is required"}, status_code=400)
+        run = store.get_run(run_id)
+        if run is None:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        ws = body.get("workspace") or ""
+        if ws and (run.get("workspace") or "") != ws:
+            # Workspace-pinned, fail closed: another tenant's run id is indistinguishable from a
+            # missing one.
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        marker = store.get_checkpoint(run_id, to_checkpoint)
+        if marker is None:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "refusal": {
+                        "code": "UNKNOWN_CHECKPOINT",
+                        "message": f"run {run_id!r} walked no checkpoint {to_checkpoint!r}",
+                    },
+                },
+                status_code=404,
+            )
+        auto = store.get_automation(
+            run.get("workspace") or "", run.get("automation_id") or "", run.get("version")
+        )
+        if auto is None or not isinstance(auto.get("plan"), dict):
+            return JSONResponse(
+                {"error": "the run's pinned automation version is gone"}, status_code=409
+            )
+        nodes = node_map(auto["plan"])
+        context = (run.get("trace") or {}).get("context") or {}
+        # Committed writes, in the plan's deterministic (pipeline) order, replaying the kernel's
+        # own committed-output judgement over the persisted trace.
+        committed_now = [
+            node["id"]
+            for node in auto["plan"]["pipeline"]
+            if node.get("type") == "action"
+            and looks_committed((context.get(node["id"]) or {}).get("output"))
+        ]
+        segment = [nid for nid in committed_now if nid not in set(marker["committed"])]
+        blocking = [nid for nid in segment if not nodes[nid].get("compensate_with")]
+        if blocking:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "refusal": {
+                        "code": "IRREVERSIBLE_SEGMENT",
+                        "message": "committed write step(s) after the checkpoint declare no "
+                        "compensation — the segment cannot be honestly reversed",
+                        "blocking_steps": blocking,
+                    },
+                },
+                status_code=409,
+            )
+        steps: list[dict[str, Any]] = []
+        for n, nid in enumerate(reversed(segment)):
+            comp = nodes[nid]["compensate_with"]
+            steps.append(
+                {
+                    "seq": n,
+                    "node": nid,
+                    "verb": comp["verb"],
+                    # References ($.step_N.output.*) resolve NOW against the persisted run trace,
+                    # so the held plan carries literal args the owner can actually read.
+                    "args": resolve_references(comp.get("args") or {}, context, item=None),
+                    "idempotency_key": f"rb-{run_id}-{n}",
+                }
+            )
+        plan_view = {
+            "run_id": run_id,
+            "to_checkpoint": to_checkpoint,
+            "workspace": run.get("workspace") or "",
+            "steps": steps,
+        }
+        proposal_id = f"rb:{run_id}:{to_checkpoint}"
+        held = store.await_approval(
+            proposal_id,
+            verb="run.rollback",
+            tier="HIGH",  # reversing committed effects is always a human decision
+            preview={"kind": "rollback", **plan_view},
+            workspace=run.get("workspace") or "",
+            resolved=plan_view,
+        )
+        return {
+            "ok": True,
+            "proposal_id": proposal_id,
+            "status": held.get("status"),
+            "rollback": plan_view,
+        }
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:

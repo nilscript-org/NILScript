@@ -35,6 +35,7 @@ class _Store(Protocol):
     def get_run(self, run_id: str) -> dict[str, Any] | None: ...
     def park_run(self, run_id: str, **kw: Any) -> dict[str, Any]: ...
     def settle_park(self, run_id: str, node_id: str, status: str) -> bool: ...
+    def record_checkpoint(self, run_id: str, **kw: Any) -> bool: ...
 
 
 def _classify(result: RunResult) -> str:
@@ -62,6 +63,7 @@ def _trace(result: RunResult) -> dict[str, Any]:
         "notifications": result.notifications,
         "context": result.context,
         "waiting": result.waiting,
+        "checkpoints": result.checkpoints,
     }
 
 
@@ -74,10 +76,21 @@ def _record(
     automation_id: str,
     version: int,
 ) -> None:
-    """Close (or park) one run row from its RunResult. A waiting result ALSO persists a
-    `parked_runs` row — the row, not any in-memory await, is what a decision/event resumes,
-    so a process restart between park and decision loses nothing."""
+    """Close (or park) one run row from its RunResult. Every checkpoint marker the segment
+    walked persists as a `run_checkpoints` row (B5 — the rollback address, idempotent by
+    (run_id, name)). A waiting result ALSO persists a `parked_runs` row — the row, not any
+    in-memory await, is what a decision/event resumes, so a process restart between park and
+    decision loses nothing."""
     store.finish_run(run_id, _classify(result), _trace(result))
+    for marker in result.checkpoints:
+        store.record_checkpoint(
+            run_id,
+            name=marker.get("name") or "",
+            node_id=marker.get("node") or "",
+            workspace=workspace,
+            committed=marker.get("committed") or [],
+            at=marker.get("at"),
+        )
     if result.waiting is None:
         return
     w = result.waiting

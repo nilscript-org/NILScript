@@ -143,6 +143,18 @@ class WaitForEventNode(DslModel):
     next: str | None = Field(default=None, pattern=NODE_ID_PATTERN)
 
 
+class CheckpointNode(DslModel):
+    """A COMPENSATION BOUNDARY marker (plan B5). Walking it emits a row-backed ledger marker
+    ({run_id, name, at, committed-so-far snapshot}) and control continues at `next` — no pause.
+    `rollback(run_id, to_checkpoint)` later reverses every write committed AFTER the marker as
+    one governed proposal."""
+
+    id: str = Field(pattern=NODE_ID_PATTERN)
+    type: Literal["checkpoint"]
+    name: str = Field(min_length=1)
+    next: str | None = Field(default=None, pattern=NODE_ID_PATTERN)
+
+
 class NotifyNode(DslModel):
     id: str = Field(pattern=NODE_ID_PATTERN)
     type: Literal["notify"]
@@ -161,6 +173,7 @@ NodeType = (
     | AwaitApprovalNode
     | WaitNode
     | WaitForEventNode
+    | CheckpointNode
     | NotifyNode
 )
 Node = Annotated[NodeType, Field(discriminator="type")]

@@ -63,6 +63,22 @@ class RunResult:
     blocked_at: str | None = None
     refusal: dict[str, Any] | None = None
     waiting: dict[str, Any] | None = None
+    # Checkpoint markers walked THIS segment (plan B5): {name, node, committed, at}. The caller
+    # persists each as a row (`run_checkpoints`) — the row, not this list, is the rollback SSOT.
+    checkpoints: list[dict[str, Any]] = field(default_factory=list)
+
+
+def looks_committed(output: Any) -> bool:
+    """True when an ACTION node's recorded output is a COMMITTED effect: it carries the proposal
+    id and a terminal state. A parked commit ({"parked": True}, no state) and a refusal
+    ({"refused": code}, no proposal) are not commits. Shared with the control plane's rollback
+    preview, which replays this judgement over a persisted run trace."""
+    return (
+        isinstance(output, dict)
+        and bool(output.get("proposal"))
+        and output.get("state") is not None
+        and not output.get("parked")
+    )
 
 
 class _Park(Exception):
@@ -124,6 +140,7 @@ class LocalExecutor:
         self._ctx: dict[str, Any] = {}
         self._notifications: list[dict[str, str]] = []
         self._committed: list[str] = []  # node ids that COMMITted, in order — for the unwind
+        self._checkpoints: list[dict[str, Any]] = []  # markers walked this segment (B5)
         self._ts = datetime.now(timezone.utc)
         on_error = program.get("on_error", "abort")
         if resume is not None:
@@ -131,6 +148,15 @@ class LocalExecutor:
             node_id = resume["node_id"]
             output = resume.get("output")
             self._ctx[node_id] = {"output": output}
+            # Rebuild the committed-write ledger from the restored context (pipeline order —
+            # deterministic) so a checkpoint or saga unwind walked AFTER a park still sees every
+            # commit made before it, not just this segment's.
+            self._committed = [
+                node["id"]
+                for node in program["pipeline"]
+                if node.get("type") == "action"
+                and looks_committed((self._ctx.get(node["id"]) or {}).get("output"))
+            ]
             start = next_after(self._nodes[node_id], output)
         else:
             if input is not None:
@@ -144,6 +170,7 @@ class LocalExecutor:
                 context=self._ctx,
                 notifications=self._notifications,
                 waiting=park.info,
+                checkpoints=self._checkpoints,
             )
         except CompensationHalt as halt:
             if on_error == "compensate":
@@ -156,6 +183,7 @@ class LocalExecutor:
                     partial=True,
                     blocked_at=halt.node_id,
                     refusal={"node": halt.node_id, "code": halt.code},
+                    checkpoints=self._checkpoints,
                 )
             return RunResult(
                 completed=False,
@@ -163,8 +191,14 @@ class LocalExecutor:
                 notifications=self._notifications,
                 blocked_at=halt.node_id,
                 refusal={"node": halt.node_id, "code": halt.code},
+                checkpoints=self._checkpoints,
             )
-        return RunResult(completed=True, context=self._ctx, notifications=self._notifications)
+        return RunResult(
+            completed=True,
+            context=self._ctx,
+            notifications=self._notifications,
+            checkpoints=self._checkpoints,
+        )
 
     async def _walk(self, node_id: str | None, *, item: Any) -> None:
         steps = 0
@@ -207,6 +241,18 @@ class LocalExecutor:
             return {"count": len(capped)}
         if node_type == "await_approval":
             return await self._do_await_approval(node, item)
+        if node_type == "checkpoint":
+            # A compensation boundary (B5): record the marker with the committed-so-far snapshot
+            # (what a later rollback reverses BACK TO) and keep walking — no pause, no adapter.
+            self._checkpoints.append(
+                {
+                    "name": node["name"],
+                    "node": node["id"],
+                    "committed": list(self._committed),
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            return {"name": node["name"]}
         if node_type == "wait_for_event":
             # PARK until a matching ledger event (or the deadline). The match filter is resolved
             # NOW against the run context ($.step_N.output.* / $.input.*), so the persisted park
