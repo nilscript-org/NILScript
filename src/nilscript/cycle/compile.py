@@ -159,7 +159,9 @@ def _lower(cycle: Cycle) -> tuple[dict, dict[str, str], tuple[str, ...]]:
             node = {
                 "id": sid,
                 "type": "await_approval",
-                "proposal": step.title.en or step.title.ar,
+                # The gate's proposal HANDLE must be a stable, URL-safe id (the step id) — never the
+                # free-text bilingual title: spaces / Arabic break the status-path safety guard.
+                "proposal": sid,
                 "timeout_seconds": step.timeout_seconds,
                 "on_approved": nid(step.on_approve),
             }
