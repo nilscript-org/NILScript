@@ -31,6 +31,7 @@ _STEP_KEYWORDS = ("use", "query", "decision", "await", "notify", "wait_for_event
 _KEYWORDS = frozenset(
     {
         "cycle",
+        "implements",
         "triggers_on",
         "triggers",
         "manual",

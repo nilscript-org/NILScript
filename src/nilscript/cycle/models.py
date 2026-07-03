@@ -31,6 +31,21 @@ VERB_PATTERN = r"^[a-z]+\.[a-z_]+$"
 
 PolicyTier = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
+# The capability version shape on the `implements` surface: `IssueInvoice@2.3` / `@2.3.1`
+# (MAJOR.MINOR with optional PATCH — same shape as `capability.models.SEMVER_PATTERN`, defined
+# here because the capability layer imports FROM this module, never the reverse).
+CAPABILITY_VERSION_PATTERN = r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?$"
+
+
+class ImplementsClause(DslModel):
+    """`cycle X implements IssueInvoice@2.3 …` (v0.3) — binds the cycle to the capability
+    contract it fulfils. The binding is validated at registration time by V7 (conformance:
+    producible inputs, bound outputs, floor-only-rises, compensation coverage) against the
+    workspace-pinned capability registry."""
+
+    capability_id: str = Field(pattern=CYCLE_ID_PATTERN)  # capability ids share the cycle shape
+    version: str = Field(pattern=CAPABILITY_VERSION_PATTERN)  # "2.3" — prints as `@2.3`
+
 
 class CycleMetadata(DslModel):
     version: str = Field(min_length=1)  # "1.3.2"
@@ -168,6 +183,9 @@ class WaitForEventStep(DslModel):
 CycleStepType = ActionStep | QueryStep | DecisionStep | ApprovalStep | NotifyStep | WaitForEventStep
 CycleStep = Annotated[CycleStepType, Field(discriminator="type")]
 
+# Step types that exist only in the v0.3 dialect (the additive seam; v0.2 stays frozen).
+_V03_STEP_TYPES = frozenset({"wait_for_event"})
+
 
 class Flow(DslModel):
     entry: str = Field(pattern=STEP_ID_PATTERN)  # a step NAME
@@ -175,11 +193,14 @@ class Flow(DslModel):
 
 
 class Cycle(DslModel):
-    # The dialect seam: "cycle/0.2" is FROZEN; "cycle/0.3" adds exactly the wait_for_event step.
-    # The dialect is fully determined by content (see `_dialect_gates_wait_for_event`), which is
-    # what keeps the .nil printer/parser an EXACT bijection with no surface version marker.
+    # The dialect seam: "cycle/0.2" is FROZEN; "cycle/0.3" adds exactly the v0.3 constructs
+    # (wait_for_event steps + the `implements` clause). The dialect is fully determined by content
+    # (see `_dialect_gates_v03_constructs`), which is what keeps the .nil printer/parser an EXACT
+    # bijection with no surface version marker.
     nil: Literal["cycle/0.2", "cycle/0.3"]
     cycle_id: str = Field(pattern=CYCLE_ID_PATTERN)
+    # v0.3: the capability contract this cycle implements (None = unbound, the v0.2 world).
+    implements: ImplementsClause | None = None
     workspace: str = Field(min_length=1)
     metadata: CycleMetadata
     intent: BilingualText
@@ -194,18 +215,23 @@ class Cycle(DslModel):
     documentation: BilingualText | None = None
 
     @model_validator(mode="after")
-    def _dialect_gates_wait_for_event(self) -> Cycle:
-        """The v0.3 step is only valid in the v0.3 dialect — and v0.3 means exactly "uses
-        wait_for_event", so dialect is content-determined in BOTH directions. That two-way rule is
-        what lets the .nil parser infer the dialect (no surface marker) while `parse(print(ast))
-        == ast` stays an exact bijection."""
-        has_wait = any(step.type == "wait_for_event" for step in self.flow.steps)
-        if has_wait and self.nil != "cycle/0.3":
+    def _dialect_gates_v03_constructs(self) -> Cycle:
+        """ONE seam: any v0.3-only construct (a wait_for_event step, the `implements` clause) is
+        only valid in the v0.3 dialect — and v0.3 means exactly "uses a v0.3 construct", so the
+        dialect is content-determined in BOTH directions. That two-way rule is what lets the .nil
+        parser infer the dialect (no surface marker) while `parse(print(ast)) == ast` stays an
+        exact bijection."""
+        constructs = [step.type for step in self.flow.steps if step.type in _V03_STEP_TYPES]
+        if self.implements is not None:
+            constructs.append("implements")
+        if constructs and self.nil != "cycle/0.3":
             raise ValueError(
-                "wait_for_event steps require the 'cycle/0.3' dialect (cycle/0.2 is frozen)"
+                f"v0.3 constructs {sorted(set(constructs))} require the 'cycle/0.3' dialect "
+                "(cycle/0.2 is frozen)"
             )
-        if self.nil == "cycle/0.3" and not has_wait:
+        if self.nil == "cycle/0.3" and not constructs:
             raise ValueError(
-                "'cycle/0.3' adds only wait_for_event; a cycle without one is 'cycle/0.2'"
+                "'cycle/0.3' adds only wait_for_event/implements; a cycle using none of them "
+                "is 'cycle/0.2'"
             )
         return self

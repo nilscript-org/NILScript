@@ -17,8 +17,13 @@ from nilscript.cycle.models import Cycle
 
 
 def cycle_content_hash(cycle: Cycle) -> str:
+    dumped = cycle.model_dump(by_alias=True, mode="json")
+    if dumped.get("implements") is None:
+        # v0.3 seam, hash-stable: an absent `implements` and a None one are the SAME statement,
+        # so dropping the null keeps every pre-implements cycle's hash (its version lock) intact.
+        dumped.pop("implements", None)
     canonical = json.dumps(
-        cycle.model_dump(by_alias=True, mode="json"),
+        dumped,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

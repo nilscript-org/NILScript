@@ -32,7 +32,7 @@ class NilSyntaxError(ValueError):
 
 # Punctuation that forms its own token. `->` must be matched before `-` would be (we never emit a
 # bare `-`, so order only matters for the arrow).
-_PUNCT = ("->", "{", "}", "(", ")", "[", "]", ":", ";", ",", "=")
+_PUNCT = ("->", "{", "}", "(", ")", "[", "]", ":", ";", ",", "=", "@")
 # A bare word: identifier, dotted verb/path, tier, number, or a `$name` variable reference (the
 # wait_for_event match sugar). We keep it loose and let the model validate the shape — the
 # tokenizer only splits the stream.
@@ -177,17 +177,26 @@ class _Reader:
     def cycle(self) -> dict:
         self._expect_word("cycle")
         cycle_id = self._word()
-        trigger = self._trigger_header()
+        raw: dict[str, Any] = {"nil": "cycle/0.2", "cycle_id": cycle_id}
+        if self._is_word("implements"):
+            # `implements IssueInvoice@2.3` — the v0.3 capability binding (validated by V7).
+            self._next()
+            capability_id = self._word()
+            self._expect_punct("@")
+            raw["implements"] = {"capability_id": capability_id, "version": self._word()}
+        raw["trigger"] = self._trigger_header()
         self._expect_punct("{")
-        raw: dict[str, Any] = {"nil": "cycle/0.2", "cycle_id": cycle_id, "trigger": trigger}
         self._cycle_body(raw)
         self._expect_punct("}")
         if self._peek().kind != "eof":
             self._fail(f"unexpected trailing token {self._peek().value!r}")
-        # The dialect is content-determined (no surface marker): a wait_for_event step means
-        # cycle/0.3, otherwise cycle/0.2 — the model's two-way rule makes this an exact bijection.
+        # The dialect is content-determined (no surface marker): any v0.3 construct — a
+        # wait_for_event step or an `implements` clause — means cycle/0.3, otherwise cycle/0.2.
+        # The model's two-way rule makes this an exact bijection.
         steps = (raw.get("flow") or {}).get("steps") or []
-        if any(isinstance(s, dict) and s.get("type") == "wait_for_event" for s in steps):
+        if "implements" in raw or any(
+            isinstance(s, dict) and s.get("type") == "wait_for_event" for s in steps
+        ):
             raw["nil"] = "cycle/0.3"
         return raw
 

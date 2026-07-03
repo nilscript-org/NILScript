@@ -45,7 +45,12 @@ INDENT = "  "
 def print_nil(cycle: Cycle) -> str:
     """Render a Cycle to its canonical `.nil` text. Deterministic and round-trippable."""
     lines: list[str] = []
-    lines.append(f"cycle {cycle.cycle_id} {_trigger_header(cycle.trigger)} {{")
+    implements = (
+        f" implements {cycle.implements.capability_id}@{cycle.implements.version}"
+        if cycle.implements is not None
+        else ""
+    )
+    lines.append(f"cycle {cycle.cycle_id}{implements} {_trigger_header(cycle.trigger)} {{")
     body = _Printer(level=1)
     body.cycle_body(cycle)
     lines.extend(body.lines)

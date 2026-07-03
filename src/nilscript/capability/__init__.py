@@ -9,6 +9,7 @@ v0 capability from any registered cycle.
 
 from __future__ import annotations
 
+from nilscript.capability.conformance import validate_implements
 from nilscript.capability.hash import capability_content_hash
 from nilscript.capability.models import (
     ArchetypeTag,
@@ -37,5 +38,6 @@ __all__ = [
     "capability_content_hash",
     "parse_capability_nil",
     "print_capability_nil",
+    "validate_implements",
     "wrap_cycle",
 ]

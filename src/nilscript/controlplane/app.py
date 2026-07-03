@@ -43,6 +43,7 @@ from nilscript.capability import (
     Capability,
     capability_content_hash,
     parse_capability_nil,
+    validate_implements,
     wrap_cycle,
 )
 from nilscript.controlplane import prepared as prepared_cards
@@ -927,28 +928,55 @@ def create_app(
         return {"ok": True, "definition": stored.model_dump(by_alias=True, mode="json")}
 
     # ── Cycle AST (the visual surface registers THROUGH the kernel) ──────────────────────────
-    async def _cycle_draft_from_body(body: dict[str, Any]) -> tuple[Any, Any]:
+    async def _cycle_draft_from_body(body: dict[str, Any]) -> tuple[Any, Any, Any]:
         """Compile a candidate Cycle AST against the workspace's live skeleton. Returns
-        (CycleDraftResult, None) or (None, JSONResponse-error). Same governance path as a plain
-        automation draft — lower → V1–V6 → AST content-hash — so a drawn cycle cannot talk past a
-        refusal (a hallucinated verb has nothing to bind to)."""
+        (CycleDraftResult, skeleton, None) or (None, None, JSONResponse-error). Same governance
+        path as a plain automation draft — lower → V1–V6 → AST content-hash — so a drawn cycle
+        cannot talk past a refusal (a hallucinated verb has nothing to bind to). The skeleton is
+        returned so register can run V7 against the same DECLARED verb metadata."""
         cycle = body.get("cycle")
         if not isinstance(cycle, dict):
-            return None, JSONResponse({"error": "cycle (AST object) is required"}, status_code=400)
+            return None, None, JSONResponse(
+                {"error": "cycle (AST object) is required"}, status_code=400
+            )
         ws = cycle.get("workspace")
         if not ws:
-            return None, JSONResponse({"error": "cycle.workspace is required"}, status_code=400)
+            return None, None, JSONResponse(
+                {"error": "cycle.workspace is required"}, status_code=400
+            )
         skeleton = await provider(ws)
         if skeleton is None:
-            return None, JSONResponse(
+            return None, None, JSONResponse(
                 {"error": "no reachable active adapter for this workspace"}, status_code=503
             )
         ctx = context_from_skeleton(ws, skeleton)
         try:
             res = draft_cycle(raw_cycle=cycle, ctx=ctx)
         except (ValidationError, ValueError) as exc:
-            return None, JSONResponse({"error": f"malformed cycle: {exc}"}, status_code=400)
-        return res, None
+            return None, None, JSONResponse(
+                {"error": f"malformed cycle: {exc}"}, status_code=400
+            )
+        return res, skeleton, None
+
+    def _v7_verdict(cycle: Cycle, skeleton: dict[str, Any] | None) -> ValidationResult:
+        """A4-V7: when the cycle declares `implements`, resolve the target from the WORKSPACE-
+        PINNED capability registry (latest version; a missing target refuses with
+        V7_UNKNOWN_CAPABILITY) and run the pure conformance validator with the adapter's
+        DECLARED verb metadata (undeclared = HIGH, fail closed)."""
+        capability: Capability | None = None
+        if cycle.implements is not None:
+            rec = store.get_capability(cycle.workspace, cycle.implements.capability_id)
+            if rec is not None:
+                try:
+                    capability = Capability.model_validate(rec.get("body") or {})
+                except (ValidationError, ValueError):
+                    capability = None  # an unreadable record proves nothing — fail closed
+        details: dict[str, dict[str, Any]] = {
+            d["verb"]: d
+            for d in (skeleton or {}).get("verb_details", [])
+            if isinstance(d, dict) and d.get("verb")
+        }
+        return validate_implements(cycle, capability, verb_metadata_lookup=details.get)
 
     @app.post("/cycles/draft")
     async def cycle_draft_endpoint(
@@ -962,7 +990,7 @@ def create_app(
             body = await request.json()
         except (ValueError, TypeError):
             return JSONResponse({"error": "bad json"}, status_code=400)
-        res, err = await _cycle_draft_from_body(body)
+        res, _skeleton, err = await _cycle_draft_from_body(body)
         if err is not None:
             return err
         if not res.ok:
@@ -982,13 +1010,22 @@ def create_app(
             body = await request.json()
         except (ValueError, TypeError):
             return JSONResponse({"error": "bad json"}, status_code=400)
-        res, err = await _cycle_draft_from_body(body)
+        res, skeleton, err = await _cycle_draft_from_body(body)
         if err is not None:
             return err
         if not res.ok:
             return JSONResponse(
                 {"ok": False, "refusal": _diag_list(res.diagnostics)}, status_code=400
             )
+        # A4-V7: a cycle that binds a capability contract must CONFORM to it at register time —
+        # same refusal shape as V1–V6, so the hub renders it unchanged. Registry lookup is
+        # workspace-pinned; a missing target refuses (V7_UNKNOWN_CAPABILITY), never stores.
+        if res.cycle is not None and res.cycle.implements is not None:
+            verdict = _v7_verdict(res.cycle, skeleton)
+            if not verdict.ok:
+                return JSONResponse(
+                    {"ok": False, "refusal": _diag_list(verdict)}, status_code=400
+                )
         stored = register_cycle(store, res, authored_by=body.get("authored_by", "") or "")
         return {"ok": True, "definition": stored}
 
