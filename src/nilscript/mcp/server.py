@@ -161,6 +161,7 @@ def build_server(
     tools_provider: ToolsProvider | None = None,
     automation_tools: Any = None,
     brain_tools: Any = None,
+    capability_tools: Any = None,
     allowed_hosts: list[str] | None = None,
 ):  # type: ignore[no-untyped-def]
     """Bind the NilTools surface onto a FastMCP server. Imports `mcp` lazily.
@@ -205,11 +206,86 @@ def build_server(
 
         register_dynamic_tools(server, tools, dynamic_verbs)
     _register_skill(server, tools)
+    if capability_tools is not None:
+        # The capability plane (plan B7, Gate M6) is the model-facing plane: registered in BOTH
+        # modes. Verb-level tools stay behind the builder (non-single-surface) flag below.
+        _register_capability_tools(server, capability_tools)
     if automation_tools is not None and not single:
         _register_automation_tools(server, automation_tools)
     if brain_tools is not None and not single:
         _register_brain_tools(server, brain_tools)
     return server
+
+
+def _register_capability_tools(server: Any, cap: Any) -> None:
+    """Bind the FIVE capability-plane tools (plan B7, UBCA Part X). The discipline every
+    docstring carries: discover → inspect → prepare → a HUMAN approves in Decisions → execute.
+    An unmet requirement is SURFACED, never worked around; refusals are answers, never retried.
+    The tool list stays five regardless of catalog size — zero raw verbs reach the model."""
+
+    async def nil_discover(intent_text: str, domain: str | None = None) -> dict[str, Any]:
+        return await cap.discover(intent_text, domain)
+
+    async def nil_inspect(capability_id: str, version: int | None = None) -> dict[str, Any]:
+        return await cap.inspect(capability_id, version)
+
+    async def nil_prepare(
+        capability_id: str, inputs: dict[str, Any], version: int | None = None
+    ) -> dict[str, Any]:
+        return await cap.prepare(capability_id, inputs, version)
+
+    async def nil_execute(prepared_id: str) -> dict[str, Any]:
+        return await cap.execute(prepared_id)
+
+    async def nil_schedule(prepared_id: str, when: str) -> dict[str, Any]:
+        return await cap.schedule(prepared_id, when)
+
+    server.add_tool(
+        nil_discover,
+        name="nil_discover",
+        description="STEP 1 of the capability plane. Search the workspace's PUBLISHED, AI-exposed "
+        "business capabilities for an intent ('bill the customer', 'إصدار فاتورة') — ranked by alias "
+        "match (both languages) + intent/example word overlap; optional domain filter. Returns a "
+        "shortlist (max 8) of {capability_id, version, intent, domain, risk, strategy, aliases_hit}. "
+        "An EMPTY result is the answer: no capability covers this — say so and STOP. Never fall back "
+        "to raw verbs, never invent a capability. No side effect.",
+    )
+    server.add_tool(
+        nil_inspect,
+        name="nil_inspect",
+        description="STEP 2. The full definition of one capability: bilingual intent, TYPED "
+        "inputs/outputs (what nil_prepare will demand), risk floor, approval-strategy summary, "
+        "requires/creates/enables dependencies, implemented_by, content-hash. Read the input "
+        "contract BEFORE preparing. If a `requires` dependency is unmet, SURFACE it to the user — "
+        "never work around it. No side effect.",
+    )
+    server.add_tool(
+        nil_prepare,
+        name="nil_prepare",
+        description="STEP 3. Seed a Permission Card for one capability invocation: inputs are "
+        "validated against the typed contract and the card (inputs, approval slots, risk, affected "
+        "systems, reversibility) is assembled BY CODE. NO effect fires here. An INPUT_CONTRACT "
+        "refusal lists the missing/wrong/unknown fields — fix the inputs from that list; it is the "
+        "answer, not an error. After prepare, a HUMAN approves the card in Decisions — you cannot "
+        "sign it (you are the preparer; separation of duties).",
+    )
+    server.add_tool(
+        nil_execute,
+        name="nil_execute",
+        description="STEP 4 — only AFTER the humans have signed. Commit a fully approved prepared "
+        "execution (the gated commit; the ONLY effect path). A NOT_APPROVED refusal means: awaiting "
+        "signatures — a human must sign in Decisions. That refusal IS the answer: report it and "
+        "stop; NEVER retry in a loop, never look for another way to cause the effect.",
+    )
+    server.add_tool(
+        nil_schedule,
+        name="nil_schedule",
+        description="Schedule a prepared execution to commit at/after `when` (ISO-8601, future "
+        "only — a past timestamp refuses with PAST_SCHEDULE). Registers a one-shot schedule row the "
+        "control plane's clock fires through the SAME gated execute path — approvals are still "
+        "required: a card whose signatures are missing at fire time records NOT_APPROVED instead of "
+        "executing. Scheduling never bypasses the humans.",
+    )
 
 
 def _register_automation_tools(server: Any, auto: Any) -> None:
@@ -668,7 +744,15 @@ def serve(
             scopes=scopes,
             gate=gate,
         )
-        server = build_server(tools, dynamic_verbs=verbs, host=host, port=port)
+        from nilscript.mcp.capability_tools import CapabilityTools
+
+        server = build_server(
+            tools,
+            dynamic_verbs=verbs,
+            host=host,
+            port=port,
+            capability_tools=CapabilityTools.from_env(workspace=workspace),
+        )
         server.run(transport="stdio")
         return
 
@@ -755,11 +839,13 @@ def build_asgi_app(
         verbs = asyncio.run(_discover_verbs(adapter_url, bearer))
     from nilscript.mcp.automation_tools import AutomationTools
     from nilscript.mcp.brain_tools import BrainTools
+    from nilscript.mcp.capability_tools import CapabilityTools
 
     brain = (
         BrainTools.from_env()
     )  # graph/meta domain behind nil_intent (None if NIL_BRAIN_URL unset)
     automation = AutomationTools.from_env()  # automation domain behind nil_intent
+    capability = CapabilityTools.from_env(workspace=workspace)  # the five-tool plane (B7/M6)
     tools = build_tools(
         adapter_url=adapter_url,
         grant_id=grant_id,
@@ -802,6 +888,7 @@ def build_asgi_app(
         tools_provider=provider,
         automation_tools=automation,
         brain_tools=brain,
+        capability_tools=capability,
         allowed_hosts=_allowed_hosts_from_env(),
     )
     app = server.streamable_http_app()  # MCP mounted at /mcp
