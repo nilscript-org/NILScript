@@ -1289,6 +1289,15 @@ def create_app(
             return _prepared_refusal(out["refusal"], status_code=400)
         return out
 
+    @app.get("/prepared")
+    def prepared_list(workspace: str = "", status: str = "") -> Any:
+        """The workspace's Permission Cards, newest first — the Decisions feed. Workspace-pinned,
+        fail closed; optional ?status= filter."""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rows = store.list_prepared(workspace, status=status or None)
+        return {"prepared": [prepared_cards.card_view(store, r) for r in rows]}
+
     @app.get("/prepared/{prepared_id}")
     def prepared_get(prepared_id: str, workspace: str = "") -> Any:
         """The Permission Card. Workspace-pinned, fail closed: another tenant's prepared_id
@@ -1403,7 +1412,9 @@ def create_app(
             )
         result: dict[str, Any] = {"ok": True, "status": signed["status"], "superseded": superseded}
         if signed["status"] == "rejected":
-            store.set_prepared_status(prepared_id, "rejected", expect="pending")
+            store.set_prepared_status(
+                prepared_id, "rejected", expect="pending", reason=body.get("reason", "")
+            )
         elif signed["status"] == "approved":
             store.set_prepared_status(prepared_id, "approved", expect="pending")
             result["execution"] = await _commit_prepared(store.get_prepared(prepared_id, ws) or row)

@@ -234,6 +234,7 @@ CREATE TABLE IF NOT EXISTS prepared_executions (
     compensation       TEXT,
     affected_systems   TEXT    NOT NULL DEFAULT '[]',
     status             TEXT    NOT NULL DEFAULT 'pending', -- pending|approved|committed|rejected
+    reason             TEXT    NOT NULL DEFAULT '',          -- rejection reason (audit)
     commit_result      TEXT,
     created_at         TEXT    NOT NULL,
     decided_at         TEXT
@@ -1867,8 +1868,8 @@ class EventStore:
     _PREPARED_COLS = (
         "prepared_id, workspace, capability_id, capability_version, content_hash, strategy_id, "
         "strategy_version, strategy_hash, inputs, modifiable, prepared_by, branch, risk, "
-        "reversibility, compensation, affected_systems, status, commit_result, created_at, "
-        "decided_at"
+        "reversibility, compensation, affected_systems, status, reason, commit_result, "
+        "created_at, decided_at"
     )
 
     @staticmethod
@@ -1941,6 +1942,24 @@ class EventStore:
             self._conn.commit()
         return self.get_prepared(prepared_id, workspace) or {}
 
+    def list_prepared(
+        self, workspace: str, *, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        """The workspace's prepared executions, newest first — the Decisions feed. Fail
+        closed: no workspace, no rows. Optional status filter (pending|approved|committed|
+        rejected)."""
+        if not workspace:
+            return []
+        where = "workspace = ?" + (" AND status = ?" if status else "")
+        params: tuple[Any, ...] = (workspace, status) if status else (workspace,)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._PREPARED_COLS} FROM prepared_executions WHERE {where} "
+                "ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+        return [self._prepared_row(r) for r in rows]
+
     def get_prepared(
         self, prepared_id: str, workspace: str | None = None
     ) -> dict[str, Any] | None:
@@ -1962,17 +1981,19 @@ class EventStore:
         status: str,
         *,
         expect: str | tuple[str, ...] = ("pending", "approved"),
+        reason: str = "",
     ) -> bool:
         """Guarded lifecycle transition (pending → approved → committed | rejected). Stamps
-        decided_at. Returns False when the row was not in an expected state — the single-decision
-        guard, mirroring `decide`/`settle_park`."""
+        decided_at and, on rejection, the reason (audit). Returns False when the row was not in
+        an expected state — the single-decision guard, mirroring `decide`/`settle_park`."""
         expected = (expect,) if isinstance(expect, str) else tuple(expect)
         ph = ",".join("?" * len(expected))
         with self._lock:
             cur = self._conn.execute(
-                f"UPDATE prepared_executions SET status = ?, decided_at = ? "
+                f"UPDATE prepared_executions SET status = ?, decided_at = ?, "
+                f"reason = CASE WHEN ? != '' THEN ? ELSE reason END "
                 f"WHERE prepared_id = ? AND status IN ({ph})",
-                (status, _now(), prepared_id, *expected),
+                (status, _now(), reason, reason, prepared_id, *expected),
             )
             self._conn.commit()
             return cur.rowcount > 0

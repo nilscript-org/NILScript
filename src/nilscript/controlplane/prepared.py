@@ -166,6 +166,7 @@ def card_view(store: Any, row: dict[str, Any]) -> dict[str, Any]:
         "prepared_id": row["prepared_id"],
         "workspace": row["workspace"],
         "status": row["status"],
+        "reason": row.get("reason") or "",
         "created_at": row["created_at"],
         "decided_at": row.get("decided_at"),
         "card": card,

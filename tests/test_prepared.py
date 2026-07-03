@@ -396,3 +396,40 @@ def test_timeout_reject_route_rejects_the_card_via_the_tick_sweep():
     tick = client.post("/automations/tick").json()
     assert tick["signatures"][0]["action"] == "rejected"
     assert client.get(f"/prepared/{pid}", params={"workspace": WS}).json()["status"] == "rejected"
+
+
+# ── list + rejection-reason audit (C4 live-mode follow-up) ────────────────────────────────────
+
+
+def test_list_prepared_is_workspace_pinned_and_status_filterable(cp):
+    _, client, _ = cp
+    a = _prepare(client).json()["prepared"]["prepared_id"]
+    b = _prepare(client, inputs={"customer": "Beta"}).json()["prepared"]["prepared_id"]
+    client.post(f"/prepared/{a}/sign", json={"workspace": WS, "actor": "fin-1",
+                                             "role": "Finance", "status": "rejected",
+                                             "reason": "wrong customer"})
+
+    # The Decisions feed: newest first, envelopes with cards.
+    r = client.get("/prepared", params={"workspace": WS})
+    assert r.status_code == 200
+    ids = [p["prepared_id"] for p in r.json()["prepared"]]
+    assert set(ids) == {a, b}
+    assert all("card" in p and "card_hash" in p for p in r.json()["prepared"])
+
+    # Status filter narrows; a foreign workspace sees NOTHING (fail closed).
+    pending = client.get("/prepared", params={"workspace": WS, "status": "pending"}).json()
+    assert [p["prepared_id"] for p in pending["prepared"]] == [b]
+    assert client.get("/prepared", params={"workspace": "ws-other"}).json() == {"prepared": []}
+    assert client.get("/prepared").status_code == 400  # no workspace, no feed
+
+
+def test_rejection_reason_is_persisted_and_surfaced(cp):
+    _, client, _ = cp
+    pid = _prepare(client).json()["prepared"]["prepared_id"]
+    r = client.post(f"/prepared/{pid}/sign", json={"workspace": WS, "actor": "fin-1",
+                                                   "role": "Finance", "status": "rejected",
+                                                   "reason": "amount disputed"})
+    assert r.status_code == 200 and r.json()["status"] == "rejected"
+    card = client.get(f"/prepared/{pid}", params={"workspace": WS}).json()
+    assert card["status"] == "rejected"
+    assert card["reason"] == "amount disputed"
