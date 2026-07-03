@@ -33,14 +33,17 @@ from nilscript.kernel.references import resolve
 from nilscript.sdk.client import NilClient
 from nilscript.sdk.sentences import ProposalBody, StatusBody
 
-# Terminal STATUS state → the branch an await_approval node takes.
+# A GENUINE human decision on a gate's proposal → the branch an await_approval node takes.
+# ONLY a real decision short-circuits the gate. Every other state a status poll can report —
+# `expired`/`pending`/`suspended`/`failed_terminal`, or a proposal the System never saw (a
+# standalone gate handle like `gate_step_2` that was never proposed, which the adapter answers
+# `expired`) — is NOT a decision. Those PARK: a human gate with no decision must WAIT (surfacing a
+# pending approval), never silently self-resolve. The real deadline-driven timeout is applied by
+# the control plane's `resume_due_waits` (routing on_timeout), not by an adapter's `expired`.
 _APPROVAL_ROUTE: dict[str, str] = {
     "approved": "approved",
     "executed": "approved",
     "rejected": "rejected",
-    "expired": "timeout",
-    "failed_terminal": "rejected",
-    "suspended": "rejected",
 }
 _MAX_STEPS = 1000
 
@@ -66,6 +69,81 @@ class RunResult:
     # Checkpoint markers walked THIS segment (plan B5): {name, node, committed, at}. The caller
     # persists each as a row (`run_checkpoints`) — the row, not this list, is the rollback SSOT.
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    # Per-node observability trace walked THIS segment — an ordered list of node events (see
+    # `_NODE_EVENT_SHAPE`). Timestamps are stamped from the runtime clock (never the model). On a
+    # PARK the parked node's entry is status waiting_approval|waiting_event and carries its
+    # proposal_id/event_wait; earlier nodes are `completed` with a redacted output_summary. The
+    # caller MERGES each segment's nodes into the persisted run trace (`trace["nodes"]`) so a
+    # resumed run advances the same list rather than overwriting it — restart-safe, row-backed.
+    trace_nodes: list[dict[str, Any]] = field(default_factory=list)
+
+
+# The exact JSON shape of one entry in `RunResult.trace_nodes` / persisted `trace["nodes"]`.
+# Documented here as the SSOT contract the control plane persists and the BFF maps to node_states.
+_NODE_EVENT_SHAPE = {
+    "node_id": "step_1",  # IR node id (stable across versions of the same step)
+    "seq": 0,  # 0-based walk order within the persisted, merged trace
+    "type": "action",  # action|query|condition|notify|wait|parallel|foreach|await_approval|
+    #                     checkpoint|wait_for_event
+    "verb": "crm.create_contact",  # action/query only; else None
+    "adapter": None,  # reserved for composed/multi-adapter runs; None in single-adapter runs
+    "label": None,  # human label if the IR carries one; else None
+    "status": "completed",  # running|completed|waiting_approval|waiting_event|skipped|failed
+    "started_at": "2026-07-03T10:00:00+00:00",  # ISO-8601 UTC, runtime clock
+    "ended_at": "2026-07-03T10:00:00+00:00",  # ISO-8601 UTC or None while running/waiting
+    "tier": None,  # governance tier when a commit/gate carries one (e.g. "HIGH"); else None
+    "reversibility": None,  # saga reversibility hint when known; else None
+    "output_summary": {"proposal": "p1", "state": "executed"},  # small, secret-redacted; or None
+    "proposal_id": None,  # the proposal a gate/park awaits (await_approval / HIGH commit); else None
+    "event_wait": None,  # {on_event, match, timeout_seconds} for a parked wait_for_event; else None
+    "error": None,  # refusal code / error string when status is failed; else None
+}
+
+# Keys whose VALUES must never appear in an output_summary (secret hygiene). Matched as substrings,
+# case-insensitive, against the key name.
+_SECRET_KEY_HINTS = (
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "bearer",
+    "authorization",
+    "api_key",
+    "apikey",
+    "private",
+    "credential",
+)
+_REDACTED = "***REDACTED***"
+_SUMMARY_MAX_KEYS = 12
+_SUMMARY_MAX_STR = 200
+
+
+def _summarize(value: Any, *, depth: int = 0) -> Any:
+    """A small, secret-free projection of a node's output for the observability trace.
+
+    Never emits a value under a secret-looking key; truncates long strings; collapses long/deep
+    structures to counts. This is a SUMMARY for humans and the dashboard — not the SSOT effect
+    (that lives in the run context / the System of record)."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= _SUMMARY_MAX_STR else value[:_SUMMARY_MAX_STR] + "…"
+    if isinstance(value, dict):
+        if depth >= 3:
+            return {"keys": len(value)}
+        out: dict[str, Any] = {}
+        for key, inner in list(value.items())[:_SUMMARY_MAX_KEYS]:
+            name = str(key)
+            if any(hint in name.lower() for hint in _SECRET_KEY_HINTS):
+                out[name] = _REDACTED
+            else:
+                out[name] = _summarize(inner, depth=depth + 1)
+        if len(value) > _SUMMARY_MAX_KEYS:
+            out["…"] = f"+{len(value) - _SUMMARY_MAX_KEYS} more"
+        return out
+    if isinstance(value, (list, tuple)):
+        return {"count": len(value)}
+    return _summarize(str(value), depth=depth)
 
 
 def looks_committed(output: Any) -> bool:
@@ -141,6 +219,7 @@ class LocalExecutor:
         self._notifications: list[dict[str, str]] = []
         self._committed: list[str] = []  # node ids that COMMITted, in order — for the unwind
         self._checkpoints: list[dict[str, Any]] = []  # markers walked this segment (B5)
+        self._trace_nodes: list[dict[str, Any]] = []  # per-node observability events this segment
         self._ts = datetime.now(timezone.utc)
         on_error = program.get("on_error", "abort")
         if resume is not None:
@@ -148,6 +227,23 @@ class LocalExecutor:
             node_id = resume["node_id"]
             output = resume.get("output")
             self._ctx[node_id] = {"output": output}
+            # The parked node's decision has landed — record it COMPLETED (its resolved output) so
+            # the merged trace shows the gate advancing from waiting_approval → completed. The walk
+            # resumes at the node's own continuation, so the node itself is not re-walked.
+            resumed_node = self._nodes.get(node_id)
+            if resumed_node is not None:
+                stamp = self._now()
+                self._trace_nodes.append(
+                    self._node_event(
+                        resumed_node,
+                        status="completed",
+                        started_at=stamp,
+                        ended_at=stamp,
+                        output=output,
+                        proposal_id=_proposal_of(output),
+                        tier=_tier_of(output),
+                    )
+                )
             # Rebuild the committed-write ledger from the restored context (pipeline order —
             # deterministic) so a checkpoint or saga unwind walked AFTER a park still sees every
             # commit made before it, not just this segment's.
@@ -171,6 +267,7 @@ class LocalExecutor:
                 notifications=self._notifications,
                 waiting=park.info,
                 checkpoints=self._checkpoints,
+                trace_nodes=self._trace_nodes,
             )
         except CompensationHalt as halt:
             if on_error == "compensate":
@@ -184,6 +281,7 @@ class LocalExecutor:
                     blocked_at=halt.node_id,
                     refusal={"node": halt.node_id, "code": halt.code},
                     checkpoints=self._checkpoints,
+                    trace_nodes=self._trace_nodes,
                 )
             return RunResult(
                 completed=False,
@@ -192,13 +290,53 @@ class LocalExecutor:
                 blocked_at=halt.node_id,
                 refusal={"node": halt.node_id, "code": halt.code},
                 checkpoints=self._checkpoints,
+                trace_nodes=self._trace_nodes,
             )
         return RunResult(
             completed=True,
             context=self._ctx,
             notifications=self._notifications,
             checkpoints=self._checkpoints,
+            trace_nodes=self._trace_nodes,
         )
+
+    def _now(self) -> str:
+        """The runtime wall clock as ISO-8601 UTC. Timestamps come from HERE (the runtime), never
+        from a model — the repo forbids clock reads inside models."""
+        return datetime.now(timezone.utc).isoformat()
+
+    def _node_event(
+        self,
+        node: dict[str, Any],
+        *,
+        status: str,
+        started_at: str,
+        ended_at: str | None = None,
+        output: Any = None,
+        proposal_id: str | None = None,
+        event_wait: dict[str, Any] | None = None,
+        tier: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Build one node-trace event (`_NODE_EVENT_SHAPE`). `seq` is provisional (segment-local);
+        the control plane re-sequences by final walk order when it merges segments."""
+        return {
+            "node_id": node["id"],
+            "seq": len(self._trace_nodes),
+            "type": node.get("type"),
+            "verb": node.get("verb"),
+            "adapter": node.get("adapter"),
+            "label": node.get("label"),
+            "status": status,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "tier": tier,
+            "reversibility": node.get("reversibility"),
+            "output_summary": _summarize(output) if output is not None else None,
+            "proposal_id": proposal_id,
+            "event_wait": event_wait,
+            "error": error,
+        }
 
     async def _walk(self, node_id: str | None, *, item: Any) -> None:
         steps = 0
@@ -207,7 +345,37 @@ class LocalExecutor:
                 raise RuntimeError(f"graph exceeded {_MAX_STEPS} steps — possible cycle at {node_id!r}")
             steps += 1
             node = self._nodes[node_id]
-            output = await self._execute(node, item)
+            started_at = self._now()
+            entry = self._node_event(node, status="running", started_at=started_at)
+            self._trace_nodes.append(entry)
+            try:
+                output = await self._execute(node, item)
+            except _Park as park:
+                # The walk stops HERE awaiting an external signal. Mark the parked node's event as
+                # waiting (approval vs event) with what the resume needs, and re-raise so the caller
+                # records the park row. The node's ended_at stays None — it has not finished.
+                info = park.info
+                is_event = info.get("kind") == "event"
+                entry["status"] = "waiting_event" if is_event else "waiting_approval"
+                entry["proposal_id"] = info.get("proposal")
+                entry["tier"] = info.get("tier")
+                if is_event:
+                    entry["event_wait"] = {
+                        "on_event": info.get("on_event"),
+                        "match": info.get("match"),
+                        "timeout_seconds": info.get("timeout_seconds"),
+                    }
+                raise
+            except CompensationHalt as halt:
+                entry["status"] = "failed"
+                entry["ended_at"] = self._now()
+                entry["error"] = halt.code
+                raise
+            entry["status"] = "completed"
+            entry["ended_at"] = self._now()
+            entry["output_summary"] = _summarize(output) if output is not None else None
+            entry["tier"] = _tier_of(output)
+            entry["proposal_id"] = _proposal_of(output)
             self._ctx[node["id"]] = {"output": output}
             node_id = next_after(node, output)
 
@@ -334,6 +502,20 @@ class LocalExecutor:
             )
             done.append(node_id)
         return done
+
+
+def _proposal_of(output: Any) -> str | None:
+    """The proposal id an ACTION node's output carries (committed or parked), for the node trace."""
+    if isinstance(output, dict) and output.get("proposal"):
+        return str(output["proposal"])
+    return None
+
+
+def _tier_of(output: Any) -> str | None:
+    """The governance tier an ACTION node's output carries (set on a parked HIGH commit)."""
+    if isinstance(output, dict) and output.get("tier"):
+        return str(output["tier"])
+    return None
 
 
 def _outcome_dict(outcome: StatusBody | ProposalBody, proposal_id: str) -> dict[str, Any]:

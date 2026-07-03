@@ -53,7 +53,44 @@ def _classify(result: RunResult) -> str:
     return "partial"
 
 
-def _trace(result: RunResult) -> dict[str, Any]:
+def _merge_trace_nodes(
+    prior: list[dict[str, Any]], segment: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge one segment's node events onto the run's accumulated node trace.
+
+    A run walks in SEGMENTS (the first fire, then one segment per park→resume). Each segment's
+    executor only sees the nodes it walked, so the persisted `trace["nodes"]` must ACCUMULATE:
+    a later event for the same node_id REPLACES the earlier one (waiting_approval → completed),
+    a new node_id APPENDS in walk order. `seq` is re-stamped to the final 0-based order — the
+    persisted list is the single ordered timeline the dashboard renders."""
+    order: list[str] = [n["node_id"] for n in prior]
+    by_id: dict[str, dict[str, Any]] = {n["node_id"]: n for n in prior}
+    for event in segment:
+        node_id = event["node_id"]
+        if node_id not in by_id:
+            order.append(node_id)
+        by_id[node_id] = event
+    merged: list[dict[str, Any]] = []
+    for seq, node_id in enumerate(order):
+        node = dict(by_id[node_id])
+        node["seq"] = seq
+        merged.append(node)
+    return merged
+
+
+def _current_node(nodes: list[dict[str, Any]], result: RunResult) -> str | None:
+    """The node a reader should point at now: the one still running/waiting, else the parked node,
+    else the last node walked (the run's leading edge)."""
+    for node in nodes:
+        if node.get("status") in ("running", "waiting_approval", "waiting_event"):
+            return node["node_id"]
+    if result.waiting is not None:
+        return result.waiting.get("node")
+    return nodes[-1]["node_id"] if nodes else result.blocked_at
+
+
+def _trace(result: RunResult, prior_nodes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    nodes = _merge_trace_nodes(prior_nodes or [], result.trace_nodes)
     return {
         "completed": result.completed,
         "partial": result.partial,
@@ -64,6 +101,11 @@ def _trace(result: RunResult) -> dict[str, Any]:
         "context": result.context,
         "waiting": result.waiting,
         "checkpoints": result.checkpoints,
+        # Per-node observability trace (SSOT contract in kernel/executor `_NODE_EVENT_SHAPE`),
+        # accumulated across every park/resume segment. Row-backed via the run's trace blob.
+        "nodes": nodes,
+        "current_node": _current_node(nodes, result),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -81,7 +123,11 @@ def _record(
     (run_id, name)). A waiting result ALSO persists a `parked_runs` row — the row, not any
     in-memory await, is what a decision/event resumes, so a process restart between park and
     decision loses nothing."""
-    store.finish_run(run_id, _classify(result), _trace(result))
+    prior = store.get_run(run_id)
+    prior_nodes = []
+    if prior and isinstance(prior.get("trace"), dict):
+        prior_nodes = prior["trace"].get("nodes") or []
+    store.finish_run(run_id, _classify(result), _trace(result, prior_nodes))
     for marker in result.checkpoints:
         store.record_checkpoint(
             run_id,
