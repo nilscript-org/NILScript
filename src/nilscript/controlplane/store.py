@@ -255,6 +255,23 @@ CREATE TABLE IF NOT EXISTS prepared_executions (
     decided_at         TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_prepared_ws ON prepared_executions(workspace, created_at DESC);
+
+-- One-shot scheduled executions (plan B7 nil_schedule): a prepared execution due to commit at/
+-- after `fire_at`, swept by the same /automations/tick clock that resumes parked runs and
+-- enforces signature deadlines. A row, never an in-memory timer — restarts lose nothing. The
+-- fire outcome (fired | refused) is RECORDED, honest: a strategy still unsatisfied at fire time
+-- settles as refused with the NOT_APPROVED answer, never silently retried.
+CREATE TABLE IF NOT EXISTS scheduled_executions (
+    schedule_id  TEXT    PRIMARY KEY,
+    prepared_id  TEXT    NOT NULL,
+    workspace    TEXT    NOT NULL,
+    fire_at      TEXT    NOT NULL,                     -- ISO UTC; lexicographic compare
+    status       TEXT    NOT NULL DEFAULT 'pending',   -- pending|fired|refused|cancelled
+    result       TEXT,                                 -- JSON outcome recorded at fire time
+    created_at   TEXT    NOT NULL,
+    settled_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sched_due ON scheduled_executions(status, fire_at);
 """
 
 # Columns surfaced by the automation registry reads (JSON columns parsed back by `_automation_row`).
@@ -2094,6 +2111,95 @@ class EventStore:
                 "UPDATE prepared_executions SET commit_result = ?, status = ?, decided_at = ? "
                 "WHERE prepared_id = ?",
                 (json.dumps(result, ensure_ascii=False), status, _now(), prepared_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    # ── scheduled executions (plan B7 nil_schedule — one-shot rows, swept by the tick) ────────
+    _SCHED_COLS = (
+        "schedule_id, prepared_id, workspace, fire_at, status, result, created_at, settled_at"
+    )
+
+    @staticmethod
+    def _sched_row(row: sqlite3.Row) -> dict[str, Any]:
+        rec = dict(row)
+        raw = rec.get("result")
+        rec["result"] = json.loads(raw) if raw else None
+        return rec
+
+    def create_scheduled_execution(
+        self, schedule_id: str, *, prepared_id: str, workspace: str, fire_at: str
+    ) -> dict[str, Any]:
+        """Register a one-shot schedule row. Idempotent on (prepared_id, fire_at) while pending —
+        re-scheduling the same card for the same moment returns the existing row, never a
+        duplicate fire."""
+        if not workspace:
+            raise ValueError("workspace is required")  # fail closed: no tenant, no schedule
+        with self._lock:
+            existing = self._conn.execute(
+                f"SELECT {self._SCHED_COLS} FROM scheduled_executions "
+                "WHERE prepared_id = ? AND fire_at = ? AND status = 'pending'",
+                (prepared_id, fire_at),
+            ).fetchone()
+            if existing is not None:
+                return self._sched_row(existing)
+            self._conn.execute(
+                "INSERT INTO scheduled_executions (schedule_id, prepared_id, workspace, fire_at, "
+                "status, result, created_at, settled_at) VALUES (?,?,?,?,'pending',NULL,?,NULL)",
+                (schedule_id, prepared_id, workspace, fire_at, _now()),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                f"SELECT {self._SCHED_COLS} FROM scheduled_executions WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+        return self._sched_row(row)
+
+    def get_scheduled_execution(self, schedule_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._SCHED_COLS} FROM scheduled_executions WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+        return self._sched_row(row) if row is not None else None
+
+    def list_scheduled_executions(self, workspace: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._SCHED_COLS} FROM scheduled_executions "
+                "WHERE workspace = ? ORDER BY fire_at",
+                (workspace,),
+            ).fetchall()
+        return [self._sched_row(r) for r in rows]
+
+    def due_scheduled_executions(self, now_iso: str) -> list[dict[str, Any]]:
+        """PENDING schedule rows whose fire_at has passed as of `now_iso` — the tick fires each
+        through the same execute path a human-driven /execute uses. ISO-UTC strings compare
+        lexicographically (the due_parks discipline)."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._SCHED_COLS} FROM scheduled_executions "
+                "WHERE status = 'pending' AND fire_at <= ? ORDER BY fire_at",
+                (now_iso,),
+            ).fetchall()
+        return [self._sched_row(r) for r in rows]
+
+    def settle_scheduled_execution(
+        self, schedule_id: str, status: str, result: dict[str, Any] | None = None
+    ) -> bool:
+        """CLAIM a pending schedule (pending → fired/refused/cancelled), recording the outcome.
+        Returns False when it was already settled — the single-fire guard (settle_park's
+        discipline), so overlapping ticks never fire the same schedule twice."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE scheduled_executions SET status = ?, result = ?, settled_at = ? "
+                "WHERE schedule_id = ? AND status = 'pending'",
+                (
+                    status,
+                    json.dumps(result, ensure_ascii=False) if result is not None else None,
+                    _now(),
+                    schedule_id,
+                ),
             )
             self._conn.commit()
             return cur.rowcount > 0

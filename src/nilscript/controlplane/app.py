@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import uuid
 from typing import Any
 
 from collections.abc import Awaitable, Callable
@@ -99,6 +100,20 @@ def _plan_scopes(plan: dict[str, Any]) -> frozenset[str]:
 SkeletonProvider = Callable[[str], Awaitable[dict[str, Any] | None]]
 # Skeleton of a SPECIFIC adapter by id (for cross-system composed plans). (workspace, adapter_id) -> skeleton|None.
 AdapterSkeletonProvider = Callable[[str, str], Awaitable[dict[str, Any] | None]]
+
+
+def _parse_when(when: Any) -> _dt.datetime | None:
+    """Parse an ISO-8601 timestamp into an aware UTC datetime. A trailing `Z` is accepted; a
+    naive timestamp reads as UTC. Unparseable input is None — the caller refuses, never guesses."""
+    if not isinstance(when, str) or not when.strip():
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(when.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.UTC)
+    return parsed.astimezone(_dt.UTC)
 
 
 def _diag_list(result: ValidationResult) -> list[dict[str, Any]]:
@@ -1363,6 +1378,44 @@ def create_app(
         )
         return result
 
+    async def _execute_prepared_core(row: dict[str, Any]) -> dict[str, Any]:
+        """The ONE execute path — shared by POST /prepared/{id}/execute and the tick's scheduled
+        fires, so a scheduled commit obeys exactly the rules a manual commit does. Returns
+        {"execution": ...} or {"refusal": ...} — the interpreter state is the authority, never a
+        stored flag; an unsatisfied strategy refuses NOT_APPROVED (collecting signatures is the
+        only way forward)."""
+        if row["status"] == "committed":
+            return {
+                "refusal": {
+                    "code": "ALREADY_COMMITTED",
+                    "message": "this prepared execution already committed",
+                    "commit_result": row.get("commit_result"),
+                }
+            }
+        if row["status"] == "rejected":
+            return {
+                "refusal": {
+                    "code": "ALREADY_DECIDED",
+                    "message": "this prepared execution was rejected",
+                }
+            }
+        if row["status"] == "pending":
+            st = strategy_exec.state(
+                store, row["prepared_id"], _prepared_strategy_body(row), inputs=row["inputs"]
+            )
+            if st.get("status") != "approved":
+                return {
+                    "refusal": {
+                        "code": "NOT_APPROVED",
+                        "message": "the strategy is not satisfied — collect the pending "
+                        "signatures first (the commit is the only effect path)",
+                        "pending": st.get("pending"),
+                    }
+                }
+            store.set_prepared_status(row["prepared_id"], "approved", expect="pending")
+        refreshed = store.get_prepared(row["prepared_id"], row["workspace"]) or row
+        return {"execution": await _commit_prepared(refreshed)}
+
     @app.post("/prepared")
     async def prepared_create(
         request: Request, authorization: str | None = Header(default=None)
@@ -1540,41 +1593,76 @@ def create_app(
         row = store.get_prepared(prepared_id, ws)
         if row is None:
             return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
-        if row["status"] == "committed":
-            return _prepared_refusal(
-                {
-                    "code": "ALREADY_COMMITTED",
-                    "message": "this prepared execution already committed",
-                    "commit_result": row.get("commit_result"),
-                }
-            )
-        if row["status"] == "rejected":
-            return _prepared_refusal(
-                {"code": "ALREADY_DECIDED", "message": "this prepared execution was rejected"}
-            )
-        if row["status"] == "pending":
-            # The interpreter state is the authority — never a stored flag.
-            st = strategy_exec.state(
-                store, prepared_id, _prepared_strategy_body(row), inputs=row["inputs"]
-            )
-            if st.get("status") != "approved":
-                return _prepared_refusal(
-                    {
-                        "code": "NOT_APPROVED",
-                        "message": "the strategy is not satisfied — collect the pending "
-                        "signatures first (the commit is the only effect path)",
-                        "pending": st.get("pending"),
-                    }
-                )
-            store.set_prepared_status(prepared_id, "approved", expect="pending")
-        execution = await _commit_prepared(store.get_prepared(prepared_id, ws) or row)
+        out = await _execute_prepared_core(row)
+        if "refusal" in out:
+            return _prepared_refusal(out["refusal"])
         return {
-            "ok": bool(execution.get("committed")),
-            "execution": execution,
+            "ok": bool(out["execution"].get("committed")),
+            "execution": out["execution"],
             "prepared": prepared_cards.card_view(
                 store, store.get_prepared(prepared_id, ws) or row
             ),
         }
+
+    @app.post("/prepared/{prepared_id}/schedule")
+    async def prepared_schedule(
+        prepared_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """B7 nil_schedule: register a ONE-SHOT schedule row for a pending/approved prepared
+        execution. The /automations/tick sweep fires it through the SAME execute path a manual
+        commit uses at/after `when` (ISO-8601) — a row, never an in-memory timer. Honest
+        refusals: unknown/decided cards, unparseable timestamps, and timestamps already past."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        ws = (body or {}).get("workspace") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        row = store.get_prepared(prepared_id, ws)
+        if row is None:
+            return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
+        if row["status"] not in ("pending", "approved"):
+            return _prepared_refusal(
+                {
+                    "code": "ALREADY_COMMITTED"
+                    if row["status"] == "committed"
+                    else "ALREADY_DECIDED",
+                    "message": f"this prepared execution is already {row['status']} — only a "
+                    "pending or approved card can be scheduled",
+                    "status": row["status"],
+                }
+            )
+        fire_at = _parse_when((body or {}).get("when"))
+        if fire_at is None:
+            return _prepared_refusal(
+                {
+                    "code": "INVALID_WHEN",
+                    "message": "`when` must be an ISO-8601 timestamp (e.g. "
+                    "2026-07-04T09:00:00Z)",
+                },
+                status_code=400,
+            )
+        now = _dt.datetime.now(_dt.UTC)
+        if fire_at <= now:
+            return _prepared_refusal(
+                {
+                    "code": "PAST_SCHEDULE",
+                    "message": "`when` is not in the future — a one-shot schedule fires at/after "
+                    "`when`; a past timestamp is refused, never fired retroactively",
+                    "when": fire_at.isoformat(),
+                    "now": now.isoformat(),
+                },
+                status_code=400,
+            )
+        sched = store.create_scheduled_execution(
+            f"sched-{uuid.uuid4().hex[:12]}",
+            prepared_id=prepared_id,
+            workspace=ws,
+            fire_at=fire_at.isoformat(),
+        )
+        return {"ok": True, "scheduled": sched}
 
     # ── Cycle .nil surface + language services (the LSP brain — a projection, no state) ────────
     async def _read_body(request: Request) -> tuple[dict[str, Any] | None, Any]:
@@ -1929,12 +2017,44 @@ def create_app(
         for act in signature_actions:
             if act.get("action") == "rejected":
                 store.set_prepared_status(act["execution_id"], "rejected", expect="pending")
+        # And one-shot scheduled executions (plan B7 nil_schedule): each due row fires through
+        # the SAME execute path a manual commit uses; the outcome (fired | refused) is settled
+        # on the row — a NOT_APPROVED strategy at fire time is a recorded answer, never a retry.
+        scheduled_fires: list[dict[str, Any]] = []
+        for sched in store.due_scheduled_executions(now.isoformat()):
+            prep_row = store.get_prepared(sched["prepared_id"], sched["workspace"])
+            if prep_row is None:
+                outcome: dict[str, Any] = {
+                    "refusal": {
+                        "code": "UNKNOWN_PREPARED",
+                        "message": "the scheduled prepared execution no longer exists",
+                    }
+                }
+            else:
+                outcome = await _execute_prepared_core(prep_row)
+            fire: dict[str, Any] = {
+                "schedule_id": sched["schedule_id"],
+                "prepared_id": sched["prepared_id"],
+            }
+            if "refusal" in outcome:
+                if store.settle_scheduled_execution(
+                    sched["schedule_id"], "refused", outcome["refusal"]
+                ):
+                    fire.update(status="refused", refusal=outcome["refusal"])
+                    scheduled_fires.append(fire)
+            else:
+                if store.settle_scheduled_execution(
+                    sched["schedule_id"], "fired", outcome["execution"]
+                ):
+                    fire.update(status="fired", execution=outcome["execution"])
+                    scheduled_fires.append(fire)
         return {
             "ok": True,
             "fired": len(fired),
             "runs": [f["run"] for f in fired if f.get("ok") and f.get("run")],
             "timed_out": timed_out,
             "signatures": signature_actions,
+            "scheduled": scheduled_fires,
         }
 
     @app.get("/automations/{workspace}/{automation_id}/runs")
