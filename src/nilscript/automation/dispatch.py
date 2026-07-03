@@ -158,6 +158,24 @@ def _record(
         deadline=deadline,
         context=result.context,
     )
+    # A run parked on a HUMAN GATE must also surface as a held approval in the Decisions queue,
+    # so an operator can actually act on it (the parked_runs row alone is invisible to /api/pending).
+    # Approving it flows through the normal decision path, which resumes this parked run by
+    # proposal_id. Event waits (kind=event) do NOT hold — they resume on the ledger event/timeout.
+    if (w.get("kind") or "approval") == "approval" and w.get("proposal"):
+        node_label = w.get("label") or w.get("node") or ""
+        store.await_approval(
+            w["proposal"],
+            verb=f"approve:{w.get('node') or 'gate'}",
+            tier=(w.get("tier") or "HIGH"),
+            preview={
+                "en": f"Approval required: {node_label}",
+                "ar": f"مطلوب اعتماد: {node_label}",
+                "cycle": automation_id,
+                "node": w.get("node"),
+            },
+            workspace=workspace,
+        )
 
 
 async def fire_manual(
