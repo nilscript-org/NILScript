@@ -34,6 +34,9 @@ _STEP_KEYWORDS = (
     "notify",
     "wait_for_event",
     "checkpoint",
+    "retry",
+    "on_error",
+    "compensate_with",
     "output",
     "next",
 )
@@ -73,6 +76,9 @@ _KEYWORDS = frozenset(
         "checkpoint",
         "on_event",
         "route",
+        "retry",
+        "on_error",
+        "compensate_with",
         "notify",
         "output",
         "next",
@@ -335,7 +341,7 @@ def _token_length(tok) -> int:
 def _classify_word(value: str, prev_word: str | None) -> str:
     if prev_word == "cycle":
         return "cycle_id"
-    if prev_word in ("use", "query"):
+    if prev_word in ("use", "query", "compensate_with"):
         return "verb"
     if prev_word == "step":
         return "step"

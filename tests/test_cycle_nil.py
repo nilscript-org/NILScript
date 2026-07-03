@@ -328,3 +328,171 @@ def test_unknown_section_raises_with_line():
         parse_nil(text)
     assert "unknown section" in exc.value.message
     assert exc.value.line == 2
+
+
+# --- 5. error/compensation clauses on action steps (retry / on_error / compensate_with) --------
+#
+# ActionStep has carried `retry`, `on_error`, and `compensate` since the v0.2 freeze, but the
+# printer never emitted them — a cycle using them broke parse(print(ast)) == ast, the SSOT trust
+# contract. Canonical grammar (between the verb line and the output/next routing tail):
+#
+#   retry { max_attempts: 3; backoff: exponential; initial_seconds: 2.0 }
+#   on_error route -> Cleanup          (the `-> target` only when `to` is set)
+#   compensate_with odoo.refund { payment_id: pay.id }
+
+
+def _action_cycle(**step_fields) -> Cycle:
+    """A minimal one-action cycle whose action step carries `step_fields`."""
+    return Cycle.model_validate(
+        {
+            "nil": "cycle/0.2",
+            "cycle_id": "PayFlow",
+            "workspace": "acme",
+            "metadata": {"version": "1.0.0", "owner": "Ops"},
+            "intent": {"ar": "دفع", "en": "Pay"},
+            "trigger": {"type": "manual"},
+            "flow": {
+                "entry": "Pay",
+                "steps": [
+                    {
+                        "id": "Pay",
+                        "type": "action",
+                        "use": "odoo.pay_invoice",
+                        "with": {"amount": 500},
+                        "output": "pay",
+                        "next": "Done",
+                        **step_fields,
+                    },
+                    {"id": "Cleanup", "type": "notify", "message": {"ar": "نظف", "en": "Clean"}},
+                    {"id": "Done", "type": "notify", "message": {"ar": "تم", "en": "Done"}},
+                ],
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"retry": {"max_attempts": 3}},  # defaults fill backoff/initial_seconds
+        {"retry": {"max_attempts": 5, "backoff": "fixed", "initial_seconds": 1.5}},
+        {"on_error": {"action": "halt"}},
+        {"on_error": {"action": "continue"}},
+        {"on_error": {"action": "route", "to": "Cleanup"}},
+        {"on_error": {"action": "compensate"}},
+        {"compensate": {"use": "odoo.refund_invoice", "with": {"payment_id": "pay.id"}}},
+        {"compensate": {"use": "odoo.refund_invoice"}},  # empty args → `{}`
+        {  # all three combined
+            "retry": {"max_attempts": 3},
+            "on_error": {"action": "route", "to": "Cleanup"},
+            "compensate": {"use": "odoo.refund_invoice", "with": {"payment_id": "pay.id"}},
+        },
+    ],
+    ids=[
+        "retry_defaults",
+        "retry_explicit",
+        "on_error_halt",
+        "on_error_continue",
+        "on_error_route",
+        "on_error_compensate",
+        "compensate_with_args",
+        "compensate_empty_args",
+        "all_combined",
+    ],
+)
+def test_error_clauses_round_trip(fields):
+    ast = _action_cycle(**fields)
+    assert parse_nil(print_nil(ast)) == ast
+    # and printing is idempotent (the printed text IS canonical)
+    canonical = print_nil(ast)
+    assert print_nil(parse_nil(canonical)) == canonical
+
+
+def test_error_clauses_print_in_canonical_form():
+    ast = _action_cycle(
+        retry={"max_attempts": 3},
+        on_error={"action": "route", "to": "Cleanup"},
+        compensate={"use": "odoo.refund_invoice", "with": {"payment_id": "pay.id"}},
+    )
+    text = print_nil(ast)
+    assert "      retry { max_attempts: 3; backoff: exponential; initial_seconds: 2.0 }\n" in text
+    assert "      on_error route -> Cleanup\n" in text
+    assert '      compensate_with odoo.refund_invoice { payment_id: "pay.id" }\n' in text
+    # the clauses sit between the verb line and the routing tail
+    step_block = text.split("step Pay {", 1)[1].split("output pay", 1)[0]
+    order = [step_block.index(k) for k in ("use ", "retry ", "on_error ", "compensate_with ")]
+    assert order == sorted(order)
+
+
+def test_on_error_without_target_prints_no_arrow():
+    text = print_nil(_action_cycle(on_error={"action": "halt"}))
+    assert "on_error halt\n" in text
+    assert "->" not in text.split("on_error halt")[1].split("\n")[0]
+
+
+def test_query_step_rejects_error_clauses():
+    """The clauses are ActionStep-only; a query step carrying `retry` must not parse."""
+    text = (
+        'cycle Q triggers manual {\n'
+        '  workspace "acme"\n'
+        '  intent "q"\n'
+        '  meta { version: "1.0.0"; owner: "Ops" }\n'
+        '  flow entry Scan {\n'
+        '    step Scan {\n'
+        '      query odoo.read_rows {}\n'
+        '      retry { max_attempts: 3; backoff: exponential; initial_seconds: 2.0 }\n'
+        '    }\n'
+        '  }\n'
+        '}\n'
+    )
+    with pytest.raises(NilSyntaxError):
+        parse_nil(text)
+
+
+def test_unknown_retry_field_raises():
+    text = (
+        'cycle Q triggers manual {\n'
+        '  workspace "acme"\n'
+        '  intent "q"\n'
+        '  meta { version: "1.0.0"; owner: "Ops" }\n'
+        '  flow entry Pay {\n'
+        '    step Pay {\n'
+        '      use odoo.pay_invoice {}\n'
+        '      retry { attempts: 3 }\n'
+        '    }\n'
+        '  }\n'
+        '}\n'
+    )
+    with pytest.raises(NilSyntaxError) as exc:
+        parse_nil(text)
+    assert "unknown retry field" in exc.value.message
+
+
+# --- 6. byte-stability regression: fields-absent cycles print EXACTLY as before ----------------
+#
+# The printer DEFINES canonical form and cycle/0.2 is FROZEN: adding the error-clause grammar must
+# not move a single byte of any cycle that does not use the fields. These sha256 hashes were
+# computed against the printer BEFORE the clauses existed — if one changes, the syntax choice
+# broke the freeze (content-hash stability for every pre-existing cycle is non-negotiable).
+
+_CANONICAL_SHA256 = {
+    "sales_lead": "2be296097f3396000bc3c0e7c8b4839862e7eec8f9e4f432d799ea27c7512f6d",
+    "manual_decision": "b31b60351cd3e310fdce56fc58dc6bf30e8c39ca25baea87626f30162bf00a1e",
+    "schedule_query": "980e7468ad3a97ff60c90f5a48457225bffc843f547db805dbd058e76dde61eb",
+}
+
+
+@pytest.mark.parametrize(
+    ("key", "fixture"),
+    [
+        ("sales_lead", _sales_lead_lifecycle),
+        ("manual_decision", _manual_with_decision),
+        ("schedule_query", _schedule_with_query_and_doc),
+    ],
+    ids=["sales_lead", "manual_decision", "schedule_query"],
+)
+def test_fields_absent_cycles_print_byte_identical_to_before(key, fixture):
+    import hashlib
+
+    text = print_nil(Cycle.model_validate(fixture()))
+    assert hashlib.sha256(text.encode("utf-8")).hexdigest() == _CANONICAL_SHA256[key]

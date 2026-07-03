@@ -413,8 +413,45 @@ class _Reader:
         with_ = self._arg_map()
         step_type = "action" if keyword == "use" else "query"
         step: dict[str, Any] = {"id": step_id, "type": step_type, "use": use, "with": with_}
+        if step_type == "action":
+            # Error/compensation clauses (ActionStep-only) in canonical order:
+            # retry { … }, then `on_error <action> [-> Step]`, then `compensate_with verb { args }`.
+            if self._is_word("retry"):
+                step["retry"] = self._retry_block()
+            if self._is_word("on_error"):
+                self._next()
+                policy: dict[str, Any] = {"action": self._word()}
+                if self._is_punct("->"):
+                    self._next()
+                    policy["to"] = self._word()
+                step["on_error"] = policy
+            if self._is_word("compensate_with"):
+                self._next()
+                step["compensate"] = {"use": self._word(), "with": self._arg_map()}
         self._read_output_and_next(step)
         return step
+
+    def _retry_block(self) -> dict:
+        """`retry { max_attempts: 3; backoff: exponential; initial_seconds: 2.0 }` — every field
+        prints (and therefore parses) explicitly, in the model's field order."""
+        self._expect_word("retry")
+        self._expect_punct("{")
+        retry: dict[str, Any] = {}
+        while not self._is_punct("}"):
+            key = self._word()
+            self._expect_punct(":")
+            if key == "max_attempts":
+                retry["max_attempts"] = self._number()
+            elif key == "backoff":
+                retry["backoff"] = self._word()
+            elif key == "initial_seconds":
+                retry["initial_seconds"] = self._float()
+            else:
+                self._fail(f"unknown retry field {key!r}")
+            if self._is_punct(";"):
+                self._next()
+        self._expect_punct("}")
+        return retry
 
     def _decision(self, step_id: str) -> dict:
         self._expect_word("decision")
@@ -636,6 +673,14 @@ class _Reader:
             return int(word)
         except ValueError:
             self._fail(f"expected an integer but found {word!r}", tok)
+
+    def _float(self) -> float:
+        tok = self._peek()
+        word = self._word()
+        try:
+            return float(word)
+        except ValueError:
+            self._fail(f"expected a number but found {word!r}", tok)
 
 
 def _try_number(word: str) -> int | float | None:

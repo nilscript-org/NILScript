@@ -134,6 +134,8 @@ def _step_target_fields(step: CycleStepType) -> list[tuple[str, str]]:
             out.append(("on_timeout", step.on_timeout))
     if isinstance(step, WaitForEventStep):
         out.append(("on_timeout", step.on_timeout))
+    if isinstance(step, ActionStep) and step.on_error is not None and step.on_error.to is not None:
+        out.append(("on_error", step.on_error.to))
     return out
 
 
@@ -148,7 +150,10 @@ def _value_refs_dotted(step: CycleStepType) -> list[tuple[str, bool]]:
     or an `approver` which is always a direct context-entity name) vs an ambiguous bare token that
     could be a literal. Used by dead-ref so a literal like `"default"` is never flagged."""
     if isinstance(step, (ActionStep, QueryStep)):
-        return _path_refs_dotted(step.with_)
+        refs = _path_refs_dotted(step.with_)
+        if isinstance(step, ActionStep) and step.compensate is not None:
+            refs += _path_refs_dotted(step.compensate.with_)  # compensation args are data refs too
+        return refs
     if isinstance(step, DecisionStep):
         return [(h, True) for h in _expr_refs(step.when)]  # an expr operand is a real reference
     if isinstance(step, ApprovalStep):

@@ -167,6 +167,26 @@ class _Printer:
 
     def _action_like(self, keyword: str, step: ActionStep | QueryStep) -> None:
         self._emit(f"{keyword} {step.use} {_arg_map(step.with_)}")
+        if isinstance(step, ActionStep):
+            # Error/compensation clauses (ActionStep-only, v0.2 fields since the freeze). All three
+            # print between the verb line and the output/next routing tail, in model field order.
+            if step.retry is not None:
+                self._emit(
+                    "retry { "
+                    f"max_attempts: {step.retry.max_attempts}; "
+                    f"backoff: {step.retry.backoff}; "
+                    f"initial_seconds: {_arg_value(step.retry.initial_seconds)}"
+                    " }"
+                )
+            if step.on_error is not None:
+                line = f"on_error {step.on_error.action}"
+                if step.on_error.to is not None:
+                    line += f" -> {step.on_error.to}"
+                self._emit(line)
+            if step.compensate is not None:
+                self._emit(
+                    f"compensate_with {step.compensate.use} {_arg_map(step.compensate.with_)}"
+                )
         if step.output is not None:
             self._emit(f"output {step.output}")
         if step.next is not None:

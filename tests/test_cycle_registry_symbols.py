@@ -301,3 +301,46 @@ def test_literal_value_is_not_a_dead_reference():
     names = {f.name for f in findings if f.problem == "undefined_ref"}
     assert "default" not in names
     assert "quotation_sent" not in names
+
+
+# --- 5. error/compensation clause wiring (on_error targets + compensate arg refs) --------------
+
+
+def test_dead_reference_flags_missing_on_error_target():
+    raw = _sales_lead_lifecycle()
+    raw["flow"]["steps"][0]["on_error"] = {"action": "route", "to": "NoSuchCleanup"}
+    findings = _registry(raw=raw).dead_references()
+    problems = {(f.name, f.problem) for f in findings}
+    assert ("NoSuchCleanup", "undefined_step") in problems
+
+
+def test_on_error_target_counts_as_step_reference():
+    raw = _sales_lead_lifecycle()
+    raw["flow"]["steps"][0]["on_error"] = {"action": "route", "to": "EndRejected"}
+    registry = _registry(raw=raw)
+    assert "CreateLead" in registry.references("EndRejected")
+
+
+def test_dead_reference_flags_undefined_compensate_arg_ref():
+    raw = _sales_lead_lifecycle()
+    raw["flow"]["steps"][0]["compensate"] = {
+        "use": "odoo.crm_delete_lead",
+        "with": {"lead_id": "ghostoutput.id"},
+    }
+    findings = _registry(raw=raw).dead_references()
+    problems = {(f.name, f.problem) for f in findings}
+    assert ("ghostoutput", "undefined_ref") in problems
+
+
+def test_compensate_arg_marks_output_as_used():
+    """An output consumed ONLY by a compensation is not flagged unused."""
+    raw = _sales_lead_lifecycle()
+    # LogActivity currently reads nothing; give CreateQuotation's output a compensation-only reader
+    raw["flow"]["steps"][5]["compensate"] = {
+        "use": "audit.log_event",
+        "with": {"quotation_id": "quotation.id"},
+    }
+    # remove the other quotation reader? (none exists — `quotation` was already unused)
+    findings = _registry(raw=raw).dead_references()
+    unused = {f.name for f in findings if f.problem == "unused_output"}
+    assert "quotation" not in unused

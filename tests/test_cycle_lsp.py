@@ -289,3 +289,38 @@ def test_http_projections_governance_lists_approval_gate(tmp_path):
     assert r.status_code == 200
     result = r.json()["result"]
     assert "Approval" in result["gates"]
+
+
+# --- error/compensation clauses: the LSP tolerates and classifies them -------------------------
+
+
+def _cycle_with_error_clauses() -> str:
+    raw = _sales_lead_lifecycle()
+    raw["flow"]["steps"][0]["retry"] = {"max_attempts": 3}
+    raw["flow"]["steps"][0]["on_error"] = {"action": "route", "to": "EndRejected"}
+    raw["flow"]["steps"][0]["compensate"] = {
+        "use": "odoo.crm_create_lead",
+        "with": {"lead_id": "lead.id"},
+    }
+    return print_nil(Cycle.model_validate(raw))
+
+
+def test_diagnostics_accept_error_clauses():
+    """The canonical text with retry/on_error/compensate_with clauses parses and validates —
+    no NIL_SYNTAX and no undefined-step diagnostic for the on_error route target."""
+    text = _cycle_with_error_clauses()
+    diags = diagnostics(text, _ctx())
+    assert all(d["code"] != "NIL_SYNTAX" for d in diags)
+    assert all("EndRejected" not in d["message"] for d in diags if d["severity"] == "error")
+
+
+def test_semantic_tokens_classify_compensation_verb():
+    text = _cycle_with_error_clauses()
+    tokens = semantic_tokens(text)
+    line_no = next(
+        i for i, line in enumerate(text.splitlines(), start=1) if "compensate_with" in line
+    )
+    line_tokens = [t for t in tokens if t["line"] == line_no]
+    # `compensate_with` is a keyword; the verb after it is classified as a verb
+    assert any(t["type"] == "keyword" for t in line_tokens)
+    assert any(t["type"] == "verb" for t in line_tokens)
