@@ -462,7 +462,14 @@ class LocalExecutor:
         return _outcome_dict(outcome, proposal.id)
 
     async def _do_await_approval(self, node: dict[str, Any], item: Any) -> str:
-        proposal_id = resolve(node["proposal"], self._ctx, item=item)
+        # RUN-SCOPE the gate handle. The compiled `proposal` is per-VERSION (e.g. `gate_step_2`),
+        # identical across every run of the cycle. Awaiting/parking under that shared id lets a
+        # second run silently bind to the FIRST run's decision — it either stalls forever (parks
+        # after the shared gate was already decided) or resumes on someone else's single approval
+        # (a two-key/SoD breach). Scoping by run_id gives each run its own held approval, while the
+        # gate-check below, the park, and the decision→resume all key off this same id.
+        gate_key = resolve(node["proposal"], self._ctx, item=item)
+        proposal_id = _gate_scoped_proposal(self._run_id, gate_key)
         for _ in range(self._max_polls):
             status = await self._client.status(proposal_id)
             route = _APPROVAL_ROUTE.get(status.state or "")
@@ -502,6 +509,15 @@ class LocalExecutor:
             )
             done.append(node_id)
         return done
+
+
+def _gate_scoped_proposal(run_id: str, gate_key: str) -> str:
+    """Run-scope a compiled gate handle so two runs of the SAME cycle version never collide on one
+    held approval. The compiled `proposal` (e.g. `gate_step_2`) is per-version, identical across
+    runs; this appends a URL-safe form of the run id. Stable per (run, gate) so a resume re-derives
+    the exact same id."""
+    safe_run = "".join(ch if (ch.isalnum() or ch in "_-") else "-" for ch in run_id)
+    return f"{gate_key}--{safe_run}"
 
 
 def _proposal_of(output: Any) -> str | None:

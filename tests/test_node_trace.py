@@ -25,7 +25,7 @@ from nilscript.automation.dispatch import (
 )
 from nilscript.automation.scheduler import resume_due_waits
 from nilscript.controlplane.store import EventStore
-from nilscript.kernel.executor import LocalExecutor
+from nilscript.kernel.executor import LocalExecutor, _gate_scoped_proposal
 
 # ── a fake NIL client: a query returns rows, a gate's status is "expired" (unknown proposal) ─────
 
@@ -83,9 +83,11 @@ def _executor(client, run_id="r1"):
 async def test_unknown_gate_proposal_parks_instead_of_completing():
     result = await _executor(_FakeClient("expired")).execute(QUERY_GATE_NOTIFY)
     assert result.completed is False  # the run did NOT run straight to completed
+    # The parked proposal is RUN-SCOPED (`gate_step_2--<run_id>`) so two runs of the same cycle
+    # version never collide on one held approval. Here the fake run id is "r1".
     assert result.waiting == {
         "kind": "approval", "node": "step_2",
-        "proposal": "gate_step_2", "timeout_seconds": 3600,
+        "proposal": "gate_step_2--r1", "timeout_seconds": 3600,
     }
 
 
@@ -115,9 +117,20 @@ async def test_park_trace_shows_completed_and_waiting_nodes():
 
     gate = nodes["step_2"]
     assert gate["status"] == "waiting_approval"
-    assert gate["proposal_id"] == "gate_step_2"
+    assert gate["proposal_id"] == "gate_step_2--r1"  # run-scoped (default run id "r1")
     assert gate["ended_at"] is None  # a waiting node has not finished
     assert "step_3" not in nodes and "step_4" not in nodes  # nothing downstream ran
+
+
+async def test_two_runs_of_same_cycle_get_distinct_gate_proposals():
+    # REGRESSION: the compiled gate handle (`gate_step_2`) is per-VERSION, identical across runs.
+    # Two runs must NOT collide on one held approval — else run B binds to run A's decision
+    # (stalling B, or resuming it on A's single approval — a two-key/SoD breach).
+    a = await _executor(_FakeClient("expired"), run_id="runA").execute(QUERY_GATE_NOTIFY)
+    b = await _executor(_FakeClient("expired"), run_id="runB").execute(QUERY_GATE_NOTIFY)
+    assert a.waiting["proposal"] == "gate_step_2--runA"
+    assert b.waiting["proposal"] == "gate_step_2--runB"
+    assert a.waiting["proposal"] != b.waiting["proposal"]
 
 
 async def test_wait_for_event_parks_with_event_wait_on_the_node():
@@ -183,8 +196,10 @@ async def test_fire_parks_then_decision_completes_full_trace(tmp_path):
     assert parked_nodes["step_2"]["status"] == "waiting_approval"
     assert run["trace"]["current_node"] == "step_2"
 
-    # the pending approval is reachable via the park row (the Decisions feed's source)
-    park = store.parked_for_proposal("gate_step_2")[0]
+    # the pending approval is reachable via the park row (the Decisions feed's source). The gate
+    # id is RUN-SCOPED so a second run of the same cycle never collides on this one held approval.
+    gate_pid = _gate_scoped_proposal(run["run_id"], "gate_step_2")
+    park = store.parked_for_proposal(gate_pid)[0]
     assert park["node_id"] == "step_2"
 
     out = await resume_on_decision(store, park, runner=_runner(client), status="approved")
@@ -215,7 +230,7 @@ async def test_node_trace_survives_a_process_restart(tmp_path):
     nodes = {n["node_id"]: n for n in persisted["trace"]["nodes"]}
     assert nodes["step_1"]["status"] == "completed"
     assert nodes["step_2"]["status"] == "waiting_approval"
-    assert nodes["step_2"]["proposal_id"] == "gate_step_2"
+    assert nodes["step_2"]["proposal_id"] == _gate_scoped_proposal(run_id, "gate_step_2")
 
 
 async def test_wait_for_event_deadline_routes_and_trace_completes(tmp_path):
