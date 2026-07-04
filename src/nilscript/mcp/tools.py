@@ -82,16 +82,11 @@ class NilTools:
         brain: Any = None,
         automation: Any = None,
         workspace: str = "",
-        describe_override: dict[str, Any] | None = None,
     ) -> None:
         if gate not in GATE_MODES:
             raise ValueError(f"gate must be one of {sorted(GATE_MODES)}, got {gate!r}")
         self._client = client
         self._transport = transport
-        # When several adapters are active for the workspace, `client` is a RoutingNilClient (routes
-        # each verb to its declaring backend) and this is the UNION of every adapter's describe — so
-        # nil_describe shows crm.* AND comms.* together, not just one backend's verbs.
-        self._describe_override = describe_override
         self._default_session = session_id
         self._gate = gate
         self._brain = brain  # optional BrainTools — owns graph/meta entities in nil_intent routing
@@ -117,10 +112,7 @@ class NilTools:
             }
 
     async def describe(self) -> dict[str, Any]:
-        """Discovery: the adapter skeleton {system, nil, verbs, targets, ready, missing}. When several
-        adapters are active, returns the pre-computed UNION so the agent sees every routable verb."""
-        if self._describe_override is not None:
-            return self._describe_override
+        """Discovery: the adapter's skeleton {system, nil, verbs, targets, ready, missing}."""
         return await handshake(self._transport)
 
     async def propose(
