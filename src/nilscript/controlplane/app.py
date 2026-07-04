@@ -81,6 +81,7 @@ from nilscript.sdk.client import NilClient
 from nilscript.sdk.idempotency import commit_idempotency_key
 from nilscript.sdk.connect import handshake
 from nilscript.sdk.grants import GrantRef
+from nilscript.sdk.routing import RoutingNilClient
 from nilscript.sdk.transport import NilTransport
 
 
@@ -179,6 +180,65 @@ def create_app(
 
     provider: SkeletonProvider = skeleton_provider or _live_skeleton
 
+    def _adapter_client(
+        active: dict[str, Any], scopes: frozenset[str], grant_id: str
+    ) -> tuple[NilClient, NilTransport]:
+        """A NilClient + its transport for ONE adapter row. The adapter's bearer is the transport auth;
+        the grant carries the workspace + verb scopes."""
+        bearer = active.get("bearer", "") or ""
+        transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
+        grant = GrantRef.from_secret(
+            grant_id=grant_id,
+            workspace=active.get("workspace", "") or "",
+            secret=bearer or "cp",
+            scopes=scopes,
+        )
+        return NilClient(transport=transport, grant=grant), transport
+
+    async def _routed_client(
+        ws: str, scopes: frozenset[str], grant_id: str
+    ) -> tuple[Any, list[NilTransport]]:
+        """Build the client the executor walks a plan against.
+
+        ONE active adapter → a plain NilClient (zero routing overhead — the common path, unchanged).
+        SEVERAL active → a RoutingNilClient that sends each verb to the adapter DECLARING it (learnt
+        from each adapter's describe), so a single governed run spans backends (crm.* on Odoo,
+        comms.* on the comms adapter). Returns (client_or_None, transports_to_close)."""
+        actives = [a for a in store.active_adapters(ws) if a.get("url")]
+        if not actives:
+            return None, []
+        if len(actives) == 1:
+            client, transport = _adapter_client(actives[0], scopes, grant_id)
+            return client, [transport]
+        transports: list[NilTransport] = []
+        routes: dict[str, NilClient] = {}
+        default: NilClient | None = None
+        for a in actives:
+            client, transport = _adapter_client(a, scopes, grant_id)
+            transports.append(transport)
+            report = await handshake(transport)
+            for verb in report.get("verbs", []) or []:
+                routes.setdefault(verb, client)  # first (newest) declarer wins a conflict
+            if default is None:
+                default = client
+        return RoutingNilClient(default=default, routes=routes), transports
+
+    async def _adapter_declaring(ws: str, verb: str) -> dict[str, Any] | None:
+        """The active adapter that DECLARES `verb` — the backend that held its proposal, where the
+        approved commit must land. Falls back to the workspace default (single-adapter / legacy)."""
+        actives = [a for a in store.active_adapters(ws) if a.get("url")]
+        if len(actives) <= 1:
+            return actives[0] if actives else (store.active_adapter(ws) or store.any_active_adapter())
+        for a in actives:
+            transport = NilTransport(base_url=a["url"], bearer_secret=a.get("bearer", "") or "")
+            try:
+                report = await handshake(transport)
+            finally:
+                await transport.aclose()
+            if verb in (report.get("verbs", []) or []):
+                return a
+        return store.active_adapter(ws) or store.any_active_adapter()
+
     async def _live_runner(
         plan: dict[str, Any],
         *,
@@ -186,24 +246,16 @@ def create_app(
         resume: dict[str, Any] | None = None,
         input: dict[str, Any] | None = None,
     ) -> Any:
-        """Default runner: walk the pinned plan against the workspace's active adapter via a headless
-        LocalExecutor. The adapter bearer is the transport auth; the grant scopes are the plan's own
-        verbs. `resume` continues a PARKED run from its row-backed context (gates / wait_for_event).
+        """Default runner: walk the pinned plan against the workspace's active adapter(s) via a
+        headless LocalExecutor. With several adapters active the verbs are routed per-backend (see
+        `_routed_client`). The adapter bearer is the transport auth; the grant scopes are the plan's
+        own verbs. `resume` continues a PARKED run from its row-backed context (gates / wait_for_event).
         (Production grant minting is the one knob to revisit when CP-initiated runs need a
         distinct identity from the adapter bearer.)"""
         ws = plan.get("workspace", "") if isinstance(plan, dict) else ""
-        active = store.active_adapter(ws)
-        if not active or not active.get("url"):
+        client, transports = await _routed_client(ws, _plan_scopes(plan), "control-plane")
+        if client is None:
             raise RuntimeError(f"no active adapter for workspace {ws!r}")
-        bearer = active.get("bearer", "") or ""
-        transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
-        grant = GrantRef.from_secret(
-            grant_id="control-plane",
-            workspace=ws,
-            secret=bearer or "cp",
-            scopes=_plan_scopes(plan),
-        )
-        client = NilClient(transport=transport, grant=grant)
         try:
             executor = LocalExecutor(
                 client,
@@ -213,7 +265,8 @@ def create_app(
             )
             return await executor.execute(plan, resume=resume, input=input)
         finally:
-            await transport.aclose()
+            for transport in transports:
+                await transport.aclose()
 
     run_exec: Runner = runner or _live_runner
 
@@ -403,11 +456,18 @@ def create_app(
         still executes exactly what was previewed. The NIL invariant holds even under a human tweak."""
         appr = store.approval(proposal_id) or {}
         ws = store.proposal_workspace(proposal_id) or ""
-        active = store.active_adapter(ws) if ws else store.any_active_adapter()
+        verb = appr.get("verb")
+        # Commit on the adapter that DECLARED the verb (the backend that held this proposal), not just
+        # the workspace default — with several adapters active, the default may be a sibling that never
+        # saw it. Falls back to the default for single-adapter / legacy workspaces.
+        active = (
+            await _adapter_declaring(ws, verb)
+            if (ws and verb)
+            else (store.active_adapter(ws) if ws else store.any_active_adapter())
+        )
         if not active or not active.get("url"):
             return {"executed": False, "error": "no active adapter to commit against"}
         ws = active.get("workspace", "") or ""
-        verb = appr.get("verb")
         bearer = active.get("bearer", "") or ""
         transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
         grant = GrantRef.from_secret(

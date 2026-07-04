@@ -992,6 +992,18 @@ class EventStore:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def active_adapters(self, workspace: str) -> list[dict[str, Any]]:
+        """EVERY active adapter for a workspace (WITH bearer), newest-first. The runner builds a
+        verb→adapter route map across these so one governed run can span backends (crm.* on Odoo,
+        comms.* on the comms adapter). A single row ⇒ the plain single-adapter fast path."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_ADAPTER_COLS} FROM adapters WHERE workspace = ? AND active = 1 "
+                "ORDER BY updated_at DESC",
+                (workspace,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def active_adapter(self, workspace: str) -> dict[str, Any] | None:
         """The workspace's default active adapter for single-backend MCP routing (WITH bearer), or
         None. With several active, the most-recently-updated wins — composition addresses adapters by
