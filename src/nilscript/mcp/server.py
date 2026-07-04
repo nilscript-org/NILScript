@@ -67,7 +67,14 @@ def build_tools(
         scopes=scopes if scopes is not None else frozenset({"*"}),
     )
     transport = NilTransport(base_url=adapter_url, bearer_secret=bearer)
-    client = NilClient(transport=transport, grant=grant)
+    client: Any = NilClient(transport=transport, grant=grant)
+    describe_override: dict[str, Any] | None = None
+    # Multi-adapter: when the workspace has ≥2 active adapters, route each verb to its declaring
+    # backend and union their describes — so the agent SEES and can INVOKE comms.* alongside crm.*,
+    # instead of being pinned to a single adapter_url. Falls back to the single client on any failure.
+    routed = _multi_adapter(workspace=workspace, grant_id=grant_id, scopes=scopes)
+    if routed is not None:
+        client, transport, describe_override = routed
     return NilTools(
         client,
         transport,
@@ -76,7 +83,87 @@ def build_tools(
         brain=brain,
         automation=automation,
         workspace=workspace,
+        describe_override=describe_override,
     )
+
+
+def _multi_adapter(
+    *, workspace: str, grant_id: str, scopes: frozenset[str] | None
+) -> tuple[Any, NilTransport, dict[str, Any]] | None:
+    """Build a verb-routed client + a UNION describe across the workspace's active adapters.
+
+    Discovers them from the control-plane registry (`GET {NIL_REGISTRY_URL}/adapters/{ws}/routing`,
+    token-gated). Returns None (→ single-adapter fallback) when the registry is unset, unreachable, or
+    the workspace has fewer than two active adapters. Describes each adapter synchronously to learn its
+    verbs, so `nil_describe` returns the union and `nil_propose` routes each verb to its owner."""
+    import os
+
+    import httpx
+
+    from nilscript.sdk.routing import RoutingNilClient
+
+    registry = os.environ.get("NIL_REGISTRY_URL", "").rstrip("/")
+    token = os.environ.get("NIL_REGISTRY_TOKEN", "")
+    if not registry or not workspace:
+        return None
+    try:
+        resp = httpx.get(
+            f"{registry}/adapters/{workspace}/routing",
+            headers={"Authorization": f"Bearer {token}"} if token else {},
+            timeout=10,
+        )
+        adapters = (resp.json() or {}).get("adapters", []) if resp.status_code == 200 else []
+    except Exception:  # noqa: BLE001 — registry unreachable → single-adapter fallback
+        return None
+    adapters = [a for a in adapters if a.get("url")]
+    if len(adapters) < 2:
+        return None
+
+    scope_set = scopes if scopes is not None else frozenset({"*"})
+    routes: dict[str, Any] = {}
+    verbs: list[str] = []
+    verb_details: list[dict[str, Any]] = []
+    targets: dict[str, Any] = {}
+    systems: list[str] = []
+    default: Any = None
+    primary_transport: NilTransport | None = None
+    for a in adapters:
+        bearer_a = a.get("bearer", "") or ""
+        tr = NilTransport(base_url=a["url"], bearer_secret=bearer_a)
+        gr = GrantRef.from_secret(
+            grant_id=grant_id, workspace=workspace, secret=bearer_a or "cp", scopes=scope_set
+        )
+        cl = NilClient(transport=tr, grant=gr)
+        if default is None:
+            default, primary_transport = cl, tr
+        try:
+            d = httpx.get(
+                f"{a['url'].rstrip('/')}/nil/v0.1/describe",
+                headers={"Authorization": f"Bearer {bearer_a}"} if bearer_a else {},
+                timeout=10,
+            ).json()
+        except Exception:  # noqa: BLE001 — an unreachable adapter contributes no routes
+            d = {}
+        for v in d.get("verbs", []) or []:
+            routes.setdefault(v, cl)  # first (newest-active) declarer wins a conflict
+            if v not in verbs:
+                verbs.append(v)
+        verb_details.extend(d.get("verb_details", []) or [])
+        targets.update(d.get("targets", {}) or {})
+        if d.get("system"):
+            systems.append(str(d["system"]))
+    if default is None or primary_transport is None:
+        return None
+    describe_union: dict[str, Any] = {
+        "nil": "0.1",
+        "system": "+".join(dict.fromkeys(systems)) or "multi",
+        "reachable": True,
+        "conformant": True,
+        "verbs": verbs,
+        "verb_details": verb_details,
+        "targets": targets,
+    }
+    return RoutingNilClient(default=default, routes=routes), primary_transport, describe_union
 
 
 class ToolsProvider:

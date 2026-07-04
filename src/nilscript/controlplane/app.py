@@ -777,6 +777,28 @@ def create_app(
     def adapters() -> dict[str, Any]:
         return {"adapters": store.adapters()}
 
+    @app.get("/adapters/{workspace}/routing")
+    def adapters_routing(
+        workspace: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Active adapters (url + bearer) for a workspace — so a MULTI-ADAPTER client (the MCP) can
+        union their verbs and route each verb to its declaring backend, the same way the control-plane
+        runner does. Token-gated because it returns bearers."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        actives = [a for a in store.active_adapters(workspace) if a.get("url")]
+        return {
+            "adapters": [
+                {
+                    "adapter_id": a["adapter_id"],
+                    "url": a["url"],
+                    "bearer": a.get("bearer", "") or "",
+                    "system": a.get("system", ""),
+                }
+                for a in actives
+            ]
+        }
+
     @app.get("/api/adapter-skeleton")
     async def api_adapter_skeleton(
         workspace: str = "",
