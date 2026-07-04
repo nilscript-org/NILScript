@@ -162,21 +162,44 @@ def create_app(
         )
 
     async def _live_skeleton(workspace: str) -> dict[str, Any] | None:
-        """Default skeleton source: discover the workspace's active adapter over NIL. None when there
-        is no active adapter, it's unreachable, or it doesn't answer with a conformant describe."""
-        active = store.active_adapter(workspace)
-        if not active or not active.get("url"):
+        """Default skeleton source: discover the workspace's active adapter(s) over NIL and UNION their
+        verb surfaces — so an agent SEES every governed verb it can route to (crm.* on one backend,
+        comms.* on another), not just one adapter's. None when no active adapter answers conformantly."""
+        actives = [a for a in store.active_adapters(workspace) if a.get("url")]
+        if not actives:
             return None
-        transport = NilTransport(
-            base_url=active["url"], bearer_secret=active.get("bearer", "") or ""
-        )
-        try:
-            report = await handshake(transport)
-        finally:
-            await transport.aclose()
-        if not report.get("reachable") or not report.get("conformant"):
+        verbs: list[str] = []
+        verb_details: list[dict[str, Any]] = []
+        targets: dict[str, Any] = {}
+        systems: list[str] = []
+        any_ok = False
+        for a in actives:
+            transport = NilTransport(base_url=a["url"], bearer_secret=a.get("bearer", "") or "")
+            try:
+                report = await handshake(transport)
+            finally:
+                await transport.aclose()
+            if not report.get("reachable") or not report.get("conformant"):
+                continue
+            any_ok = True
+            for vb in report.get("verbs", []) or []:
+                if vb not in verbs:
+                    verbs.append(vb)
+            verb_details.extend(report.get("verb_details", []) or [])
+            targets.update(report.get("targets", {}) or {})
+            if report.get("system"):
+                systems.append(str(report["system"]))
+        if not any_ok:
             return None
-        return report
+        return {
+            "reachable": True,
+            "conformant": True,
+            "nil": "0.1",
+            "system": "+".join(dict.fromkeys(systems)) or "multi",
+            "verbs": verbs,
+            "verb_details": verb_details,
+            "targets": targets,
+        }
 
     provider: SkeletonProvider = skeleton_provider or _live_skeleton
 
