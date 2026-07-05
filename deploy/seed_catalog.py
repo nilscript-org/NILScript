@@ -63,30 +63,54 @@ def _flow(entry: str, verb: str, with_map: dict) -> dict:
     ]}}
 
 
-# cycle_id -> (name_en, source).  sendmessagecycle + cyc_order already exist; we don't re-author them.
-CYCLES = {
-    "requestconfirmationcycle": ("Request confirmation", _flow(
-        "Ask", "comms.send_email",
-        {"to": "$to", "subject": "$subject", "body_md": "$body", "reply_token": "$order_ref"})),
-    "managecontactcycle": ("Add client", _flow(
-        "AddClient", "crm.create_client",
-        {"name": "$name", "phone": "$phone", "email": "$email"})),
-    "createproductcycle": ("Create product", _flow(
-        "AddProduct", "commerce.create_product",
-        {"name": "$name", "price": "$price", "sku": "$sku"})),
-    "issueinvoicecycle": ("Issue invoice", _flow(
-        "Invoice", "services.create_invoice",
-        {"client_id": "$client_id", "currency": "$currency", "description": "$description"})),
-    "recordpaymentcycle": ("Record payment", _flow(
-        "Pay", "commerce.record_payment",
-        {"invoice_id": "$invoice_id", "amount": "$amount", "method": "$method"})),
-    "recordpurchaseinvoicecycle": ("Record purchase invoice", _flow(
-        "PurchaseInvoice", "procurement.create_purchase_invoice",
-        {"supplier_id": "$supplier_id", "currency": "$currency"})),
-    # Stub for every not-yet-buildable capability — a single notify, never AI-exposed (fail-closed).
-    "cycpending": ("Pending adapter", {"flow": {"entry": "Pending", "steps": [
-        {"id": "Pending", "type": "notify", "text": "Capability pending its adapter/cycle."}]}}),
+def _plan(entry: str, verb: str, with_map: dict) -> dict:
+    """The EXECUTABLE plan the runner walks (auto['plan']) — a source.flow alone dispatches NOTHING
+    (the runner ignores it). `$field` in the with-map binds the prepared inputs as `$.input.field`;
+    `skill` is the verb's namespace (comms/crm/services/commerce/procurement)."""
+    args = {k: (f"$.input.{v[1:]}" if isinstance(v, str) and v.startswith("$") else v)
+            for k, v in with_map.items()}
+    return {
+        "wosool": "0.1", "workspace": WS, "locale": "ar", "entry": entry,
+        "pipeline": [{
+            "id": entry, "type": "action", "skill": verb.split(".", 1)[0], "verb": verb, "args": args,
+            "next": None, "retry_policy": None, "on_error": None, "compensate_with": None,
+        }],
+    }
+
+
+# cycle_id -> (name_en, entry, verb, with_map); both the executable plan and the .flow source derive.
+_CYCLE_SPECS = {
+    "sendmessagecycle": ("Send message", "Send", "comms.send_email",
+                         {"to": "$to", "subject": "$subject", "body_md": "$body"}),
+    "requestconfirmationcycle": ("Request confirmation", "Ask", "comms.send_email",
+                                 {"to": "$to", "subject": "$subject", "body_md": "$body", "reply_token": "$order_ref"}),
+    "managecontactcycle": ("Add client", "AddClient", "crm.create_client",
+                           {"name": "$name", "phone": "$phone", "email": "$email"}),
+    "createproductcycle": ("Create product", "AddProduct", "commerce.create_product",
+                           {"name": "$name", "price": "$price", "sku": "$sku"}),
+    "issueinvoicecycle": ("Issue invoice", "Invoice", "services.create_invoice",
+                          {"client_id": "$client_id", "currency": "$currency", "description": "$description"}),
+    "recordpaymentcycle": ("Record payment", "Pay", "commerce.record_payment",
+                           {"invoice_id": "$invoice_id", "amount": "$amount", "method": "$method"}),
+    "recordpurchaseinvoicecycle": ("Record purchase invoice", "PurchaseInvoice", "procurement.create_purchase_invoice",
+                                   {"supplier_id": "$supplier_id", "currency": "$currency"}),
 }
+
+
+# cycle_id -> (name_en, plan, source). Each has a REAL executable plan (the runner walks plan, NOT
+# the .flow) — an empty pipeline was why approved sends dispatched nothing. cyc_order already exists.
+CYCLES = {
+    cid: (name, _plan(entry, verb, wm), _flow(entry, verb, wm))
+    for cid, (name, entry, verb, wm) in _CYCLE_SPECS.items()
+}
+# Stub for every not-yet-buildable capability — a single notify, never AI-exposed (fail-closed).
+CYCLES["cycpending"] = (
+    "Pending adapter",
+    {"wosool": "0.1", "workspace": WS, "locale": "ar", "entry": "Pending", "pipeline": [
+        {"id": "Pending", "type": "notify", "message": {"en": "Pending its adapter/cycle.", "ar": "بانتظار المُحوِّل/الدورة."}, "next": None}]},
+    {"flow": {"entry": "Pending", "steps": [
+        {"id": "Pending", "type": "notify", "text": "Capability pending its adapter/cycle."}]}},
+)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -237,10 +261,11 @@ def seed(store) -> dict:
                                       state="published")
         store.set_strategy_state(WS, sid, reg["version"], "published")
 
-    # 2) implementing cycles (stubs + real single-action cycles)
-    for cid, (name_en, source) in CYCLES.items():
-        store.register_automation(workspace=WS, automation_id=cid, content_hash=f"cat-{cid}",
-                                  name={"en": name_en, "ar": name_en}, plan={"workspace": WS, "pipeline": []},
+    # 2) implementing cycles — REAL executable plan (the runner walks plan; an empty pipeline
+    # dispatched nothing, which is why approved sends never left the building).
+    for cid, (name_en, plan, source) in CYCLES.items():
+        store.register_automation(workspace=WS, automation_id=cid, content_hash=f"cat-{cid}-plan",
+                                  name={"en": name_en, "ar": name_en}, plan=plan,
                                   trigger={"type": "manual"}, state="active", kind="cycle", source=source)
 
     # 3) capabilities — register with the target state AND pin that state on the returned version
