@@ -523,6 +523,15 @@ def _single_surface() -> bool:
     )
 
 
+def _capability_first() -> bool:
+    """When on, the RAW-VERB surface is hidden from the agent: no nil_describe (verb/target lister),
+    no nil_commit / nil_plan (direct raw-verb writes). The agent's only action path is then the
+    capability plane (nil_discover → nil_prepare → …), and reads/graph stay on nil_intent. This
+    enforces 'the agent expresses intent, the code owns the action' — it can no longer freelance a
+    raw verb (e.g. see comms.send_whatsapp and declare email unsupported)."""
+    return os.environ.get("NIL_MCP_CAPABILITY_FIRST", "") not in ("", "0", "false", "False")
+
+
 def _register_tools(
     server: Any, provider: ToolsProvider, *, single_surface: bool = False
 ) -> None:
@@ -617,17 +626,21 @@ def _register_tools(
     # The single-surface keepers: discovery, the one intent payload, and the governance verbs the
     # approval/reversal flow needs. Everything else is SUBSUMED by nil_intent and hidden when
     # NIL_MCP_SINGLE_SURFACE is on — so the model sees ONE obvious tool, not a menu.
-    server.add_tool(
-        nil_describe,
-        name="nil_describe",
-        description="Discover the backend skeleton: the verbs and targets it actually exposes. No side effect.",
-    )
-    server.add_tool(
-        nil_commit,
-        name="nil_commit",
-        description="Execute a previously previewed proposal by its id. This is the ONLY tool that writes. "
-        "Idempotent: re-committing the same proposal replays, it never double-writes.",
-    )
+    capability_first = _capability_first()
+    if not capability_first:
+        # The RAW-VERB surface. Hidden in capability-first mode so the agent cannot enumerate or
+        # directly commit backend verbs — it must go through the capability plane instead.
+        server.add_tool(
+            nil_describe,
+            name="nil_describe",
+            description="Discover the backend skeleton: the verbs and targets it actually exposes. No side effect.",
+        )
+        server.add_tool(
+            nil_commit,
+            name="nil_commit",
+            description="Execute a previously previewed proposal by its id. This is the ONLY tool that writes. "
+            "Idempotent: re-committing the same proposal replays, it never double-writes.",
+        )
     server.add_tool(
         nil_intent,
         name="nil_intent",
@@ -643,18 +656,19 @@ def _register_tools(
         "Show policies → about='policy', seek='all'. Show business cycles → about='cycle', seek='all'. "
         "Update her phone → about='res.partner', where=[{attr:'name',rel:'contains',value:'دينا'}], change={op:'update', set:{phone:'…'}}.",
     )
-    server.add_tool(
-        nil_plan,
-        name="nil_plan",
-        description="Propose an ORDERED, LINKED dependent plan when a write needs a brand-NEW referenced "
-        "entity (e.g. invoice for a NEW client). `steps` is an ordered list; each step = {verb, args, "
-        "depends_on?: int (index of the prerequisite step), handoff?: {arg_field: \"$.step<i>.<field>\"}}. "
-        "The default handoff for a dependent create is the referenced FK ← the prerequisite's committed "
-        "id ($.step0.id). Only step 0 (the prerequisite) is proposed now and HELD as a card (even at "
-        "MEDIUM, because it belongs to a gated plan); dependents are registered as BLOCKED planned cards "
-        "and materialized on the prerequisite's commit — so the referenced id is real before the "
-        "dependent is validated. Use this instead of two separate writes when one references the other.",
-    )
+    if not capability_first:
+        server.add_tool(
+            nil_plan,
+            name="nil_plan",
+            description="Propose an ORDERED, LINKED dependent plan when a write needs a brand-NEW referenced "
+            "entity (e.g. invoice for a NEW client). `steps` is an ordered list; each step = {verb, args, "
+            "depends_on?: int (index of the prerequisite step), handoff?: {arg_field: \"$.step<i>.<field>\"}}. "
+            "The default handoff for a dependent create is the referenced FK ← the prerequisite's committed "
+            "id ($.step0.id). Only step 0 (the prerequisite) is proposed now and HELD as a card (even at "
+            "MEDIUM, because it belongs to a gated plan); dependents are registered as BLOCKED planned cards "
+            "and materialized on the prerequisite's commit — so the referenced id is real before the "
+            "dependent is validated. Use this instead of two separate writes when one references the other.",
+        )
     server.add_tool(
         nil_status,
         name="nil_status",
