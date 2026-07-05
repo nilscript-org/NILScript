@@ -47,6 +47,7 @@ from nilscript.capability import (
     validate_implements,
     wrap_cycle,
 )
+from nilscript.capability.derive import derive_from_skeleton
 from nilscript.controlplane import prepared as prepared_cards
 from nilscript.controlplane import strategy_exec
 from nilscript.controlplane.store import EventStore
@@ -956,22 +957,31 @@ def create_app(
         return {"ok": True, "workspace": workspace, "adapter_id": adapter_id}
 
     @app.post("/adapters/{workspace}/{adapter_id}/enable")
-    def enable_adapter(
+    async def enable_adapter(
         workspace: str,
         adapter_id: str,
         authorization: str | None = Header(default=None),
     ) -> Any:
         """Enable an adapter WITHOUT deactivating siblings — several can be active at once (e.g.
-        PocketBase + Odoo for a cross-system automation). Operator-gated."""
+        PocketBase + Odoo for a cross-system automation). Operator-gated. On enable we AUTO-DERIVE
+        fail-closed draft capabilities from the adapter's verbs (plug-and-play) — best-effort, so a
+        derivation hiccup never blocks activation."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if not store.set_adapter_active(workspace, adapter_id, True):
             return JSONResponse({"error": "no such adapter"}, status_code=404)
+        derived: list[str] = []
+        try:
+            result = await _derive_adapter_drafts(workspace, adapter_id)
+            derived = result.get("derived", [])
+        except Exception:  # noqa: BLE001 — derivation is a convenience, never a gate on activation
+            derived = []
         return {
             "ok": True,
             "workspace": workspace,
             "adapter_id": adapter_id,
             "active": True,
+            "derived_capabilities": derived,
         }
 
     @app.post("/adapters/{workspace}/{adapter_id}/disable")
@@ -1435,6 +1445,62 @@ def create_app(
             body=wrapped.capability.model_dump(by_alias=True, mode="json"),
         )
         return {"ok": True, "capability": capability_row, "strategy": strategy_row}
+
+    # ── Auto-derive (plan B8+): plug an adapter → a fail-closed draft capability per verb ─────────
+    def _covered_verbs(workspace: str) -> set[str]:
+        """Every verb some existing capability already implements (via its default cycle's action
+        steps). Auto-derivation SKIPS these so a curated catalog is never shadowed by generic drafts."""
+        covered: set[str] = set()
+        for cap_row in store.list_capabilities(workspace):
+            cycle_id = ((cap_row.get("body") or {}).get("implemented_by") or {}).get("default")
+            if not cycle_id:
+                continue
+            row = store.get_automation(workspace, cycle_slug(cycle_id))
+            for step in (((row or {}).get("source") or {}).get("flow") or {}).get("steps", []):
+                verb = step.get("use") if isinstance(step, dict) else None
+                if verb:
+                    covered.add(verb)
+        return covered
+
+    async def _derive_adapter_drafts(workspace: str, adapter_id: str) -> dict[str, Any]:
+        """Discover the adapter, synthesize a one-action cycle per uncovered verb, wrap each into a
+        fail-closed DRAFT capability + its strategy, and register them. Idempotent (same ids/hashes)."""
+        skeleton = await adapter_skeletons(workspace, adapter_id)
+        if skeleton is None:
+            return {"ok": False, "error": "adapter unreachable or non-conformant", "derived": []}
+        derived = derive_from_skeleton(workspace, skeleton, _covered_verbs(workspace))
+        registered: list[str] = []
+        for d in derived:
+            store.register_automation(
+                workspace=workspace, automation_id=d.cycle.cycle_id,
+                content_hash=f"auto-{d.verb}", name=d.cycle.intent.model_dump(mode="json"),
+                plan={"workspace": workspace, "pipeline": []}, trigger={"type": "manual"},
+                state="active", kind="cycle",
+                source=d.cycle.model_dump(by_alias=True, mode="json"),
+            )
+            store.register_strategy(
+                workspace=workspace, strategy_id=d.wrapped.strategy.strategy_id,
+                content_hash=strategy_content_hash(d.wrapped.strategy),
+                body=d.wrapped.strategy.model_dump(by_alias=True, mode="json"), state="published",
+            )
+            store.register_capability(
+                workspace=workspace, capability_id=d.wrapped.capability.capability_id,
+                content_hash=capability_content_hash(d.wrapped.capability),
+                body=d.wrapped.capability.model_dump(by_alias=True, mode="json"), state="draft",
+            )
+            registered.append(d.wrapped.capability.capability_id)
+        return {"ok": True, "adapter_id": adapter_id, "derived": registered}
+
+    @app.post("/adapters/{workspace}/{adapter_id}/derive")
+    async def derive_adapter_endpoint(
+        workspace: str, adapter_id: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Auto-derive fail-closed draft capabilities from one adapter's verbs. Operator-gated; the
+        drafts are ai=false until a human performs the governed publish/expose act."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        result = await _derive_adapter_drafts(workspace, adapter_id)
+        return result if result["ok"] else JSONResponse(result, status_code=502)
 
     # ── Prepared executions (plans B2+B3): prepare → sign(strategy) → commit ──────────────────
     def _prepared_refusal(refusal: dict[str, Any], status_code: int = 409, **extra: Any) -> Any:
