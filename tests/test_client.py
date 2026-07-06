@@ -202,6 +202,23 @@ async def test_status_round_trip() -> None:
 
 
 @respx.mock
+async def test_status_undecided_gate_state_parses_as_none_not_crash() -> None:
+    # A backend may report an undecided/never-recorded proposal (a governance gate not yet decided)
+    # with a state OUTSIDE ProposalState — e.g. the control-plane decision store returns "unknown"
+    # (also "pending"). That is NOT a verdict. The status poll must treat it as undecided (state=None)
+    # so the caller keeps waiting / PARKS — it must never raise and crash the whole run.
+    for undecided in ("unknown", "pending"):
+        respx.get(f"{BASE}/nil/v0.1/status/prop-0001").mock(
+            return_value=httpx.Response(
+                200,
+                json=server_envelope("STATUS", {"proposal": "prop-0001", "state": undecided}),
+            )
+        )
+        status = await make_client().status("prop-0001")
+        assert status.state is None, f"{undecided!r} should normalize to undecided (None)"
+
+
+@respx.mock
 async def test_malformed_server_answer_is_protocol_error() -> None:
     respx.post(f"{BASE}/nil/v0.1/propose").mock(
         return_value=httpx.Response(200, json={"weird": "shape"})
