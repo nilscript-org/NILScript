@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     state         TEXT    NOT NULL DEFAULT 'running',
     trace         TEXT,
     started_at    TEXT    NOT NULL,
-    ended_at      TEXT
+    ended_at      TEXT,
+    business_ref  TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_runs_auto ON automation_runs(workspace, automation_id, started_at DESC);
 
@@ -350,6 +351,11 @@ class EventStore:
                 self._conn.execute("ALTER TABLE events ADD COLUMN event_id TEXT")
             except sqlite3.OperationalError:
                 pass  # column already present
+            # business_ref: a run's human thread identity (PO-2026-00145) — see business-threads-plan.
+            try:
+                self._conn.execute("ALTER TABLE automation_runs ADD COLUMN business_ref TEXT")
+            except sqlite3.OperationalError:
+                pass
             try:
                 self._conn.execute(
                     "ALTER TABLE automations ADD COLUMN kind TEXT NOT NULL DEFAULT 'single'"
@@ -1584,9 +1590,12 @@ class EventStore:
                 "SELECT 1 FROM automation_runs WHERE run_id = ?", (run_id,)
             ).fetchone():
                 return False
+            started = _now()
+            business_ref = self._mint_business_ref(workspace, automation_id, started, run_id)
             self._conn.execute(
                 "INSERT INTO automation_runs (run_id, workspace, automation_id, version, "
-                "content_hash, fired_by, state, started_at) VALUES (?,?,?,?,?,?, 'running', ?)",
+                "content_hash, fired_by, state, started_at, business_ref) "
+                "VALUES (?,?,?,?,?,?, 'running', ?, ?)",
                 (
                     run_id,
                     workspace,
@@ -1594,11 +1603,34 @@ class EventStore:
                     version,
                     content_hash,
                     fired_by,
-                    _now(),
+                    started,
+                    business_ref,
                 ),
             )
             self._conn.commit()
         return True
+
+    # A run's human THREAD identity — PO-2026-00145, not cyc_order:v1:… (business-threads-plan.md).
+    # Prefix per automation; year from the start time; sequence = count-so-far + 1 for that automation.
+    _REF_PREFIXES = {"cyc_order": "PO", "sendmessagecycle": "MSG"}
+
+    def _mint_business_ref(
+        self, workspace: str, automation_id: str, started_at: str, run_id: str
+    ) -> str:
+        """Deterministic, human-friendly. FAIL-SAFE: any error falls back to run_id — minting a nice
+        label must NEVER block a run from starting (that would be a runtime outage for a cosmetic)."""
+        try:
+            n = self._conn.execute(
+                "SELECT COUNT(*) FROM automation_runs WHERE workspace = ? AND automation_id = ?",
+                (workspace, automation_id),
+            ).fetchone()[0]
+            prefix = self._REF_PREFIXES.get(automation_id) or (
+                "".join(ch for ch in automation_id.upper() if ch.isalnum())[:6] or "THR"
+            )
+            year = (started_at or "")[:4] or "0000"
+            return f"{prefix}-{year}-{int(n) + 1:05d}"
+        except Exception:  # noqa: BLE001 — never let a label mint fail the run
+            return run_id
 
     def finish_run(self, run_id: str, state: str, trace: dict[str, Any] | None) -> bool:
         """Close a run with its terminal state and the executor trace. Returns False if unknown."""
@@ -1621,7 +1653,7 @@ class EventStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT run_id, workspace, automation_id, version, content_hash, fired_by, state, "
-                "trace, started_at, ended_at FROM automation_runs WHERE run_id = ?",
+                "trace, started_at, ended_at, business_ref FROM automation_runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         if row is None:
@@ -1637,7 +1669,7 @@ class EventStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT run_id, workspace, automation_id, version, content_hash, fired_by, state, "
-                "started_at, ended_at FROM automation_runs "
+                "started_at, ended_at, business_ref FROM automation_runs "
                 "WHERE workspace = ? AND automation_id = ? ORDER BY started_at DESC LIMIT ?",
                 (workspace, automation_id, max(1, min(limit, 500))),
             ).fetchall()
