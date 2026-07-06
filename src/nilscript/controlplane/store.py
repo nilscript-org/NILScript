@@ -125,7 +125,8 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     trace         TEXT,
     started_at    TEXT    NOT NULL,
     ended_at      TEXT,
-    business_ref  TEXT
+    business_ref  TEXT,
+    correlation_id TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_runs_auto ON automation_runs(workspace, automation_id, started_at DESC);
 
@@ -354,6 +355,12 @@ class EventStore:
             # business_ref: a run's human thread identity (PO-2026-00145) — see business-threads-plan.
             try:
                 self._conn.execute("ALTER TABLE automation_runs ADD COLUMN business_ref TEXT")
+            except sqlite3.OperationalError:
+                pass
+            # correlation_id: the durable JOIN key every side-channel stamps so scattered events
+            # (comms replies, prepared cards, docs) find their thread — see business-threads-plan §3.
+            try:
+                self._conn.execute("ALTER TABLE automation_runs ADD COLUMN correlation_id TEXT")
             except sqlite3.OperationalError:
                 pass
             try:
@@ -1592,10 +1599,14 @@ class EventStore:
                 return False
             started = _now()
             business_ref = self._mint_business_ref(workspace, automation_id, started, run_id)
+            # correlation_id defaults to business_ref (business-threads-plan §4.1): the thread's
+            # durable join key. Later side-channels (comms reply-token, order_ref) correlate to it;
+            # the aggregator additionally reconciles against the run's context.order_ref.
+            correlation_id = business_ref
             self._conn.execute(
                 "INSERT INTO automation_runs (run_id, workspace, automation_id, version, "
-                "content_hash, fired_by, state, started_at, business_ref) "
-                "VALUES (?,?,?,?,?,?, 'running', ?, ?)",
+                "content_hash, fired_by, state, started_at, business_ref, correlation_id) "
+                "VALUES (?,?,?,?,?,?, 'running', ?, ?, ?)",
                 (
                     run_id,
                     workspace,
@@ -1605,6 +1616,7 @@ class EventStore:
                     fired_by,
                     started,
                     business_ref,
+                    correlation_id,
                 ),
             )
             self._conn.commit()
@@ -1653,7 +1665,8 @@ class EventStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT run_id, workspace, automation_id, version, content_hash, fired_by, state, "
-                "trace, started_at, ended_at, business_ref FROM automation_runs WHERE run_id = ?",
+                "trace, started_at, ended_at, business_ref, correlation_id "
+                "FROM automation_runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         if row is None:
@@ -1669,7 +1682,7 @@ class EventStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT run_id, workspace, automation_id, version, content_hash, fired_by, state, "
-                "started_at, ended_at, business_ref FROM automation_runs "
+                "started_at, ended_at, business_ref, correlation_id FROM automation_runs "
                 "WHERE workspace = ? AND automation_id = ? ORDER BY started_at DESC LIMIT ?",
                 (workspace, automation_id, max(1, min(limit, 500))),
             ).fetchall()
