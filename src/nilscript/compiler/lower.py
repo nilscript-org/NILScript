@@ -68,18 +68,31 @@ def _lower_control(step: CompiledStep, sid: str, nxt: str) -> object:
 
 def lower_to_flow(plan: CompiledPlan) -> Flow:
     """The plan's steps → a well-formed `Flow`. Linear: step i continues to step i+1, the last business
-    step to the terminal; approval/​wait reject/​timeout route to the terminal. Empty plan → just the
-    terminal (a no-op flow)."""
+    step to the terminal. A `wait` with an `escalate` message (§14.5a) routes its timeout to a
+    synthesized escalation notify (emit-and-halt), not the terminal — the non-linear branch cyc_order
+    needs. Empty plan → just the terminal (a no-op flow)."""
     n = len(plan.steps)
     nodes: list[object] = []
+    escalations: list[object] = []  # synthesized on-timeout escalation terminals, appended at the end
     for i, step in enumerate(plan.steps):
         sid = _step_id(i)
         nxt = _step_id(i + 1) if i + 1 < n else _TERMINAL_ID
         if step.kind == "effect":
             nodes.append(_lower_effect(step, sid, nxt))
+        elif step.control == "wait" and step.escalate is not None:
+            esc_id = f"Escalate{i + 1}"  # a distinct halt node this wait's timeout routes to
+            escalations.append(
+                NotifyStep(id=esc_id, type="notify", message=step.escalate, next=None)
+            )
+            nodes.append(WaitForEventStep(
+                id=sid, type="wait_for_event", on_event=step.event, match=dict(step.match),
+                timeout_seconds=step.timeout_seconds or _DEFAULT_TIMEOUT,
+                on_timeout=esc_id, next=nxt,
+            ))
         else:
             nodes.append(_lower_control(step, sid, nxt))
     # The terminal: a no-op notify that ends the flow, so every required target resolves.
     nodes.append(NotifyStep(id=_TERMINAL_ID, type="notify", message=_TERMINAL_MSG, next=None))
+    nodes.extend(escalations)
     entry = _step_id(0) if n else _TERMINAL_ID
     return Flow(entry=entry, steps=tuple(nodes))

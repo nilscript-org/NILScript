@@ -103,6 +103,7 @@ def _compile_control(step: ControlStep) -> CompiledStep:
         match=dict(step.match),
         timeout_seconds=step.timeout_seconds,
         message=step.message,
+        escalate=step.escalate,
         to=step.to,
     )
 

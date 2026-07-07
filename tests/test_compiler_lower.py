@@ -70,6 +70,29 @@ def test_notify_checkpoint_wait_lower_to_their_kernel_steps() -> None:
     assert wait.on_timeout == "Done" and wait.next == "Done"
 
 
+def test_wait_with_escalate_synthesizes_a_timeout_branch_not_the_terminal() -> None:
+    # §14.5a: the cyc_order shape — wait 7d, and if the supplier is silent, ESCALATE (notify) + halt.
+    # The business author gives a message; the COMPILER synthesizes the branch + target (no step ids in L2).
+    flow = lower_to_flow(_plan([
+        UseStep(use="crm.createLead"),
+        ControlStep(control="wait", event="mail.received", match={"order_ref": "$po"},
+                    timeout_seconds=604800, escalate={"en": "Supplier silent 7 days", "ar": "المورد صامت"}),
+        UseStep(use="crm.createLead"),
+    ]))
+    wait = next(s for s in flow.steps if isinstance(s, WaitForEventStep))
+    # Timeout routes to a SYNTHESIZED escalation step — NOT the shared terminal, and NOT the fall-through.
+    assert wait.on_timeout == "Escalate2" and wait.next == "Step3"
+    esc = next(s for s in flow.steps if s.id == "Escalate2")
+    assert isinstance(esc, NotifyStep) and esc.message.en == "Supplier silent 7 days" and esc.next is None
+
+
+def test_escalate_only_valid_on_wait() -> None:
+    import pytest as _pytest
+    from pydantic import ValidationError
+    with _pytest.raises(ValidationError, match="escalate is only valid on a wait"):
+        ControlStep(control="notify", message={"en": "x", "ar": "x"}, escalate={"en": "y", "ar": "y"})
+
+
 def test_empty_plan_lowers_to_a_terminal_only_flow() -> None:
     flow = lower_to_flow(_plan([UseStep(use="crm.createLead")]))  # non-empty baseline
     empty = lower_to_flow(compile_bizspec(

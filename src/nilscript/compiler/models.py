@@ -32,6 +32,7 @@ class CompiledStep:
     match: dict[str, Any] = field(default_factory=dict)
     timeout_seconds: int | None = None
     message: Any | None = None  # BilingualText for a notify step
+    escalate: Any | None = None  # BilingualText — a wait step's on-timeout escalation (§14.5a)
     to: str | None = None
 
 

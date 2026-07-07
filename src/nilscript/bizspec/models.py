@@ -60,6 +60,10 @@ class ControlStep(DslModel):
     event: str | None = None  # wait: the event name to park on
     match: dict[str, Any] = Field(default_factory=dict)  # wait: correlation keys ($var refs allowed)
     timeout_seconds: int | None = Field(default=None, ge=1, le=2_592_000)  # approval/wait SLA
+    # wait: the business escalation on timeout (§14.5a) — "if the deadline passes, emit this notice and
+    # halt". Business-level (a message, NOT a step id — L2 stays scaffolding-free per §11); the compiler
+    # synthesizes the branch + target. This is what makes cyc_order's 7-day supplier-silence route real.
+    escalate: BilingualText | None = None
     message: BilingualText | None = None  # notify: the bilingual message
     to: str | None = None  # checkpoint: the label
 
@@ -73,6 +77,8 @@ class ControlStep(DslModel):
             raise ValueError("a notify control step needs a message")
         if self.control == "checkpoint" and not self.to:
             raise ValueError("a checkpoint control step needs a `to` label")
+        if self.escalate is not None and self.control != "wait":
+            raise ValueError("escalate is only valid on a wait control step")
         return self
 
 
