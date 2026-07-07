@@ -2625,6 +2625,209 @@ def create_app(
             "rollback": plan_view,
         }
 
+    # ─── Wave 5.5 Business Discovery API Endpoints ─────────────────────────────────────
+
+    # In-memory session cache for discovery (production would use store)
+    _discovery_sessions: dict[str, Any] = {}
+
+    @app.post("/api/discovery/start")
+    async def discovery_start(req: Request) -> JSONResponse:
+        """Start a new business discovery session.
+
+        Request body: {workspace, domain_name, user_email}
+        Returns: {success, data: {session_id, phase, ...}}
+        """
+        try:
+            body = await req.json()
+            workspace = body.get("workspace", "default")
+            domain_name = body.get("domain_name", "")
+            user_email = body.get("user_email", "")
+
+            if not workspace or not domain_name or not user_email:
+                return JSONResponse(
+                    {"success": False, "error": "workspace, domain_name, and user_email required"},
+                    status_code=400,
+                )
+
+            from nilscript.hermes.business_discovery import BusinessDiscoverySession
+
+            session_id = str(uuid.uuid4())
+            session = BusinessDiscoverySession(
+                session_id=session_id,
+                workspace=workspace,
+                domain_name=domain_name,
+                user_email=user_email,
+            )
+            _discovery_sessions[session_id] = session
+            state = session.get_current_state()
+            return JSONResponse({"success": True, "data": state})
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.post("/api/discovery/answer")
+    async def discovery_answer(req: Request) -> JSONResponse:
+        """Submit an answer for the current discovery phase.
+
+        Request body: {session_id, phase, answer}
+        Returns: {success, data: {phase_accepted, next_phase}}
+        """
+        try:
+            body = await req.json()
+            session_id = body.get("session_id", "")
+            phase = body.get("phase", "")
+            answer = body.get("answer", "")
+
+            if not session_id or not phase or not answer:
+                return JSONResponse(
+                    {"success": False, "error": "session_id, phase, and answer required"},
+                    status_code=400,
+                )
+
+            if session_id not in _discovery_sessions:
+                return JSONResponse(
+                    {"success": False, "error": f"Session {session_id} not found"},
+                    status_code=404,
+                )
+
+            session = _discovery_sessions[session_id]
+            valid_phases = ("intro", "actors", "systems", "documents", "events", "rules", "review")
+
+            if phase not in valid_phases:
+                return JSONResponse(
+                    {"success": False, "error": f"Invalid phase: {phase}"},
+                    status_code=400,
+                )
+
+            session.record_answer(phase, answer)
+            phase_order = [
+                "intro",
+                "actors",
+                "systems",
+                "documents",
+                "events",
+                "rules",
+                "review",
+            ]
+            current_idx = phase_order.index(phase)
+            next_phase = (
+                phase_order[current_idx + 1]
+                if current_idx + 1 < len(phase_order)
+                else "complete"
+            )
+
+            session.set_phase(next_phase)
+            if next_phase == "complete":
+                session.mark_complete()
+
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "phase_accepted": phase,
+                        "next_phase": next_phase,
+                        "session_id": session_id,
+                    },
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/api/discovery/status")
+    async def discovery_status(session_id: str = "") -> JSONResponse:
+        """Get current status of a discovery session.
+
+        Query param: session_id
+        Returns: {success, data: {session_id, phase, is_complete, ...}}
+        """
+        try:
+            if not session_id:
+                return JSONResponse(
+                    {"success": False, "error": "session_id required"},
+                    status_code=400,
+                )
+
+            if session_id not in _discovery_sessions:
+                return JSONResponse(
+                    {"success": False, "error": f"Session {session_id} not found"},
+                    status_code=404,
+                )
+
+            session = _discovery_sessions[session_id]
+            state = session.get_current_state()
+            return JSONResponse({"success": True, "data": state})
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/api/discovery/specification")
+    async def discovery_specification(session_id: str = "") -> JSONResponse:
+        """Retrieve extracted BusinessSpecification from completed session.
+
+        Query param: session_id
+        Returns: {success, data: {specification: {...}}}
+        """
+        try:
+            if not session_id:
+                return JSONResponse(
+                    {"success": False, "error": "session_id required"},
+                    status_code=400,
+                )
+
+            if session_id not in _discovery_sessions:
+                return JSONResponse(
+                    {"success": False, "error": f"Session {session_id} not found"},
+                    status_code=404,
+                )
+
+            session = _discovery_sessions[session_id]
+
+            if not session.is_complete():
+                return JSONResponse(
+                    {
+                        "success": False,
+                        "error": "Session is not yet complete. Continue with discovery phases.",
+                    },
+                    status_code=400,
+                )
+
+            from nilscript.hermes.business_discovery import extract_structured_specification
+
+            try:
+                answers = session.get_answers()
+                intent = answers.get("intro", "Business process automation")
+                spec = extract_structured_specification(session, intent)
+                spec_data = spec.model_dump(mode="json")
+
+                return JSONResponse(
+                    {
+                        "success": True,
+                        "data": {
+                            "specification": spec_data,
+                        },
+                    }
+                )
+            except ValueError as ve:
+                return JSONResponse(
+                    {
+                        "success": False,
+                        "error": f"Specification extraction failed: {str(ve)}",
+                    },
+                    status_code=400,
+                )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         return _INDEX_HTML
