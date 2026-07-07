@@ -244,3 +244,51 @@ def test_strategy_endpoint_reserved_form_refusal_passes_through():
     assert res.status_code == 400
     assert "V9_UNSUPPORTED_FORM" in res.json()["error"]
     assert res.json()["line"] == 3
+
+
+# --- Wave 4 §14.2b: registry-gate on the register endpoint (DAG the model can't catch) -----------
+
+
+def _dep_cap(cid: str, *, requires=(), workspace: str = "acme", version: str = "1.0") -> dict:
+    return {
+        "nil": "capability/0.1",
+        "capability_id": cid,
+        "workspace": workspace,
+        "version": version,
+        "domain": "Finance",
+        "owner_role": "Finance",
+        "intent": {"ar": "س", "en": "x"},
+        "risk": "MEDIUM",
+        "strategy": "FinanceThreshold",
+        "requires": list(requires),
+        "implemented_by": {"default": "GenericCycle"},
+    }
+
+
+def test_registry_gate_rejects_a_dependency_cycle():
+    c = _client()
+    # A requires B — fine while B is unknown (the edge only forms once B exists).
+    assert c.post("/capabilities", json={"capability": _dep_cap("CapA", requires=["CapB"])}).status_code == 200
+    # Registering B (requires A) closes the loop A→B→A — the gate refuses with a witness.
+    res = c.post("/capabilities", json={"capability": _dep_cap("CapB", requires=["CapA"])})
+    assert res.status_code == 409
+    body = res.json()
+    assert body["error"] == "registry invariant violation"
+    assert any(v["code"] == "dependency_cycle" for v in body["violations"])
+    # And B was NOT stored — the registry stays acyclic.
+    assert c.get("/capabilities", params={"workspace": "acme"}).json()["capabilities"]  # A only
+    assert all(cap["capability_id"] != "CapB"
+               for cap in c.get("/capabilities", params={"workspace": "acme"}).json()["capabilities"])
+
+
+def test_registry_gate_allows_acyclic_dependencies():
+    c = _client()
+    assert c.post("/capabilities", json={"capability": _dep_cap("CapBase")}).status_code == 200
+    assert c.post("/capabilities", json={"capability": _dep_cap("CapDependent", requires=["CapBase"])}).status_code == 200
+
+
+def test_registry_gate_allows_supersede_of_same_id():
+    # Re-registering an id with new content must NOT self-collide (candidate replaces its own version).
+    c = _client()
+    assert c.post("/capabilities", json={"capability": _dep_cap("CapX")}).status_code == 200
+    assert c.post("/capabilities", json={"capability": _dep_cap("CapX", version="1.1")}).status_code == 200

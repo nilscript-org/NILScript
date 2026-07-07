@@ -48,6 +48,7 @@ from nilscript.capability import (
     wrap_cycle,
 )
 from nilscript.capability.derive import derive_from_skeleton
+from nilscript.capability.registry import validate_registry
 from nilscript.controlplane import prepared as prepared_cards
 from nilscript.controlplane import strategy_exec
 from nilscript.controlplane.store import EventStore
@@ -95,6 +96,41 @@ def _plan_scopes(plan: dict[str, Any]) -> frozenset[str]:
             scopes.add(verb)
             scopes.add(verb.split(".", 1)[0] + ".*")
     return frozenset(scopes) or frozenset({"*"})
+
+
+def _registry_gate(store: Any, capability: Capability) -> "JSONResponse | None":
+    """Wave 4 §14.2b registry gate. Returns a 409 refusal if registering `capability` would INTRODUCE a
+    new registry-level violation (bad SemVer, or a dependency cycle with other capabilities), else None.
+    The candidate REPLACES its own id (register supersedes), so we validate `others + candidate` and
+    block only the NEW violations — a legitimate supersede never self-collides, and a pre-existing
+    registry issue never fails an unrelated registration. Fails OPEN on an unexpected internal error: a
+    governance gate must never brick the registry on its own bug."""
+    try:
+        others = [
+            {**(row.get("body") or {}), "content_hash": row.get("content_hash", "")}
+            for row in store.list_capabilities(capability.workspace)
+            if row.get("capability_id") != capability.capability_id
+        ]
+        candidate = {
+            **capability.model_dump(by_alias=True, mode="json"),
+            "content_hash": capability_content_hash(capability),
+        }
+        before = set(validate_registry(others))
+        new = [v for v in validate_registry([*others, candidate]) if v not in before]
+    except Exception as exc:  # noqa: BLE001 — never let the gate itself block a valid registration
+        print(f"[registry-gate] errored, allowing registration: {exc}", flush=True)
+        return None
+    if not new:
+        return None
+    return JSONResponse(
+        {
+            "error": "registry invariant violation",
+            "violations": [
+                {"code": v.code, "capability_id": v.capability_id, "detail": v.detail} for v in new
+            ],
+        },
+        status_code=409,
+    )
 
 
 # An async source of a workspace's live adapter skeleton ({verbs, targets, ...}), or None when there
@@ -1287,6 +1323,15 @@ def create_app(
         capability, cap_err = _capability_from_body(body or {})
         if cap_err is not None:
             return cap_err
+        # Registry-level gate (Wave 4 §14.2b / Encaps D7): the candidate must not INTRODUCE a
+        # SemVer or dependency-DAG violation into the workspace registry. The candidate REPLACES its
+        # own id (register supersedes), so we validate `others + candidate` and block only the NEW
+        # violations — a pre-existing registry issue never fails an unrelated registration, and a
+        # legitimate supersede (same body SemVer, new content) never self-collides. Fuller canonical
+        # enforcement (re-own / same-version fork) lands once SemVer-per-change is enforced.
+        gate_err = _registry_gate(store, capability)
+        if gate_err is not None:
+            return gate_err
         stored = store.register_capability(
             workspace=capability.workspace,
             capability_id=capability.capability_id,
