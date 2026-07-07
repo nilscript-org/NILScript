@@ -249,3 +249,54 @@ async def test_wait_for_event_deadline_routes_and_trace_completes(tmp_path):
     by_id = {n["node_id"]: n for n in final["trace"]["nodes"]}
     assert by_id["step_2"]["status"] == "completed"  # the wait advanced on the deadline
     assert by_id["step_3"]["status"] == "completed"  # the on_timeout branch ran
+
+
+# ── D1: a crashed run must PRESERVE its partial node trace (not a 0-node "failed" run) ───────────
+
+
+class _BoomClient:
+    """A backend whose verb raises an unexpected exception mid-walk (the class of failure that used
+    to escape the executor and discard the whole node trace — e.g. the StatusBody enum crash)."""
+
+    async def query(self, verb, args=None):
+        raise RuntimeError("adapter exploded")
+
+
+_BOOM_PLAN = {
+    "wosool": "0.1",
+    "workspace": "acme",
+    "entry": "step_1",
+    "pipeline": [
+        {"id": "step_1", "type": "query", "verb": "crm.list", "args": {}, "next": "step_2"},
+        {"id": "step_2", "type": "notify", "message": {"ar": "تم", "en": "done"}},
+    ],
+}
+
+
+async def test_crashed_run_preserves_partial_trace(tmp_path):
+    """An unexpected runner failure is recorded as a FAILED run WITH its partial trace: the failing
+    node is present and marked `failed`, the error is surfaced, and ok stays False (D1)."""
+    store = _armed_store(tmp_path, _BOOM_PLAN, name="boom.db")
+    fired = await fire_manual(
+        store, workspace="acme", automation_id="cyc",
+        idempotency_key="k1", runner=_runner(_BoomClient()),
+    )
+    assert fired["ok"] is False  # a failed run stays ok:False (prepared-commit callers key on this)
+
+    run = fired["run"]
+    assert run["state"] == "failed"
+    nodes = run["trace"]["nodes"]
+    assert len(nodes) == 1, nodes  # step_1 WAS walked and recorded — the trace is NOT discarded
+    assert nodes[0]["node_id"] == "step_1"
+    assert nodes[0]["status"] == "failed"  # the failing node is marked, not left "running"
+    assert "exploded" in (nodes[0]["error"] or "")
+    assert "exploded" in (run["trace"]["error"] or "")  # surfaced (os-server _run_error reads it)
+
+
+async def test_executor_returns_failed_result_not_raise(tmp_path):
+    """At the executor boundary: an unexpected exception returns a failed RunResult (with the
+    partial trace + error), it does not propagate and lose everything."""
+    result = await _executor(_BoomClient(), run_id="r1").execute(_BOOM_PLAN)
+    assert result.completed is False
+    assert result.error is not None and "exploded" in result.error
+    assert len(result.trace_nodes) == 1 and result.trace_nodes[0]["status"] == "failed"

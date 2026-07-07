@@ -44,6 +44,8 @@ def _classify(result: RunResult) -> str:
     `compensated`; a halt at a node is `blocked`; anything else partial is `partial`."""
     if result.completed:
         return "completed"
+    if result.error is not None:
+        return "failed"  # the executor caught an unexpected runner failure (trace preserved) — D1
     if result.waiting is not None:
         return "waiting_event" if result.waiting.get("kind") == "event" else "waiting_approval"
     if result.compensated:
@@ -96,6 +98,7 @@ def _trace(result: RunResult, prior_nodes: list[dict[str, Any]] | None = None) -
         "partial": result.partial,
         "blocked_at": result.blocked_at,
         "refusal": result.refusal,
+        "error": result.error,  # runner-failure message (D1); os-server surfaces it on the timeline
         "compensated": result.compensated,
         "notifications": result.notifications,
         "context": result.context,
@@ -217,11 +220,17 @@ async def fire_manual(
         # `input` binds as the run's $.input (a prepared execution's seeded inputs). Passed only
         # when present so existing runner fakes with narrower signatures stay valid.
         result = await runner(auto["plan"], run_id=run_id, **({"input": input} if input else {}))
-    except Exception as exc:  # noqa: BLE001 — a runner blow-up is a failed run, recorded honestly
-        store.finish_run(run_id, "failed", {"error": str(exc)})
+    except Exception as exc:  # noqa: BLE001 — a runner blow-up that ESCAPED the executor (setup
+        # error, non-executor runner). The executor now catches its own mid-walk failures and returns
+        # a failed RunResult with the partial trace (below); this stays as a last-resort.
+        store.finish_run(run_id, "failed", {"error": str(exc), "nodes": []})
         return {"ok": False, "error": str(exc), "status": 500, "run": store.get_run(run_id)}
 
     _record(store, run_id, result, workspace=workspace, automation_id=automation_id, version=version)
+    # A failure the executor CAUGHT (trace preserved) is still ok:False — callers like the prepared
+    # commit path key on `ok` to decide whether the effect happened (D1: honest without losing history).
+    if getattr(result, "error", None) is not None:
+        return {"ok": False, "error": result.error, "status": 500, "run": store.get_run(run_id)}
     return {"ok": True, "run": store.get_run(run_id)}
 
 

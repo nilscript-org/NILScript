@@ -76,6 +76,10 @@ class RunResult:
     # caller MERGES each segment's nodes into the persisted run trace (`trace["nodes"]`) so a
     # resumed run advances the same list rather than overwriting it — restart-safe, row-backed.
     trace_nodes: list[dict[str, Any]] = field(default_factory=list)
+    # An unexpected runner failure the executor CAUGHT mid-walk. When set, the run FAILED — but the
+    # partial `trace_nodes` above are preserved (the failing node is marked `failed`), and this
+    # carries the human-facing message. (D1: a crash must never discard the run's timeline.)
+    error: str | None = None
 
 
 # The exact JSON shape of one entry in `RunResult.trace_nodes` / persisted `trace["nodes"]`.
@@ -292,6 +296,18 @@ class LocalExecutor:
                 checkpoints=self._checkpoints,
                 trace_nodes=self._trace_nodes,
             )
+        except Exception as exc:  # noqa: BLE001 — an unexpected runner failure is a FAILED run,
+            # recorded HONESTLY WITH its partial node trace (D1). `_walk` already marked the failing
+            # node `failed`; we preserve the accumulated trace instead of letting the exception
+            # escape `run()` and discard it (which produced 0-node "failed" runs / empty timelines).
+            return RunResult(
+                completed=False,
+                context=self._ctx,
+                notifications=self._notifications,
+                checkpoints=self._checkpoints,
+                trace_nodes=self._trace_nodes,
+                error=str(exc),
+            )
         return RunResult(
             completed=True,
             context=self._ctx,
@@ -370,6 +386,12 @@ class LocalExecutor:
                 entry["status"] = "failed"
                 entry["ended_at"] = self._now()
                 entry["error"] = halt.code
+                raise
+            except Exception as exc:  # noqa: BLE001 — mark WHERE the run died so the timeline shows
+                # the failed node (not a blank trace), then re-raise for `run()` to record the failure.
+                entry["status"] = "failed"
+                entry["ended_at"] = self._now()
+                entry["error"] = str(exc)
                 raise
             entry["status"] = "completed"
             entry["ended_at"] = self._now()
