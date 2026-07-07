@@ -2050,23 +2050,56 @@ def create_app(
             if isinstance(flow_data, str):
                 flow_data = json.loads(flow_data)
 
-            # TODO (Wave 4 Phase 3): Instantiate LocalExecutor with D8 governance routing
-            # The backend_bindings map verbs to adapters for governed capability invocation.
-            # Real impl would:
-            # 1. Use GovernedRoutingNilClient with backend_bindings
-            # 2. Walk the flow graph
-            # 3. Return execution result with trace
+            # Wave 4 Phase 3: Instantiate LocalExecutor with D8 governance routing
+            from nilscript.kernel.executor import LocalExecutor
+            from nilscript.sdk.routing import GovernedRoutingNilClient
 
-            # For now, return a placeholder execution result
-            # This endpoint structure is ready; implementation follows when executor is wired
-            result = {
-                "execution_id": f"exec-{uuid.uuid4().hex[:12]}",
-                "status": "pending",
-                "domain_id": domain_id,
-                "output": None,
-                "error": None,
+            execution_id = f"exec-{uuid.uuid4().hex[:12]}"
+
+            # Parse backend_bindings if string
+            if isinstance(backend_bindings, str):
+                backend_bindings = json.loads(backend_bindings) if backend_bindings else {}
+
+            # Build adapter clients dict (in production, would load from workspace config)
+            adapter_clients = {
+                "odoo": None,  # Placeholder; real impl loads from workspace
+                "mock": None,  # For testing
             }
-            return result
+
+            try:
+                # Instantiate executor with governed routing
+                executor = LocalExecutor.from_governed(
+                    domain_id=domain_id,
+                    backend_bindings=backend_bindings,
+                    adapter_clients=adapter_clients,
+                )
+
+                # Execute the flow
+                exec_result = executor.execute(
+                    program=flow_data,
+                    args=args,
+                    execution_id=execution_id,
+                    workspace=ws,
+                )
+
+                # Return actual execution result
+                return {
+                    "execution_id": execution_id,
+                    "status": exec_result.get("status", "completed"),
+                    "domain_id": domain_id,
+                    "output": exec_result.get("output"),
+                    "error": exec_result.get("error"),
+                    "trace": exec_result.get("trace"),
+                }
+
+            except Exception as e:
+                return {
+                    "execution_id": execution_id,
+                    "status": "error",
+                    "domain_id": domain_id,
+                    "output": None,
+                    "error": f"Execution failed: {str(e)}",
+                }
 
         except Exception as e:
             return JSONResponse(
