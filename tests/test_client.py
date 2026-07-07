@@ -123,6 +123,20 @@ async def test_commit_reuses_key_as_sentence_id_and_surfaces_replay() -> None:
 
 
 @respx.mock
+async def test_commit_out_of_enum_state_parses_as_none_not_crash() -> None:
+    # D2-sibling: a backend answering a COMMIT with a non-ProposalState value must normalize to
+    # undecided (state=None), never raise a ValidationError that crashes the run.
+    respx.post(f"{BASE}/nil/v0.1/commit").mock(
+        return_value=httpx.Response(
+            200, json=server_envelope("STATUS", {"proposal": "prop-0001", "state": "unknown"})
+        )
+    )
+    outcome = await make_client().commit("prop-0001", idempotency_key="c" * 64)
+    assert isinstance(outcome, StatusBody)
+    assert outcome.state is None
+
+
+@respx.mock
 async def test_commit_refusal_returns_proposal_body() -> None:
     respx.post(f"{BASE}/nil/v0.1/commit").mock(
         return_value=httpx.Response(

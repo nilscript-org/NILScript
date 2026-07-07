@@ -149,7 +149,9 @@ class NilClient:
             answer, {Performative.STATUS, Performative.PROPOSAL}
         )
         if performative is Performative.STATUS:
-            return StatusBody.model_validate(body)
+            # Normalize an out-of-enum state to None here too (D2-sibling of status()): a backend
+            # that answers a commit with a non-ProposalState value must not crash the run.
+            return StatusBody.model_validate(_normalize_status_state(body))
         return ProposalBody.model_validate(body)
 
     async def query(
