@@ -27,7 +27,11 @@ class CompiledStep:
     # control fields (None on effect steps):
     control: str | None = None
     strategy: str | None = None
+    approver: str | None = None
     event: str | None = None
+    match: dict[str, Any] = field(default_factory=dict)
+    timeout_seconds: int | None = None
+    message: Any | None = None  # BilingualText for a notify step
     to: str | None = None
 
 

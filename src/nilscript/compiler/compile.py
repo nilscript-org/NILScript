@@ -98,7 +98,11 @@ def _compile_control(step: ControlStep) -> CompiledStep:
         kind="control",
         control=step.control,
         strategy=step.strategy,
+        approver=step.approver,
         event=step.event,
+        match=dict(step.match),
+        timeout_seconds=step.timeout_seconds,
+        message=step.message,
         to=step.to,
     )
 

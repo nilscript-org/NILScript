@@ -18,8 +18,8 @@ from typing import Any, Literal
 from pydantic import Field, model_validator
 
 from nilscript.capability.models import IDENT_PATTERN
-from nilscript.cycle.models import PolicyTier
-from nilscript.kernel.models import DslModel
+from nilscript.cycle.models import VAR_PATTERN, PolicyTier
+from nilscript.kernel.models import BilingualText, DslModel
 
 # A skill call site: `alias.skill` (two identifiers). The alias resolves through the Domain's imports;
 # the skill is the capability's public operation. This is a SHAPE check only — that the reference names
@@ -38,7 +38,7 @@ class UseStep(DslModel):
     use: str  # "alias.skill" — resolved through the Domain
     args: dict[str, Any] = Field(default_factory=dict)
     via: str | None = None  # explicit verb disambiguation, checked against the Skill's candidates
-    bind: str | None = Field(default=None, pattern=IDENT_PATTERN)  # output name, e.g. `bind: po`
+    bind: str | None = Field(default=None, pattern=VAR_PATTERN)  # output var, e.g. `bind: po` → `$po`
 
     @model_validator(mode="after")
     def _use_has_skill_call_shape(self) -> UseStep:
@@ -48,13 +48,20 @@ class UseStep(DslModel):
 
 
 class ControlStep(DslModel):
-    """A control-flow primitive — explicit, never a capability (D4). `strategy` applies to `approval`;
-    `event` to `wait`; `to` (checkpoint label) is free-form. Kept minimal in v0.1."""
+    """A control-flow primitive — explicit, never a capability (D4). Carries only BUSINESS-level fields;
+    the runtime scaffolding a runnable cycle needs (step ids, `next`-chaining, on_approve/on_timeout
+    targets, the Flow entry) is SYNTHESIZED by the compiler, never authored here (§11 — L2 has no runtime
+    detail). Per kind: `approval` → strategy (+ optional approver/timeout); `wait` → event (+ optional
+    match/timeout); `notify` → message; `checkpoint` → `to` label."""
 
     control: ControlKind
     strategy: str | None = Field(default=None, pattern=IDENT_PATTERN)  # approval strategy ref
-    event: str | None = None  # for wait: the event name to park on
-    to: str | None = None  # for checkpoint: the label
+    approver: str | None = Field(default=None, min_length=1)  # approval: the business actor/role
+    event: str | None = None  # wait: the event name to park on
+    match: dict[str, Any] = Field(default_factory=dict)  # wait: correlation keys ($var refs allowed)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=2_592_000)  # approval/wait SLA
+    message: BilingualText | None = None  # notify: the bilingual message
+    to: str | None = None  # checkpoint: the label
 
     @model_validator(mode="after")
     def _shape_matches_kind(self) -> ControlStep:
@@ -62,6 +69,10 @@ class ControlStep(DslModel):
             raise ValueError("an approval control step needs a strategy")
         if self.control == "wait" and not self.event:
             raise ValueError("a wait control step needs an event")
+        if self.control == "notify" and self.message is None:
+            raise ValueError("a notify control step needs a message")
+        if self.control == "checkpoint" and not self.to:
+            raise ValueError("a checkpoint control step needs a `to` label")
         return self
 
 
