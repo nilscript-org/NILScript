@@ -70,7 +70,10 @@ def lower_to_flow(plan: CompiledPlan) -> Flow:
     """The plan's steps → a well-formed `Flow`. Linear: step i continues to step i+1, the last business
     step to the terminal. A `wait` with an `escalate` message (§14.5a) routes its timeout to a
     synthesized escalation notify (emit-and-halt), not the terminal — the non-linear branch cyc_order
-    needs. Empty plan → just the terminal (a no-op flow)."""
+    needs. Empty plan → just the terminal (a no-op flow).
+
+    NEW: Also carries domain_id and backend_bindings from the CompiledPlan (D8 governance) so the
+    runtime can select GovernedRoutingNilClient when needed."""
     n = len(plan.steps)
     nodes: list[object] = []
     escalations: list[object] = []  # synthesized on-timeout escalation terminals, appended at the end
@@ -95,4 +98,9 @@ def lower_to_flow(plan: CompiledPlan) -> Flow:
     nodes.append(NotifyStep(id=_TERMINAL_ID, type="notify", message=_TERMINAL_MSG, next=None))
     nodes.extend(escalations)
     entry = _step_id(0) if n else _TERMINAL_ID
-    return Flow(entry=entry, steps=tuple(nodes))
+    return Flow(
+        entry=entry,
+        steps=tuple(nodes),
+        domain_id=plan.domain,  # Carry domain from compiled plan
+        backend_bindings=dict(plan.backend_bindings) if plan.backend_bindings else None,  # D8 bindings
+    )

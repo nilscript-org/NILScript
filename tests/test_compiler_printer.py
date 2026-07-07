@@ -34,7 +34,7 @@ DOMAIN = Domain(nil="domain/0.1", domain_id="Procurement", workspace="acme",
 
 
 def _plan():
-    spec = BizSpec(nil="bizspec/0.1", domain="Procurement", intent="reorder low stock", steps=(
+    spec = BizSpec(nil="bizspec/0.1", domain_id="Procurement", intent="reorder low stock", steps=(
         UseStep(use="crm.createLead", args={"name": "$who", "src": "web"}, bind="lead"),
         ControlStep(control="approval", strategy="OwnerApprove"),
         UseStep(use="comms.notify"),

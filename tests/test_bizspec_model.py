@@ -12,7 +12,7 @@ from nilscript.bizspec import BizSpec, BizSpecPolicies, ControlStep, UseStep
 
 
 def _spec(steps, *, domain="Procurement", intent="reorder low stock") -> BizSpec:
-    return BizSpec(nil="bizspec/0.1", domain=domain, intent=intent, steps=tuple(steps))
+    return BizSpec(nil="bizspec/0.1", domain_id=domain, intent=intent, steps=tuple(steps))
 
 
 # ── UseStep (effects) ─────────────────────────────────────────────────────────────────────────────
@@ -66,7 +66,7 @@ def test_bizspec_requires_at_least_one_step() -> None:
 def test_bizspec_policies_default_and_set() -> None:
     assert _spec([UseStep(use="Inventory.check")]).policies == BizSpecPolicies()
     spec = BizSpec(
-        nil="bizspec/0.1", domain="Finance", intent="pay",
+        nil="bizspec/0.1", domain_id="Finance", intent="pay",
         steps=(UseStep(use="Payments.pay"),),
         policies=BizSpecPolicies(tier_floor="HIGH", sod_preparer_not_approver=True),
     )

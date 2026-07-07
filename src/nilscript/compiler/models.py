@@ -48,9 +48,10 @@ class CompiledEnvelope:
 
 @dataclass(frozen=True)
 class CompiledPlan:
-    """A compiled cycle: the domain it ran in, its lowered steps, and the aggregate envelope."""
+    """A compiled cycle: the domain it ran in, its lowered steps, backend bindings (D8), and the aggregate envelope."""
 
     domain: str
     intent: str
     steps: tuple[CompiledStep, ...]
     envelope: CompiledEnvelope
+    backend_bindings: dict[str, str] = field(default_factory=dict)  # capability name -> backend address

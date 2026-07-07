@@ -136,10 +136,12 @@ def _aggregate_envelope(used_skills: list, floor_tier: str | None) -> CompiledEn
 def compile_bizspec(spec: BizSpec, domain: Domain, registry: list[Capability]) -> CompiledPlan:
     """Lower a BizSpec to a CompiledPlan under a Domain + registry. Deterministic; raises CompileRefusal
     on any unresolved reference (I2 — never a partial plan). Also validates that the capabilities the
-    plan actually uses form no dependency cycle (a subset guard on top of the registry-level DAG gate)."""
-    if spec.domain != domain.domain_id:
+    plan actually uses form no dependency cycle (a subset guard on top of the registry-level DAG gate).
+
+    Extracts backend bindings from the Domain and includes them in the CompiledPlan."""
+    if spec.domain_id != domain.domain_id:
         raise CompileRefusal(
-            "DOMAIN_MISMATCH", f"spec targets {spec.domain!r} but domain is {domain.domain_id!r}"
+            "DOMAIN_MISMATCH", f"spec targets {spec.domain_id!r} but domain is {domain.domain_id!r}"
         )
 
     compiled_steps: list[CompiledStep] = []
@@ -160,10 +162,17 @@ def compile_bizspec(spec: BizSpec, domain: Domain, registry: list[Capability]) -
     if dag:
         raise CompileRefusal("DEPENDENCY_CYCLE", dag[0].detail)
 
+    # Extract backend bindings from the Domain (D8)
+    backend_bindings = {
+        binding.capability: binding.backend
+        for binding in domain.bindings
+    }
+
     envelope = _aggregate_envelope(used_envelopes, spec.policies.tier_floor)
     return CompiledPlan(
         domain=domain.domain_id,
         intent=spec.intent,
         steps=tuple(compiled_steps),
         envelope=envelope,
+        backend_bindings=backend_bindings,
     )

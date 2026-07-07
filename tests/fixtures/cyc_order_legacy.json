@@ -1,0 +1,94 @@
+{
+  "id": "cyc_order",
+  "name": "Purchase Order Cycle (Live Legacy)",
+  "version": "0.1.0",
+  "domain": "Procurement",
+  "workspace": "ws_acme",
+  "intent": {
+    "en": "procure to pay",
+    "ar": "الشراء حتى الدفع"
+  },
+  "governance": "HIGH IRREVERSIBLE",
+  "steps": [
+    {
+      "step_id": "step_1",
+      "type": "action",
+      "capability_name": "resource.read",
+      "capability_version": "1.0.0",
+      "args": {
+        "resource_type": "purchase_order"
+      },
+      "output_alias": "po"
+    },
+    {
+      "step_id": "step_2",
+      "type": "approval",
+      "gate_name": "OwnerApprove",
+      "participants": ["owner"],
+      "description": "Owner must approve the purchase order"
+    },
+    {
+      "step_id": "step_3",
+      "type": "wait_for_event",
+      "event_name": "mail.received",
+      "match": {
+        "order_ref": "$po"
+      },
+      "timeout_seconds": 604800,
+      "on_timeout_next": "step_5",
+      "escalation": {
+        "en": "Escalate: supplier silent 7 days",
+        "ar": "تصعيد: لا رد من المورد خلال ٧ أيام"
+      }
+    },
+    {
+      "step_id": "step_4",
+      "type": "action",
+      "capability_name": "procurement.create_purchase_invoice",
+      "capability_version": "1.1.0",
+      "args": {
+        "po_id": "$.po.id",
+        "vendor_id": "$.po.vendor_id"
+      },
+      "output_alias": "invoice"
+    },
+    {
+      "step_id": "step_5",
+      "type": "notify",
+      "message": {
+        "en": "Escalate: supplier silent 7 days",
+        "ar": "تصعيد: لا رد من المورد خلال ٧ أيام"
+      }
+    },
+    {
+      "step_id": "step_6",
+      "type": "approval",
+      "gate_name": "FinanceApprove",
+      "participants": ["finance"],
+      "escalation": {
+        "after_days": 7,
+        "action": "notify",
+        "to": "escalation_contact"
+      },
+      "description": "Finance must approve the invoice"
+    },
+    {
+      "step_id": "step_7",
+      "type": "action",
+      "capability_name": "commerce.record_payment",
+      "capability_version": "1.0.0",
+      "args": {
+        "invoice_id": "$.invoice.id"
+      },
+      "output_alias": "payment"
+    },
+    {
+      "step_id": "step_8",
+      "type": "notify",
+      "message": {
+        "en": "Update GIT + notify logistics",
+        "ar": "تحديث البضاعة بالطريق"
+      }
+    }
+  ]
+}

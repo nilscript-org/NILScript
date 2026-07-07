@@ -53,7 +53,7 @@ DOMAIN = Domain(nil="domain/0.1", domain_id="Procurement", workspace="ws_acme",
                           BackendBinding(capability="Commerce", backend="odoo")))
 
 # cyc_order expressed as a BizSpec — business language only, no step ids, no routing.
-CYC_ORDER = BizSpec(nil="bizspec/0.1", domain="Procurement", intent="procure to pay", steps=(
+CYC_ORDER = BizSpec(nil="bizspec/0.1", domain_id="Procurement", intent="procure to pay", steps=(
     UseStep(use="resource.read", bind="po"),
     ControlStep(control="approval", strategy="OwnerApprove"),
     ControlStep(control="wait", event="mail.received", match={"order_ref": "$po"},
@@ -121,3 +121,12 @@ def test_parity_lowered_flow_is_runnable_nil() -> None:
         "flow": _flow().model_dump(by_alias=True),
     })
     assert parse_nil(print_nil(cycle)) == cycle
+
+
+def test_parity_backend_bindings_resolved_D8() -> None:
+    # Verify backend bindings are extracted from the Domain and included in CompiledPlan (D8)
+    plan = compile_bizspec(CYC_ORDER, DOMAIN, REGISTRY)
+    assert "Resource" in plan.backend_bindings
+    assert "Procurement" in plan.backend_bindings
+    assert "Commerce" in plan.backend_bindings
+    assert plan.backend_bindings == {"Resource": "odoo", "Procurement": "odoo", "Commerce": "odoo"}

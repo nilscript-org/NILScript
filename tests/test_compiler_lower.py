@@ -28,7 +28,7 @@ DOMAIN = Domain(nil="domain/0.1", domain_id="Procurement", workspace="acme",
 
 
 def _plan(steps):
-    spec = BizSpec(nil="bizspec/0.1", domain="Procurement", intent="x", steps=tuple(steps))
+    spec = BizSpec(nil="bizspec/0.1", domain_id="Procurement", intent="x", steps=tuple(steps))
     return compile_bizspec(spec, DOMAIN, [CRM])
 
 
@@ -96,7 +96,7 @@ def test_escalate_only_valid_on_wait() -> None:
 def test_empty_plan_lowers_to_a_terminal_only_flow() -> None:
     flow = lower_to_flow(_plan([UseStep(use="crm.createLead")]))  # non-empty baseline
     empty = lower_to_flow(compile_bizspec(
-        BizSpec(nil="bizspec/0.1", domain="Procurement", intent="x", steps=(ControlStep(control="checkpoint", to="c"),)),
+        BizSpec(nil="bizspec/0.1", domain_id="Procurement", intent="x", steps=(ControlStep(control="checkpoint", to="c"),)),
         DOMAIN, [CRM]))
     assert empty.steps[-1].id == "Done"
 
@@ -124,7 +124,7 @@ def test_lowered_flow_wraps_into_a_runnable_cycle_that_round_trips() -> None:
 def test_decision_control_is_refused_in_v01() -> None:
     plan = _plan([ControlStep(control="decision")]) if False else None  # decision needs no strategy/event
     # A decision control step compiles (control-only) but cannot be lowered linearly yet.
-    spec = BizSpec(nil="bizspec/0.1", domain="Procurement", intent="x", steps=(ControlStep(control="decision"),))
+    spec = BizSpec(nil="bizspec/0.1", domain_id="Procurement", intent="x", steps=(ControlStep(control="decision"),))
     with pytest.raises(CompileRefusal) as ei:
         lower_to_flow(compile_bizspec(spec, DOMAIN, [CRM]))
     assert ei.value.code == "UNSUPPORTED_STEP"

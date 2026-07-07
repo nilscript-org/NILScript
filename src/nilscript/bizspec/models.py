@@ -91,7 +91,7 @@ class BizSpecPolicies(DslModel):
 
 class BizSpec(DslModel):
     nil: Literal["bizspec/0.1"]
-    domain: str = Field(pattern=IDENT_PATTERN)  # the Domain the steps resolve through
+    domain_id: str = Field(pattern=IDENT_PATTERN)  # the Domain ID the steps resolve through (e.g., "Procurement@1.0.0")
     intent: str = Field(min_length=1)  # provenance from L1 (what the human/Hermes meant)
     steps: tuple["UseStep | ControlStep", ...] = ()
     policies: BizSpecPolicies = Field(default_factory=BizSpecPolicies)

@@ -211,6 +211,11 @@ _V03_STEP_TYPES = frozenset({"wait_for_event", "checkpoint"})
 class Flow(DslModel):
     entry: str = Field(pattern=STEP_ID_PATTERN)  # a step NAME
     steps: tuple[CycleStep, ...] = Field(min_length=1, max_length=256)
+    # D8 governance fields (set during lower_to_flow from CompiledPlan).
+    # These are INTERNAL METADATA: not part of the .nil spec, not serialized to text.
+    # They travel with the Flow only at runtime; the printer excludes them deliberately.
+    domain_id: str | None = Field(default=None, exclude=True)  # e.g., "ws_acme_procurement@1.0.0"
+    backend_bindings: dict[str, str] | None = Field(default=None, exclude=True)  # e.g., {"crm.read_contact": "odoo"}
 
 
 class Cycle(DslModel):

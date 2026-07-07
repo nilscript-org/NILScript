@@ -51,7 +51,7 @@ DOMAIN = _domain(
 
 
 def _spec(steps, domain="Procurement", policies=None):
-    return BizSpec(nil="bizspec/0.1", domain=domain, intent="x", steps=tuple(steps),
+    return BizSpec(nil="bizspec/0.1", domain_id=domain, intent="x", steps=tuple(steps),
                    policies=policies or BizSpecPolicies())
 
 

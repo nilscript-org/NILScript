@@ -284,6 +284,29 @@ CREATE TABLE IF NOT EXISTS scheduled_executions (
     settled_at   TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_sched_due ON scheduled_executions(status, fire_at);
+
+-- Cycle compilation pipeline (Wave 4 Phase 1): one row per cycle version. Stores the compiled
+-- Flow, backend bindings, and compilation errors. `domain_id` identifies the domain the cycle
+-- implements; `compiled_plan` is the lowered WosoolProgram; `flow` is the Cycle AST Flow;
+-- `backend_bindings` maps capabilities to adapters. Status tracks compilation lifecycle.
+CREATE TABLE IF NOT EXISTS cycles (
+    workspace       TEXT    NOT NULL DEFAULT '',
+    cycle_id        TEXT    NOT NULL,
+    version         INTEGER NOT NULL DEFAULT 1,
+    domain_id       TEXT,                                  -- domain this cycle implements
+    cycle_ast       TEXT    NOT NULL,                      -- serialized Cycle (the SSOT)
+    compiled_plan   TEXT,                                  -- serialized CompiledPlan (lowered IR)
+    flow            TEXT,                                  -- serialized Flow from compiled_plan
+    backend_bindings TEXT    NOT NULL DEFAULT '{}',        -- JSON {capability -> adapter}
+    compile_error   TEXT,                                  -- error message if compile failed
+    status          TEXT    NOT NULL DEFAULT 'draft',      -- draft|published|compile_error|lower_error
+    content_hash    TEXT,                                  -- SHA256 hash of cycle AST (version lock)
+    created_at      TEXT    NOT NULL,
+    published_at    TEXT,                                  -- when status changed to published
+    PRIMARY KEY (workspace, cycle_id, version)
+);
+CREATE INDEX IF NOT EXISTS ix_cycles_ws ON cycles(workspace, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_cycles_status ON cycles(workspace, status);
 """
 
 # Columns surfaced by the automation registry reads (JSON columns parsed back by `_automation_row`).

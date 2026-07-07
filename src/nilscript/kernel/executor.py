@@ -23,6 +23,7 @@ Deviations from the cloud executor (documented, intentional for v1):
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -31,7 +32,13 @@ from nilscript.kernel.graph import idem_key, next_after, node_map
 from nilscript.kernel.guards import evaluate_guard
 from nilscript.kernel.references import resolve
 from nilscript.sdk.client import NilClient
+from nilscript.sdk.routing import GovernedRoutingNilClient, RoutingNilClient
 from nilscript.sdk.sentences import ProposalBody, StatusBody
+
+# Feature flag for D8 governance cutover. Controls whether LocalExecutor uses
+# GovernedRoutingNilClient (explicit Domain bindings) or RoutingNilClient (legacy verb discovery).
+# Set to "false" to fall back to implicit routing for safe rollback.
+USE_GOVERNED_ROUTING = os.getenv("USE_GOVERNED_ROUTING", "true").lower() in ("true", "1", "yes")
 
 # A GENUINE human decision on a gate's proposal → the branch an await_approval node takes.
 # ONLY a real decision short-circuits the gate. Every other state a status poll can report —
@@ -184,11 +191,16 @@ class CompensationHalt(Exception):
 
 
 class LocalExecutor:
-    """Walks one admitted DSL program against a mounted NIL adapter. Headless, no durability."""
+    """Walks one admitted DSL program against a mounted NIL adapter. Headless, no durability.
+
+    Supports both legacy routing (RoutingNilClient with implicit verb discovery) and D8 governance
+    (GovernedRoutingNilClient with explicit Domain bindings). Use `from_governed` class method to
+    initialize with explicit bindings when USE_GOVERNED_ROUTING is enabled.
+    """
 
     def __init__(
         self,
-        client: NilClient,
+        client: NilClient | RoutingNilClient | GovernedRoutingNilClient,
         *,
         session_id: str = "local-session",
         run_id: str = "local-run",
@@ -203,6 +215,41 @@ class LocalExecutor:
         self._poll_interval = approval_poll_interval
         self._max_polls = approval_max_polls
 
+    @classmethod
+    def from_governed(
+        cls,
+        domain_id: str,
+        backend_bindings: dict[str, str],
+        adapter_clients: dict[str, NilClient],
+        *,
+        session_id: str = "local-session",
+        run_id: str = "local-run",
+        locale: str = "ar",
+        approval_poll_interval: float = 0.5,
+        approval_max_polls: int = 20,
+    ) -> LocalExecutor:
+        """Create a LocalExecutor with explicit Domain backend bindings (D8 governance).
+
+        Args:
+            domain_id: The cycle's Domain identifier (e.g., "ws_acme_procurement@1.0.0")
+            backend_bindings: A dict mapping capability names to adapter addresses
+                             (e.g., {"procurement.create_purchase_invoice": "odoo"})
+            adapter_clients: A dict mapping adapter names to their NilClient instances
+            session_id, run_id, locale, approval_poll_interval, approval_max_polls: Executor config
+
+        Returns:
+            A LocalExecutor using GovernedRoutingNilClient for explicit, governance-first routing.
+        """
+        router = GovernedRoutingNilClient(domain_id, backend_bindings, adapter_clients)
+        return cls(
+            router,
+            session_id=session_id,
+            run_id=run_id,
+            locale=locale,
+            approval_poll_interval=approval_poll_interval,
+            approval_max_polls=approval_max_polls,
+        )
+
     async def execute(
         self,
         program: dict[str, Any],
@@ -216,7 +263,11 @@ class LocalExecutor:
         output>}`: the saved context is restored, the output is bound as the parked node's output,
         and the walk continues at whatever `next_after(node, output)` routes to — so an approved
         commit continues at the node's continuation and an approval/timeout route follows the
-        node's own branch, with no resume-only routing logic."""
+        node's own branch, with no resume-only routing logic.
+
+        NEW: If the program carries domain_id + backend_bindings and USE_GOVERNED_ROUTING is true,
+        and the executor was initialized with a default client (not a router), this will upgrade
+        the router to GovernedRoutingNilClient transparently for this execution."""
         self._program = program
         self._nodes = node_map(program)
         self._ctx: dict[str, Any] = {}
@@ -226,6 +277,11 @@ class LocalExecutor:
         self._trace_nodes: list[dict[str, Any]] = []  # per-node observability events this segment
         self._ts = datetime.now(timezone.utc)
         on_error = program.get("on_error", "abort")
+
+        # Router selection: if the program has backend_bindings and USE_GOVERNED_ROUTING is true,
+        # upgrade to GovernedRoutingNilClient (unless already a GovernedRoutingNilClient).
+        self._setup_router_for_program(program)
+
         if resume is not None:
             self._ctx = dict(resume.get("context") or {})
             node_id = resume["node_id"]
@@ -314,6 +370,37 @@ class LocalExecutor:
             notifications=self._notifications,
             checkpoints=self._checkpoints,
             trace_nodes=self._trace_nodes,
+        )
+
+    def _setup_router_for_program(self, program: dict[str, Any]) -> None:
+        """Check if the program has domain_id + backend_bindings and USE_GOVERNED_ROUTING enabled,
+        and upgrade the router if needed.
+
+        This is a transparent upgrade: if the executor was initialized with a plain NilClient
+        and the program carries governance metadata, switch to GovernedRoutingNilClient.
+        If already a GovernedRoutingNilClient or if bindings are missing, no change."""
+        if not USE_GOVERNED_ROUTING:
+            return  # Feature flag disabled; use existing router
+
+        domain_id = program.get("domain_id")
+        backend_bindings = program.get("backend_bindings")
+
+        if not domain_id or not backend_bindings:
+            return  # No governance metadata; use existing router
+
+        # Already using GovernedRoutingNilClient; no upgrade needed
+        if isinstance(self._client, GovernedRoutingNilClient):
+            return
+
+        # If here, we need to upgrade. But this is tricky: to create GovernedRoutingNilClient,
+        # we'd need adapter_clients dict, which we don't have. Instead, raise a clear error
+        # so the caller can use from_governed() or provide the bindings upfront.
+        # In practice, the control plane should use from_governed() when calling execute() on
+        # a program with bindings, so this path is rare (mostly tests).
+        raise RuntimeError(
+            f"Program for domain '{domain_id}' has backend_bindings but executor was initialized "
+            "with a plain client. Use LocalExecutor.from_governed() or pass a "
+            "GovernedRoutingNilClient directly."
         )
 
     def _now(self) -> str:

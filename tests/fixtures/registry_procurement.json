@@ -1,0 +1,176 @@
+[
+  {
+    "nil": "capability/0.1",
+    "capability_id": "Resource",
+    "workspace": "ws_acme",
+    "version": "1.0",
+    "domain": "Procurement",
+    "owner_role": "Procurement",
+    "intent": {
+      "en": "Resource",
+      "ar": "Resource"
+    },
+    "aliases": [],
+    "examples": [],
+    "inputs": [],
+    "outputs": [],
+    "risk": "LOW",
+    "strategy": "OwnerApprove",
+    "compensation": null,
+    "requires": [],
+    "creates": [],
+    "enables": [],
+    "exposure": {
+      "ai": false,
+      "roles": []
+    },
+    "sod": {
+      "preparer_not_approver": false
+    },
+    "archetype": null,
+    "metrics": null,
+    "skills": [
+      {
+        "name": "read",
+        "intent": {
+          "ar": "read",
+          "en": "read"
+        },
+        "inputs": [],
+        "outputs": [],
+        "resolves_to": [
+          "resource.read"
+        ],
+        "envelope": {
+          "tier": "LOW",
+          "reversibility": "IRREVERSIBLE",
+          "effects": [
+            "resource.read"
+          ],
+          "sod": {
+            "preparer_not_approver": false
+          }
+        }
+      }
+    ],
+    "implemented_by": {
+      "default": "ResourceCycle"
+    }
+  },
+  {
+    "nil": "capability/0.1",
+    "capability_id": "Procurement",
+    "workspace": "ws_acme",
+    "version": "1.0",
+    "domain": "Procurement",
+    "owner_role": "Procurement",
+    "intent": {
+      "en": "Procurement",
+      "ar": "Procurement"
+    },
+    "aliases": [],
+    "examples": [],
+    "inputs": [],
+    "outputs": [],
+    "risk": "HIGH",
+    "strategy": "OwnerApprove",
+    "compensation": null,
+    "requires": [],
+    "creates": [],
+    "enables": [],
+    "exposure": {
+      "ai": false,
+      "roles": []
+    },
+    "sod": {
+      "preparer_not_approver": false
+    },
+    "archetype": null,
+    "metrics": null,
+    "skills": [
+      {
+        "name": "createPurchaseInvoice",
+        "intent": {
+          "ar": "createPurchaseInvoice",
+          "en": "createPurchaseInvoice"
+        },
+        "inputs": [],
+        "outputs": [],
+        "resolves_to": [
+          "procurement.create_purchase_invoice"
+        ],
+        "envelope": {
+          "tier": "HIGH",
+          "reversibility": "IRREVERSIBLE",
+          "effects": [
+            "procurement.create_purchase_invoice"
+          ],
+          "sod": {
+            "preparer_not_approver": false
+          }
+        }
+      }
+    ],
+    "implemented_by": {
+      "default": "ProcurementCycle"
+    }
+  },
+  {
+    "nil": "capability/0.1",
+    "capability_id": "Commerce",
+    "workspace": "ws_acme",
+    "version": "1.0",
+    "domain": "Procurement",
+    "owner_role": "Procurement",
+    "intent": {
+      "en": "Commerce",
+      "ar": "Commerce"
+    },
+    "aliases": [],
+    "examples": [],
+    "inputs": [],
+    "outputs": [],
+    "risk": "HIGH",
+    "strategy": "OwnerApprove",
+    "compensation": null,
+    "requires": [],
+    "creates": [],
+    "enables": [],
+    "exposure": {
+      "ai": false,
+      "roles": []
+    },
+    "sod": {
+      "preparer_not_approver": false
+    },
+    "archetype": null,
+    "metrics": null,
+    "skills": [
+      {
+        "name": "recordPayment",
+        "intent": {
+          "ar": "recordPayment",
+          "en": "recordPayment"
+        },
+        "inputs": [],
+        "outputs": [],
+        "resolves_to": [
+          "commerce.record_payment"
+        ],
+        "envelope": {
+          "tier": "HIGH",
+          "reversibility": "IRREVERSIBLE",
+          "effects": [
+            "commerce.record_payment"
+          ],
+          "sod": {
+            "preparer_not_approver": false
+          }
+        }
+      }
+    ],
+    "implemented_by": {
+      "default": "CommerceCycle"
+    }
+  }
+]

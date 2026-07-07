@@ -1,0 +1,44 @@
+{
+  "nil": "bizspec/0.1",
+  "domain_id": "Procurement",
+  "intent": "procure to pay",
+  "steps": [
+    {
+      "use": "resource.read",
+      "bind": "po"
+    },
+    {
+      "control": "approval",
+      "strategy": "OwnerApprove"
+    },
+    {
+      "control": "wait",
+      "event": "mail.received",
+      "match": {
+        "order_ref": "$po"
+      },
+      "timeout_seconds": 604800,
+      "escalate": {
+        "en": "Escalate: supplier silent 7 days",
+        "ar": "تصعيد: لا رد من المورد خلال ٧ أيام"
+      }
+    },
+    {
+      "use": "proc.createPurchaseInvoice"
+    },
+    {
+      "control": "approval",
+      "strategy": "OwnerApprove"
+    },
+    {
+      "use": "commerce.recordPayment"
+    },
+    {
+      "control": "notify",
+      "message": {
+        "en": "Update GIT + notify logistics",
+        "ar": "تحديث البضاعة بالطريق"
+      }
+    }
+  ]
+}
