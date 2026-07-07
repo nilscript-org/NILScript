@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from nilscript.compiler.compile import CompileRefusal, compile_bizspec
 from nilscript.compiler.models import CompiledEnvelope, CompiledPlan, CompiledStep
+from nilscript.compiler.printer import render_plan
 
 __all__ = [
     "CompileRefusal",
@@ -19,4 +20,5 @@ __all__ = [
     "CompiledPlan",
     "CompiledStep",
     "compile_bizspec",
+    "render_plan",
 ]
