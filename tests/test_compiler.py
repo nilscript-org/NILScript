@@ -125,6 +125,15 @@ def test_refuse_unknown_skill() -> None:
     _refuse([UseStep(use="comms.teleport")], "UNKNOWN_SKILL")
 
 
+def test_refuse_private_verb_reference() -> None:
+    # Verbs are private (§14.5c): comms.send_email is a VERB the `send`/`notify` skills resolve to.
+    # A cycle must call the skill, never the verb — refused by name so the rule is legible.
+    with pytest.raises(CompileRefusal) as ei:
+        compile_bizspec(_spec([UseStep(use="comms.send_email")]), DOMAIN, REGISTRY)
+    assert ei.value.code == "PRIVATE_VERB"
+    assert "call it through a skill" in ei.value.detail
+
+
 def test_refuse_ambiguous_verb_without_via() -> None:
     _refuse([UseStep(use="comms.send")], "UNRESOLVED_VERB")  # send has two candidates
 

@@ -61,6 +61,16 @@ def _compile_use(step: UseStep, domain: Domain, registry: list[Capability]) -> t
 
     skill = resolve_skill(cap, skill_name)
     if skill is None:
+        # Verbs are PRIVATE (Wave 4 §14.5c): a cycle reaches an effect ONLY through a Skill, never a
+        # verb. If the reference is actually one of the capability's private verbs, refuse by name so
+        # the rule is legible — "call it through a skill", not a vague "unknown skill".
+        private_verbs = {v for s in cap.skills for v in s.resolves_to}
+        if step.use in private_verbs:
+            raise CompileRefusal(
+                "PRIVATE_VERB",
+                f"{step.use!r} is a private verb of {imp.capability}; call it through a skill "
+                f"({', '.join(s.name for s in cap.skills) or 'none exposed'})",
+            )
         raise CompileRefusal(
             "UNKNOWN_SKILL", f"{imp.capability}@{cap.version} exposes no skill {skill_name!r}"
         )
