@@ -307,6 +307,55 @@ CREATE TABLE IF NOT EXISTS cycles (
 );
 CREATE INDEX IF NOT EXISTS ix_cycles_ws ON cycles(workspace, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_cycles_status ON cycles(workspace, status);
+
+-- Business Discovery Sessions: track multi-phase discovery conversations
+CREATE TABLE IF NOT EXISTS discovery_sessions (
+    session_id      TEXT    NOT NULL PRIMARY KEY,
+    workspace       TEXT    NOT NULL DEFAULT '',
+    domain_name     TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL,
+    phase           TEXT    NOT NULL DEFAULT 'intro',
+    status          TEXT    NOT NULL DEFAULT 'in_progress',
+    current_answer  TEXT,
+    user_email      TEXT,
+    metadata        TEXT,
+    completed_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_discovery_workspace ON discovery_sessions(workspace);
+
+-- Discovered Business Specifications: the extracted result after discovery is complete
+CREATE TABLE IF NOT EXISTS specifications (
+    spec_id         TEXT    NOT NULL PRIMARY KEY,
+    workspace       TEXT    NOT NULL DEFAULT '',
+    session_id      TEXT    NOT NULL,
+    domain_name     TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL,
+    content_hash    TEXT    NOT NULL,
+    specification   TEXT    NOT NULL,
+    version         INTEGER NOT NULL DEFAULT 1,
+    status          TEXT    NOT NULL DEFAULT 'draft',
+    FOREIGN KEY (session_id) REFERENCES discovery_sessions(session_id)
+);
+CREATE INDEX IF NOT EXISTS ix_spec_workspace ON specifications(workspace);
+CREATE INDEX IF NOT EXISTS ix_spec_session ON specifications(session_id);
+
+-- Audit trail: every answer and extraction for post-hoc review
+CREATE TABLE IF NOT EXISTS discovery_audit (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT    NOT NULL,
+    workspace       TEXT    NOT NULL DEFAULT '',
+    phase           TEXT    NOT NULL,
+    user_answer     TEXT    NOT NULL,
+    extraction_result TEXT,
+    extracted_count INTEGER,
+    extraction_error TEXT,
+    timestamp       TEXT    NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES discovery_sessions(session_id)
+);
+CREATE INDEX IF NOT EXISTS ix_audit_session ON discovery_audit(session_id);
+CREATE INDEX IF NOT EXISTS ix_audit_timestamp ON discovery_audit(timestamp DESC);
 """
 
 # Columns surfaced by the automation registry reads (JSON columns parsed back by `_automation_row`).
