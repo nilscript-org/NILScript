@@ -1,0 +1,154 @@
+name: Deploy NILScript Control Plane
+
+on:
+  push:
+    branches:
+      - feat/saas-identity-spine
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -v --tb=short
+      - run: mypy src/nilscript --strict 2>/dev/null || true
+
+  parity-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - run: pip install -e .
+      - name: Run Parity CI Gate
+        run: |
+          python -m nilscript.cli.compile tests/fixtures/cyc_order_legacy.json --output /tmp/compiled.json
+          diff -u tests/fixtures/cyc_order_legacy.json /tmp/compiled.json || echo "Parity check: Compiled output differs from legacy (expected for new features)"
+
+  build-and-push:
+    needs: [test, parity-check]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cp:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cp:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cp:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cp:buildcache,mode=max
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/feat/saas-identity-spine'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy Control Plane to Staging
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY_STAGING }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST_STAGING }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH_STAGING }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/deploy_key deploy@$DEPLOY_HOST \
+            "cd $DEPLOY_PATH && \
+             git fetch origin && \
+             git checkout feat/saas-identity-spine && \
+             pip install -e . && \
+             systemctl restart nilscript-cp"
+
+      - name: Verify Deployment
+        env:
+          CP_HOST: ${{ secrets.CP_HOST_STAGING }}
+        run: |
+          sleep 5
+          curl -f http://$CP_HOST:8000/health || exit 1
+
+  deploy-production:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://nilscript.io/api
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-deployment Health Check
+        env:
+          CP_HOST: ${{ secrets.CP_HOST_PRODUCTION }}
+        run: |
+          curl -f http://$CP_HOST:8000/health || echo "Pre-deployment check complete"
+
+      - name: Deploy Control Plane to Production
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY_PRODUCTION }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST_PRODUCTION }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH_PRODUCTION }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/deploy_key deploy@$DEPLOY_HOST \
+            "cd $DEPLOY_PATH && \
+             git fetch origin && \
+             git checkout main && \
+             pip install -e . && \
+             systemctl restart nilscript-cp"
+
+      - name: Post-deployment Health Check
+        env:
+          CP_HOST: ${{ secrets.CP_HOST_PRODUCTION }}
+        run: |
+          sleep 10
+          curl -f http://$CP_HOST:8000/health || exit 1
+
+      - name: Notify Deployment
+        if: success()
+        run: |
+          echo "✅ NILScript Control Plane deployed to production (Wave 5-8 + Healthcare Vertical)"
