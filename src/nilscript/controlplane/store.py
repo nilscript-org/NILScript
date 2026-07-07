@@ -130,6 +130,16 @@ CREATE TABLE IF NOT EXISTS automation_runs (
 );
 CREATE INDEX IF NOT EXISTS ix_runs_auto ON automation_runs(workspace, automation_id, started_at DESC);
 
+-- Business-ref sequence: a monotonic, gap-free per-(workspace, automation) counter for minting the
+-- human thread identity (PO-2026-00145). Replaces COUNT(*) of runs, which was racy AND reused a ref
+-- after a run was deleted. `next` persists independently of the runs table (business-threads W1).
+CREATE TABLE IF NOT EXISTS ref_sequences (
+    workspace     TEXT    NOT NULL DEFAULT '',
+    automation_id TEXT    NOT NULL,
+    next          INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (workspace, automation_id)
+);
+
 -- Capability registry (SSOT): one row per VERSION of one capability — the business-contract
 -- object (CAPABILITY-SHIFT plan B1). Exactly the automation-registry disciplines: content_hash is
 -- the lock, re-registering the same hash is an idempotent no-op, a new hash supersedes (never
@@ -1632,15 +1642,34 @@ class EventStore:
         """Deterministic, human-friendly. FAIL-SAFE: any error falls back to run_id — minting a nice
         label must NEVER block a run from starting (that would be a runtime outage for a cosmetic)."""
         try:
-            n = self._conn.execute(
-                "SELECT COUNT(*) FROM automation_runs WHERE workspace = ? AND automation_id = ?",
+            # Monotonic, gap-free sequence (W1) — NOT COUNT(*) (racy under concurrency; reused a ref
+            # after a run was deleted). Seed `next` on first use from the current run count so live
+            # DBs continue exactly where COUNT-minting left off (no collision with existing refs),
+            # then increment atomically. start_run holds self._lock, so read-then-update is atomic.
+            self._conn.execute(
+                "INSERT INTO ref_sequences (workspace, automation_id, next) "
+                "SELECT ?, ?, (SELECT COUNT(*) FROM automation_runs "
+                "              WHERE workspace = ? AND automation_id = ?) + 1 "
+                "WHERE NOT EXISTS (SELECT 1 FROM ref_sequences "
+                "                  WHERE workspace = ? AND automation_id = ?)",
+                (workspace, automation_id, workspace, automation_id, workspace, automation_id),
+            )
+            seq = int(
+                self._conn.execute(
+                    "SELECT next FROM ref_sequences WHERE workspace = ? AND automation_id = ?",
+                    (workspace, automation_id),
+                ).fetchone()[0]
+            )
+            self._conn.execute(
+                "UPDATE ref_sequences SET next = next + 1 "
+                "WHERE workspace = ? AND automation_id = ?",
                 (workspace, automation_id),
-            ).fetchone()[0]
+            )
             prefix = self._REF_PREFIXES.get(automation_id) or (
                 "".join(ch for ch in automation_id.upper() if ch.isalnum())[:6] or "THR"
             )
             year = (started_at or "")[:4] or "0000"
-            return f"{prefix}-{year}-{int(n) + 1:05d}"
+            return f"{prefix}-{year}-{seq:05d}"
         except Exception:  # noqa: BLE001 — never let a label mint fail the run
             return run_id
 
