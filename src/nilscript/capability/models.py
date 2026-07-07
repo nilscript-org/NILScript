@@ -19,7 +19,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from nilscript.cycle.models import CYCLE_ID_PATTERN, PolicyTier
+from nilscript.cycle.models import CYCLE_ID_PATTERN, VERB_PATTERN, PolicyTier
 from nilscript.kernel.models import BilingualText, DslModel
 
 # A capability id shares the cycle id shape (stable PascalCase/slug identity); referenced names
@@ -93,6 +93,52 @@ class Metrics(DslModel):
     sla: str = Field(min_length=1)  # e.g. "P2D" — informational in MVP
 
 
+# The governance tier lattice — a skill may only sit AT or ABOVE its capability's risk floor (I3).
+TIER_ORDER: dict[str, int] = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+class GovernanceEnvelope(DslModel):
+    """D5 — the per-Skill governance surface: the tier, reversibility, and the FULL effect set the skill
+    can produce, so the Permission Card shows the complete blast radius before approval (compile-checked
+    against what the resolved cycle actually does). `effects` is the union of verbs the skill may fire —
+    a skill cannot smuggle an effect not declared here."""
+
+    tier: PolicyTier
+    reversibility: Literal["REVERSIBLE", "COMPENSABLE", "IRREVERSIBLE"] = "IRREVERSIBLE"
+    effects: tuple[str, ...] = ()  # verb ids this skill may produce (the declared blast radius)
+    sod: Sod = Field(default_factory=Sod)
+
+    @model_validator(mode="after")
+    def _effects_are_verb_ids(self) -> GovernanceEnvelope:
+        verb_re = re.compile(VERB_PATTERN)
+        bad = [e for e in self.effects if not verb_re.match(e)]
+        if bad:
+            raise ValueError(f"envelope effects must be verb ids (domain.action), got {bad}")
+        return self
+
+
+class Skill(DslModel):
+    """One named operation ON a capability (send · receive · notify) — the call site a cycle uses.
+    Semantic-first (D3): a cycle calls `comms.send(...)` by MEANING; `resolves_to` lists the candidate
+    verb(s) and an explicit `via:` at the call site disambiguates. Carries its own governance envelope
+    (D5). A Skill is not a Verb — after migration the Verb is private to the capability."""
+
+    name: str = Field(pattern=IDENT_PATTERN)  # "send"
+    intent: BilingualText
+    inputs: tuple[CapabilityField, ...] = ()
+    outputs: tuple[CapabilityField, ...] = ()
+    resolves_to: tuple[str, ...] = ()  # candidate verb ids; one when unambiguous, many when `via`-picked
+    envelope: GovernanceEnvelope
+
+    @model_validator(mode="after")
+    def _resolves_to_are_verb_ids(self) -> Skill:
+        verb_re = re.compile(VERB_PATTERN)
+        bad = [v for v in self.resolves_to if not verb_re.match(v)]
+        if bad:
+            raise ValueError(f"skill {self.name!r} resolves_to must be verb ids, got {bad}")
+        return self
+
+
 class Capability(DslModel):
     nil: Literal["capability/0.1"]
     capability_id: str = Field(pattern=CAPABILITY_ID_PATTERN)
@@ -115,6 +161,7 @@ class Capability(DslModel):
     sod: Sod = Field(default_factory=Sod)
     archetype: ArchetypeTag | None = None  # OPTIONAL: wrapped v0 capabilities omit it
     metrics: Metrics | None = None
+    skills: tuple[Skill, ...] = ()  # public operations (Wave 4 §14.3b) — OPTIONAL so wrapped v0 caps omit
     implemented_by: dict[str, str] = Field(min_length=1)  # name → cycle id
 
     @model_validator(mode="after")
@@ -129,6 +176,24 @@ class Capability(DslModel):
                 raise ValueError(f"implemented_by name {key!r} is not an identifier")
             if not cycle_re.match(value):
                 raise ValueError(f"implemented_by[{key!r}] = {value!r} is not a cycle id")
+        return self
+
+    @model_validator(mode="after")
+    def _skills_are_well_formed(self) -> Capability:
+        """Skill names are unique on a capability, and each skill sits AT or ABOVE the capability's risk
+        floor (I3 — an implementation may only RAISE the tier, never lower the governance)."""
+        names = [s.name for s in self.skills]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(f"duplicate skill names: {dupes}")
+        floor = TIER_ORDER[self.risk]
+        below = [
+            f"{s.name}({s.envelope.tier})"
+            for s in self.skills
+            if TIER_ORDER[s.envelope.tier] < floor
+        ]
+        if below:
+            raise ValueError(f"skills below the capability risk floor {self.risk}: {below}")
         return self
 
     @model_validator(mode="after")

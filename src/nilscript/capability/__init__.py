@@ -17,11 +17,14 @@ from nilscript.capability.models import (
     CapabilityField,
     Exposure,
     FieldType,
+    GovernanceEnvelope,
     Metrics,
+    Skill,
     Sod,
 )
 from nilscript.capability.nil_parser import parse_capability_nil
 from nilscript.capability.nil_printer import print_capability_nil
+from nilscript.capability.skills import resolve_skill, resolve_skill_verb
 from nilscript.capability.wrap import WrappedCapability, wrap_cycle
 from nilscript.cycle.nil_parser import NilSyntaxError
 
@@ -31,13 +34,17 @@ __all__ = [
     "CapabilityField",
     "Exposure",
     "FieldType",
+    "GovernanceEnvelope",
     "Metrics",
     "NilSyntaxError",
+    "Skill",
     "Sod",
     "WrappedCapability",
     "capability_content_hash",
     "parse_capability_nil",
     "print_capability_nil",
+    "resolve_skill",
+    "resolve_skill_verb",
     "validate_implements",
     "wrap_cycle",
 ]
