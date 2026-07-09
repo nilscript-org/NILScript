@@ -2070,6 +2070,7 @@ def create_app(
         signed = strategy_exec.sign(
             store, prepared_id, strat_body, inputs=row["inputs"], actor=actor,
             role=body.get("role"), decision=decision, prepared_by=row["prepared_by"],
+            actor_roles=body.get("actor_roles"),
         )
         if "refusal" in signed:
             code = (signed["refusal"] or {}).get("code")

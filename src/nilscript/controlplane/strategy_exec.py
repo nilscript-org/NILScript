@@ -354,14 +354,29 @@ def sign(
     decision: str = "approved",
     prepared_by: str = "",
     now: datetime.datetime | None = None,
+    actor_roles: list[str] | None = None,
 ) -> dict[str, Any]:
     """One unit's decision on the subject. Enforces SoD structurally (the preparer can NEVER
     sign their own card; `distinct_from` and quorum-distinctness refuse duplicate identities),
     advances Seq stages on approval, and cancels everything live on a rejection. Returns the new
-    overall status or a refusal payload — never an exception."""
+    overall status or a refusal payload — never an exception.
+
+    `actor_roles` (when provided by the trusted BFF) is the VERIFIED set of roles the actor
+    holds — the strategy-role → identity join. A `role` claim outside that set is refused:
+    a CfoTwoKey slot can only be signed by an identity that actually holds Finance/CFO."""
     now = now or datetime.datetime.now(datetime.UTC)
     if not actor:
         return _refusal("ACTOR_REQUIRED", "a signature needs a named actor")
+    if role and actor_roles is not None:
+        held = {str(r).lower() for r in actor_roles}
+        if role.lower() not in held:
+            return _refusal(
+                "ROLE_NOT_HELD",
+                f"actor {actor!r} does not hold the role {role!r} — a signature role must be "
+                "one of the identity's verified roles",
+                actor=actor,
+                role=role,
+            )
     flat = flatten(strategy, inputs)
     if flat.refusal is not None:
         return {"refusal": flat.refusal}
