@@ -457,16 +457,33 @@ def create_app(
         return {"ok": True, "new": new}
 
     @app.get("/api/events")
-    def events(limit: int = 100, workspace: str | None = None) -> dict[str, Any]:
+    def events(
+        limit: int = 100,
+        workspace: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         # SaaS: a workspace query param scopes the timeline to that tenant (the BFF passes the
-        # authenticated workspace); omitted = operator/global view.
+        # authenticated workspace); omitted = operator/global view. Registry-gated: the workspace
+        # param is an ISOLATION boundary, not a filter — an unauthenticated caller must not be able
+        # to read any tenant's timeline by naming it. (The BFF holds the token; the operator page
+        # gets it injected by the edge behind basic-auth.)
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         return {"events": store.recent(limit, workspace=workspace)}
 
     @app.get("/api/events/{event_id}")
-    def event_detail(event_id: int) -> Any:
+    def event_detail(
+        event_id: int,
+        workspace: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """The full payload journey for one row — intent → resolution → field-level SSOT verdict →
-        effect — fetched lazily when the operator expands a row."""
-        detail = store.detail(event_id)
+        effect — fetched lazily when the operator expands a row. Registry-gated; a `workspace`
+        param makes the read TENANT-SCOPED (404 for another tenant's or an unscoped row) — the BFF
+        always passes it, so cross-tenant ids are unreadable even with a leaked id."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        detail = store.detail(event_id, workspace=workspace or None)
         if detail is None:
             return JSONResponse({"error": "no such event"}, status_code=404)
         return detail
@@ -828,8 +845,15 @@ def create_app(
         return result
 
     @app.get("/api/pending")
-    def pending(workspace: str | None = None) -> dict[str, Any]:
-        # SaaS: scope held proposals to the tenant (joined to its events' workspace); omitted = global.
+    def pending(
+        workspace: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
+        # SaaS: scope held proposals to the tenant (joined to its events' workspace); omitted =
+        # global. Registry-gated for the same reason as /api/events — pending approvals carry
+        # tenant business intent and must not be enumerable by naming a workspace.
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         return {"pending": store.pending(workspace=workspace)}
 
     @app.get("/api/adapters")
@@ -882,9 +906,12 @@ def create_app(
         }
 
     @app.get("/api/automations")
-    def api_automations() -> dict[str, Any]:
-        """Dashboard view of every automation (latest version, all workspaces). Public read — no
-        secrets in the record; the heavy plan is summarised, not shipped whole."""
+    def api_automations(authorization: str | None = Header(default=None)) -> Any:
+        """Dashboard view of every automation (latest version, all workspaces). Registry-gated:
+        automation names/triggers describe a tenant's business processes — cross-workspace reads
+        are an operator/platform surface, never a public one. The heavy plan is summarised."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         out: list[dict[str, Any]] = []
         for a in store.all_automations():
             plan = a.get("plan") or {}

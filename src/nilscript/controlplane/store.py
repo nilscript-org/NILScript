@@ -687,17 +687,29 @@ class EventStore:
             out.append(record)
         return out
 
-    def detail(self, event_id: int) -> dict[str, Any] | None:
+    def detail(self, event_id: int, workspace: str | None = None) -> dict[str, Any] | None:
         """The full payload journey for one event — raw intent → resolved values → field-level SSOT
         verdict → effect — assembled from its own envelope plus its proposal's `proposed` event and
         every sibling event for that proposal. Everything needed to reconstruct a (failed) action
-        from the log alone, without opening the backend or the logs. Returns None for an unknown id."""
+        from the log alone, without opening the backend or the logs. Returns None for an unknown id.
+
+        `workspace` makes the read TENANT-SCOPED: a row belonging to another workspace — or to no
+        workspace at all — is None (indistinguishable from missing). Fail closed: an empty-workspace
+        row never satisfies a scoped read."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT id, received_at, workspace, grant_id, source, performative, event, proposal, "
-                "verb, tier, severity, envelope FROM events WHERE id = ?",
-                (event_id,),
-            ).fetchone()
+            if workspace is not None:
+                row = self._conn.execute(
+                    "SELECT id, received_at, workspace, grant_id, source, performative, event, "
+                    "proposal, verb, tier, severity, envelope FROM events "
+                    "WHERE id = ? AND workspace = ? AND workspace != ''",
+                    (event_id, workspace),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT id, received_at, workspace, grant_id, source, performative, event, "
+                    "proposal, verb, tier, severity, envelope FROM events WHERE id = ?",
+                    (event_id,),
+                ).fetchone()
         if row is None:
             return None
         env = _loads(row["envelope"])
@@ -1037,6 +1049,35 @@ class EventStore:
         return rec
 
     # ── active-adapter registry (multi-tenant routing) ───────────────────────────────────────
+    # ── adapter bearer encryption at rest ─────────────────────────────────────────────────────
+    # The adapter bearer is a live credential into a tenant's backend. It used to sit PLAINTEXT in
+    # the adapters table — one leaked DB file was every tenant's backend. With the vault enabled it
+    # is Fernet-encrypted on write ("enc:v1:" prefix) and decrypted only on the internal read paths
+    # (the API layer still redacts it for the browser). Legacy plaintext rows keep working; an
+    # encrypted row read while the vault is off fails CLOSED (empty bearer, never ciphertext-as-secret).
+    _BEARER_ENC_PREFIX = "enc:v1:"
+
+    def _encrypt_bearer(self, bearer: str) -> str:
+        if not bearer or self._vault is None:
+            return bearer
+        return self._BEARER_ENC_PREFIX + self._vault._fernet.encrypt(bearer.encode("utf-8")).decode("utf-8")
+
+    def _decrypt_bearer(self, bearer: str) -> str:
+        if not bearer or not bearer.startswith(self._BEARER_ENC_PREFIX):
+            return bearer  # legacy plaintext row
+        if self._vault is None:
+            return ""
+        try:
+            return self._vault._fernet.decrypt(
+                bearer[len(self._BEARER_ENC_PREFIX):].encode("utf-8")
+            ).decode("utf-8")
+        except Exception:  # noqa: BLE001 — wrong key / tampered ciphertext ⇒ unusable, not leaked
+            return ""
+
+    def _adapter_out(self, rec: dict[str, Any]) -> dict[str, Any]:
+        rec["bearer"] = self._decrypt_bearer(rec.get("bearer", "") or "")
+        return rec
+
     def register_adapter(
         self,
         workspace: str,
@@ -1056,7 +1097,7 @@ class EventStore:
                 "ON CONFLICT(workspace, adapter_id) DO UPDATE SET "
                 "label=excluded.label, url=excluded.url, bearer=excluded.bearer, "
                 "system=excluded.system, updated_at=excluded.updated_at",
-                (workspace, adapter_id, label, url, bearer, system, _now()),
+                (workspace, adapter_id, label, url, self._encrypt_bearer(bearer), system, _now()),
             )
             self._conn.commit()
         return self._adapter(workspace, adapter_id) or {}
@@ -1263,7 +1304,7 @@ class EventStore:
                 "ORDER BY updated_at DESC",
                 (workspace,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._adapter_out(dict(r)) for r in rows]
 
     def active_adapter(self, workspace: str) -> dict[str, Any] | None:
         """The workspace's default active adapter for single-backend MCP routing (WITH bearer), or
@@ -1275,7 +1316,7 @@ class EventStore:
                 "ORDER BY updated_at DESC LIMIT 1",
                 (workspace,),
             ).fetchone()
-        return dict(row) if row is not None else None
+        return self._adapter_out(dict(row)) if row is not None else None
 
     def any_active_adapter(self) -> dict[str, Any] | None:
         """The single most-recently-active adapter across the whole registry (WITH bearer). Used by the
@@ -1285,7 +1326,7 @@ class EventStore:
             row = self._conn.execute(
                 f"SELECT {_ADAPTER_COLS} FROM adapters WHERE active = 1 ORDER BY updated_at DESC LIMIT 1"
             ).fetchone()
-        return dict(row) if row is not None else None
+        return self._adapter_out(dict(row)) if row is not None else None
 
     def proposal_workspace(self, proposal_id: str) -> str | None:
         """Derive the workspace for a proposal_id from its 'proposed' event. Returns None when no
@@ -1469,14 +1510,14 @@ class EventStore:
                 "ORDER BY active DESC, updated_at DESC",
                 (workspace,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._adapter_out(dict(r)) for r in rows]
 
     def _adapter(self, workspace: str, adapter_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             f"SELECT {_ADAPTER_COLS} FROM adapters WHERE workspace = ? AND adapter_id = ?",
             (workspace, adapter_id),
         ).fetchone()
-        return dict(row) if row is not None else None
+        return self._adapter_out(dict(row)) if row is not None else None
 
     # ── automation registry (SSOT, append-only versions) ─────────────────────────────────────
     @staticmethod
