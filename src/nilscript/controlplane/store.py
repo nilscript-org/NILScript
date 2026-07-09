@@ -406,6 +406,19 @@ CREATE TABLE IF NOT EXISTS workspaces (
     updated_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_workspaces_account ON workspaces(account_id);
+
+-- Metering (SaaS Phase 5): every billable/limitable act lands here as an append-only usage
+-- event; summaries aggregate per (workspace, kind, day). This is what plan quotas check
+-- against and what a future invoice line derives from — no usage table, no billing, ever.
+CREATE TABLE IF NOT EXISTS usage_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    kind      TEXT NOT NULL DEFAULT 'request',
+    quantity  INTEGER NOT NULL DEFAULT 1,
+    day       TEXT NOT NULL,
+    at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_usage_ws_day ON usage_events(workspace, day, kind);
 """
 
 # Columns surfaced by the automation registry reads (JSON columns parsed back by `_automation_row`).
@@ -1209,6 +1222,41 @@ class EventStore:
             )
             self._conn.commit()
         return cur.rowcount > 0
+
+    # ── metering (SaaS Phase 5) ──────────────────────────────────────────────────────────────────
+    def record_usage(self, workspace: str, kind: str = "request", quantity: int = 1) -> None:
+        """Append one usage event (the BFF batches per-request writes into these)."""
+        if not workspace:
+            return
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO usage_events (workspace, kind, quantity, day, at) VALUES (?,?,?,?,?)",
+                (workspace, kind, max(1, int(quantity)), now[:10], now),
+            )
+            self._conn.commit()
+
+    def usage_summary(self, workspace: str, days: int = 31) -> list[dict[str, Any]]:
+        """Per-day, per-kind usage for the last `days` days — the quota check + invoice feed."""
+        cutoff = (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=max(1, days))
+        ).isoformat()[:10]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT day, kind, SUM(quantity) AS quantity FROM usage_events "
+                "WHERE workspace = ? AND day >= ? GROUP BY day, kind ORDER BY day DESC",
+                (workspace, cutoff),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def usage_today(self, workspace: str, kind: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(quantity), 0) FROM usage_events "
+                "WHERE workspace = ? AND kind = ? AND day = ?",
+                (workspace, kind, _now()[:10]),
+            ).fetchone()
+        return int(row[0] if row else 0)
 
     # ── per-tenant secret vault (encrypted at rest) ──────────────────────────────────────────────
     @property

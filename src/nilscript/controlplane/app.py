@@ -974,6 +974,79 @@ def create_app(
         )
         return {"ok": True, "adapter": _redact(rec)}
 
+    # ── metering + plan limits (SaaS Phase 5) ────────────────────────────────────────────────────
+    # The plan tier on the workspace row maps to REAL limits here — one table the BFF enforces at
+    # the tenant front door and the usage endpoints report against. Not env strings, not cosmetic.
+    PLAN_LIMITS: dict[str, dict[str, int]] = {
+        "starter": {"rate_per_minute": 120, "burst": 40, "daily_writes": 2000},
+        "pro": {"rate_per_minute": 600, "burst": 150, "daily_writes": 20000},
+        "enterprise": {"rate_per_minute": 3000, "burst": 600, "daily_writes": 200000},
+    }
+
+    def _plan_limits(plan_tier: str) -> dict[str, int]:
+        return PLAN_LIMITS.get((plan_tier or "starter").lower(), PLAN_LIMITS["starter"])
+
+    @app.post("/usage/record")
+    async def record_usage(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Append usage events (registry-gated; the BFF is the caller). Body:
+        {workspace, kind, quantity} or {events: [{workspace, kind, quantity}, …]}."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        events = body.get("events") if isinstance(body.get("events"), list) else [body]
+        n = 0
+        for ev in events:
+            ws = (ev or {}).get("workspace", "") or ""
+            if ws:
+                store.record_usage(ws, kind=(ev.get("kind") or "request"),
+                                   quantity=int(ev.get("quantity") or 1))
+                n += 1
+        return {"ok": True, "recorded": n}
+
+    @app.get("/workspaces/{workspace}/usage")
+    def workspace_usage(
+        workspace: str, days: int = 31, authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        row = store.get_workspace(workspace)
+        limits = _plan_limits((row or {}).get("plan_tier", "starter"))
+        return {
+            "workspace": workspace,
+            "plan_tier": (row or {}).get("plan_tier", "starter"),
+            "limits": limits,
+            "today_writes": store.usage_today(workspace, "write"),
+            "summary": store.usage_summary(workspace, days=days),
+        }
+
+    @app.get("/metrics")
+    def metrics() -> Any:
+        """Prometheus exposition — the operator's live counters (open; no tenant payloads)."""
+        from starlette.responses import PlainTextResponse
+
+        workspaces = store.list_workspaces()
+        lines = [
+            "# TYPE nil_workspaces_total gauge",
+            f"nil_workspaces_total {len(workspaces)}",
+            "# TYPE nil_events_total gauge",
+            f"nil_events_total {store.count()}",
+            "# TYPE nil_usage_today gauge",
+        ]
+        for w in workspaces:
+            ws = w["workspace"]
+            lines.append(
+                f'nil_usage_today{{workspace="{ws}",kind="write"}} {store.usage_today(ws, "write")}'
+            )
+            lines.append(
+                f'nil_usage_today{{workspace="{ws}",kind="request"}} {store.usage_today(ws, "request")}'
+            )
+        return PlainTextResponse("\n".join(lines) + "\n")
+
     # ── tenant lifecycle: accounts + workspaces + the baseline bundle (SaaS Phase 1) ─────────────
     @app.post("/accounts")
     async def create_account(
@@ -1064,6 +1137,8 @@ def create_app(
             "workspace": row,
             "baseline_current": BASELINE_VERSION,
             "baseline_converged": row.get("baseline_version") == BASELINE_VERSION,
+            # The plan's REAL limits — the BFF enforces these at the tenant front door.
+            "limits": _plan_limits(row.get("plan_tier", "starter")),
         }
 
     @app.post("/workspaces/{workspace}/baseline/apply")
