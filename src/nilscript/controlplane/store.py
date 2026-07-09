@@ -308,6 +308,28 @@ CREATE TABLE IF NOT EXISTS cycles (
 CREATE INDEX IF NOT EXISTS ix_cycles_ws ON cycles(workspace, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_cycles_status ON cycles(workspace, status);
 
+-- Cycle compilation audit trail (Wave 8.5): append-only record of every compilation attempt.
+-- Distinct from `cycles` (current-state table). Tracks who compiled, when, from what spec/ontology
+-- version, and whether it succeeded. Idempotent by content_hash: re-compiling identical content
+-- yields a cache_hit=true row, never a duplicate history entry (controlled by the compilation_record
+-- layer). Enables full traceability: "who changed this cycle's compilation state, when, and why."
+CREATE TABLE IF NOT EXISTS compilation_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace       TEXT    NOT NULL DEFAULT '',
+    cycle_id        TEXT    NOT NULL,
+    content_hash    TEXT    NOT NULL,                        -- cycle AST version lock (cache key)
+    compiled_by     TEXT    NOT NULL DEFAULT '',             -- actor (user/system) who compiled
+    spec_version    TEXT    NOT NULL DEFAULT '1.0.0',        -- spec version (cycle/0.2, cycle/0.3)
+    ontology_version TEXT   NOT NULL DEFAULT '1.0.0',        -- ontology version for semantics
+    status          TEXT    NOT NULL DEFAULT 'pending',      -- pending|success|error
+    diagnostics     TEXT    NOT NULL DEFAULT '[]',           -- JSON array of V-code Diagnostic objects
+    cache_hit       INTEGER NOT NULL DEFAULT 0,              -- 1 if this was a cache hit
+    created_at      TEXT    NOT NULL,
+    UNIQUE(workspace, cycle_id, content_hash)
+);
+CREATE INDEX IF NOT EXISTS ix_compilation_history_ws ON compilation_history(workspace, cycle_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_compilation_history_hash ON compilation_history(content_hash);
+
 -- Business Discovery Sessions: track multi-phase discovery conversations
 CREATE TABLE IF NOT EXISTS discovery_sessions (
     session_id      TEXT    NOT NULL PRIMARY KEY,
@@ -425,8 +447,16 @@ class EventStore:
             self._vault = (
                 SecretVault.from_env()
             )  # NIL_VAULT_KEY; raises if unset → stays None
-        except Exception:  # noqa: BLE001 — no/invalid key ⇒ vault disabled, not crashed
+        except Exception as exc:  # noqa: BLE001 — no/invalid key ⇒ vault disabled, not crashed
             self._vault = None
+            # In production a disabled vault means onboarding 503s and tenant secrets can never be
+            # stored — that is an outage, not a degraded mode. Fail LOUD at boot so the operator
+            # fixes NIL_VAULT_KEY instead of discovering it at the first tenant's signup.
+            if os.environ.get("ENVIRONMENT", "").lower() == "production":
+                raise RuntimeError(
+                    "NIL_VAULT_KEY is missing or invalid — refusing to boot in production "
+                    "with the tenant secret vault disabled"
+                ) from exc
         with self._lock:
             self._conn.executescript(_DDL)
             # Existing DBs (volume) predate event_id — add it idempotently.

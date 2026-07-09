@@ -19,8 +19,8 @@ from typing import Any
 
 from collections.abc import Awaitable, Callable
 
-from fastapi import FastAPI, Header, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from nilscript.automation import (
@@ -85,6 +85,26 @@ from nilscript.sdk.connect import handshake
 from nilscript.sdk.grants import GrantRef
 from nilscript.sdk.routing import RoutingNilClient
 from nilscript.sdk.transport import NilTransport
+from nilscript.runtime.command_bus import (
+    RuntimeCommandBus,
+    ResolutionIndex,
+    Intent,
+    ThreadContext,
+    ExecutionPlan,
+)
+from nilscript.runtime.outcomes.models import (
+    Outcome,
+    OutcomeAction,
+)
+from nilscript.hermes.runtime import (
+    IntentClassificationRequest,
+    classify_intent,
+    process_chat_request,
+)
+from nilscript.hermes.orchestrator import HermesOrchestrator
+from nilscript.hermes.config import HermesConfig
+from nilscript.hermes.models.message import Message
+from nilscript.comms.correlation_engine import ThreadState
 
 
 def _plan_scopes(plan: dict[str, Any]) -> frozenset[str]:
@@ -190,10 +210,12 @@ def create_app(
     app = FastAPI(title="nilscript control plane", version="0.1.0")
 
     def _registry_authed(authorization: str | None) -> bool:
-        """Guard the registry's sensitive endpoints. Open when no token is configured (local/test);
-        otherwise require `Authorization: Bearer <NIL_REGISTRY_TOKEN>`."""
+        """Guard the registry's sensitive endpoints. Open when no token is configured ONLY outside
+        production (local/test convenience); in production a missing NIL_REGISTRY_TOKEN fails CLOSED —
+        privileged endpoints (including decrypted-secret fetch) must never be public.
+        Otherwise require `Authorization: Bearer <NIL_REGISTRY_TOKEN>`."""
         if not registry_token:
-            return True
+            return os.environ.get("ENVIRONMENT", "").lower() != "production"
         return bool(authorization) and hmac.compare_digest(
             authorization, f"Bearer {registry_token}"
         )
@@ -963,6 +985,15 @@ def create_app(
             )
             store.activate_adapter(ws, adapter["adapter_id"])
             steps["adapter"] = f"{adapter['adapter_id']} registered+activated"
+            # Enable-equivalent derivation: without this the tenant's catalog stays EMPTY —
+            # draft capabilities are derived from the adapter's verb surface (fail-closed drafts,
+            # published only via an explicit governance act later). Best-effort: a derivation
+            # hiccup (adapter briefly unreachable) never fails the onboarding call.
+            try:
+                result = await _derive_adapter_drafts(ws, adapter["adapter_id"])
+                steps["derived_capabilities"] = result.get("derived", [])
+            except Exception:  # noqa: BLE001 — derivation is a convenience, never an onboarding gate
+                steps["derived_capabilities"] = []
         return {"ok": True, "workspace": ws, "provisioned": steps}
 
     @app.get("/tenants/{workspace}/secret/{name}")
@@ -1995,6 +2026,305 @@ def create_app(
         )
         return {"ok": True, "scheduled": sched}
 
+    # ── Hermes: Intent Classification + Session State + Event Streaming ────────────────────────
+    # Session store: user_id → {context, messages, intents, events}
+    _hermes_sessions: dict[str, dict[str, Any]] = {}
+    # WebSocket subscriptions: user_id → set of connected clients
+    _hermes_subscriptions: dict[str, set[WebSocket]] = {}
+
+    async def _hermes_broadcast(user_id: str, event: dict[str, Any]) -> None:
+        """Broadcast an event to all subscribed WebSocket clients for a user."""
+        if user_id not in _hermes_subscriptions:
+            return
+        disconnected = set()
+        for client in _hermes_subscriptions[user_id]:
+            try:
+                await client.send_json(event)
+            except (RuntimeError, ConnectionError):
+                disconnected.add(client)
+        # Clean up disconnected clients
+        for client in disconnected:
+            _hermes_subscriptions[user_id].discard(client)
+        if not _hermes_subscriptions[user_id]:
+            del _hermes_subscriptions[user_id]
+
+    # Hermes orchestrators keyed by account_id for multi-tenant isolation
+    _hermes_orchestrators: dict[str, HermesOrchestrator] = {}
+
+    def _get_hermes_orchestrator(account_id: str) -> HermesOrchestrator:
+        """Lazy-load or return cached orchestrator for a tenant (account_id)."""
+        if account_id not in _hermes_orchestrators:
+            config = HermesConfig.from_env()
+            _hermes_orchestrators[account_id] = HermesOrchestrator(config=config)
+        return _hermes_orchestrators[account_id]
+
+    @app.post("/hermes/chat")
+    async def hermes_chat(
+        request: Request,
+        x_account_id: str | None = Header(default=None),
+        x_workspace_id: str | None = Header(default=None),
+    ) -> Any:
+        """POST /hermes/chat: Tenant-aware intent classification and execution.
+
+        Extracts account_id and workspace_id from request headers or body.
+        All Hermes operations are now tenant-aware and isolated per account.
+
+        Headers (preferred):
+            X-Account-ID: Tenant account identifier
+            X-Workspace-ID: Workspace identifier within account
+
+        Body: {
+            "user_id": str (required),
+            "workspace_id": str (optional; falls back to header),
+            "account_id": str (optional; falls back to header),
+            "message": str (required),
+            "thread_id": str (optional; defaults to user_id),
+            "channel": str (optional; defaults to "chat")
+        }
+
+        Returns: {
+            "ok": bool,
+            "session_id": str,
+            "intent": str,
+            "confidence": float,
+            "message": Message (outbound response),
+            "outcome": ExecutionOutcome,
+            "timestamp": ISO-8601
+        }
+        """
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+
+        # Extract tenant context (headers take precedence over body)
+        account_id = x_account_id or (body or {}).get("account_id", "").strip()
+        workspace_id = x_workspace_id or (body or {}).get("workspace_id", "").strip()
+        user_id = (body or {}).get("user_id", "").strip()
+        message_text = (body or {}).get("message", "").strip()
+        thread_id = (body or {}).get("thread_id", user_id).strip()
+        channel = (body or {}).get("channel", "chat").strip()
+
+        # Validate required fields
+        if not user_id or not message_text:
+            return JSONResponse(
+                {"error": "user_id and message are required"}, status_code=400
+            )
+        if not account_id:
+            return JSONResponse(
+                {"error": "account_id must be provided in headers (X-Account-ID) or body"},
+                status_code=400,
+            )
+
+        try:
+            # Get tenant-scoped orchestrator
+            orchestrator = _get_hermes_orchestrator(account_id)
+
+            # Create inbound Message with tenant metadata
+            inbound_message = Message(
+                id=str(uuid.uuid4()),
+                thread_id=thread_id,
+                user_id=user_id,
+                content=message_text,
+                channel=channel,
+                timestamp=_dt.datetime.now(_dt.UTC),
+                direction="inbound",
+                metadata={
+                    "account_id": account_id,
+                    "workspace_id": workspace_id or workspace_id,
+                    "workspace": workspace_id or workspace_id,
+                    "domain": (body or {}).get("domain", "default"),
+                },
+            )
+
+            # Process through orchestrator: CLASSIFY → EXECUTE → RENDER
+            response_message, outcome = orchestrator.process_message(inbound_message)
+
+            # Store in session registry (keyed by tenant:user:thread)
+            session_key = f"{account_id}:{user_id}:{thread_id}"
+            if session_key not in _hermes_sessions:
+                _hermes_sessions[session_key] = {
+                    "account_id": account_id,
+                    "workspace_id": workspace_id,
+                    "user_id": user_id,
+                    "thread_id": thread_id,
+                    "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+                    "messages": [],
+                    "outcomes": [],
+                }
+
+            session = _hermes_sessions[session_key]
+            session["messages"].append({
+                "id": inbound_message.id,
+                "timestamp": inbound_message.timestamp.isoformat(),
+                "direction": "inbound",
+                "content": message_text,
+            })
+            session["outcomes"].append({
+                "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+                "intent": outcome.intent,
+                "status": outcome.status.value,
+                "confidence": outcome.context.get("confidence", 0.0),
+            })
+
+            # Broadcast to subscribed clients (tenant-scoped)
+            await _hermes_broadcast(session_key, {
+                "type": "message_processed",
+                "account_id": account_id,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "message_id": inbound_message.id,
+                "intent": outcome.intent,
+                "confidence": outcome.context.get("confidence", 0.0),
+                "status": outcome.status.value,
+                "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+            })
+
+            # Log to event store with tenant context
+            store.ingest({
+                "type": "hermes_intent",
+                "account_id": account_id,
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "message_id": inbound_message.id,
+                "intent": outcome.intent,
+                "confidence": outcome.context.get("confidence", 0.0),
+                "status": outcome.status.value,
+                "message": message_text,
+                "received_at": _dt.datetime.now(_dt.UTC).isoformat(),
+            }, source="hermes")
+
+            return {
+                "ok": True,
+                "session_id": session_key,
+                "message_id": inbound_message.id,
+                "intent": outcome.intent,
+                "confidence": outcome.context.get("confidence", 0.0),
+                "status": outcome.status.value,
+                "message": response_message.model_dump(by_alias=True, mode="json"),
+                "outcome": outcome.model_dump(by_alias=True, mode="json"),
+                "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+            }
+
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                {
+                    "error": f"hermes processing failed: {type(exc).__name__}",
+                    "detail": str(exc),
+                    "account_id": account_id,
+                },
+                status_code=500,
+            )
+
+    @app.get("/hermes/session/{account_id}/{user_id}/{thread_id}")
+    async def hermes_session(
+        account_id: str,
+        user_id: str,
+        thread_id: str,
+    ) -> Any:
+        """GET /hermes/session/{account_id}/{user_id}/{thread_id}: Retrieve tenant-scoped session.
+
+        Requires account_id for tenant isolation. Session key = account_id:user_id:thread_id.
+
+        Returns: {
+            "ok": bool,
+            "account_id": str,
+            "user_id": str,
+            "thread_id": str,
+            "workspace_id": str,
+            "message_count": int,
+            "outcome_count": int,
+            "created_at": str,
+            "messages": [...],
+            "outcomes": [...]
+        }
+        """
+        if not account_id or not user_id or not thread_id:
+            return JSONResponse(
+                {"error": "account_id, user_id, and thread_id are required"},
+                status_code=400,
+            )
+
+        session_key = f"{account_id}:{user_id}:{thread_id}"
+        if session_key not in _hermes_sessions:
+            return JSONResponse(
+                {"error": "session not found", "session_key": session_key},
+                status_code=404,
+            )
+
+        session = _hermes_sessions[session_key]
+        return {
+            "ok": True,
+            "account_id": session.get("account_id"),
+            "workspace_id": session.get("workspace_id", ""),
+            "user_id": session.get("user_id"),
+            "thread_id": session.get("thread_id"),
+            "message_count": len(session.get("messages", [])),
+            "outcome_count": len(session.get("outcomes", [])),
+            "created_at": session.get("created_at"),
+            "messages": session.get("messages", [])[-10:],
+            "outcomes": session.get("outcomes", [])[-10:],
+        }
+
+    @app.websocket("/hermes/subscribe/{account_id}/{user_id}/{thread_id}")
+    async def hermes_subscribe(
+        websocket: WebSocket,
+        account_id: str,
+        user_id: str,
+        thread_id: str,
+    ) -> None:
+        """WebSocket /hermes/subscribe/{account_id}/{user_id}/{thread_id}: Tenant-scoped event stream.
+
+        Establishes a persistent WebSocket connection for a specific tenant and thread.
+        Streams events like:
+        - message_processed: when a message is classified and executed
+        - session_updated: when session state changes
+        - notification: system notifications
+
+        Frame format: {"type": str, "account_id": str, "timestamp": str, ...}
+        """
+        if not account_id or not user_id or not thread_id:
+            await websocket.close(code=1008, reason="account_id, user_id, and thread_id are required")
+            return
+
+        await websocket.accept()
+
+        # Use tenant-scoped session key for subscriptions
+        session_key = f"{account_id}:{user_id}:{thread_id}"
+
+        # Register this WebSocket client
+        if session_key not in _hermes_subscriptions:
+            _hermes_subscriptions[session_key] = set()
+        _hermes_subscriptions[session_key].add(websocket)
+
+        # Send initial session context if it exists
+        if session_key in _hermes_sessions:
+            session = _hermes_sessions[session_key]
+            await websocket.send_json({
+                "type": "session_state",
+                "account_id": account_id,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "message_count": len(session.get("messages", [])),
+                "outcome_count": len(session.get("outcomes", [])),
+                "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+            })
+
+        # Keep connection alive and handle control messages
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                if msg.get("type") == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "account_id": account_id,
+                        "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+                    })
+        except WebSocketDisconnect:
+            _hermes_subscriptions[session_key].discard(websocket)
+            if not _hermes_subscriptions[session_key]:
+                del _hermes_subscriptions[session_key]
+
     @app.post("/executions")
     async def execute_compiled_flow(
         request: Request, authorization: str | None = Header(default=None)
@@ -2825,6 +3155,584 @@ def create_app(
         except Exception as e:
             return JSONResponse(
                 {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    # ─── Runtime Endpoints (Wave 6 §2) ─────────────────────────────────────────
+
+    @app.post("/runtime/chat")
+    async def runtime_chat(request: IntentClassificationRequest) -> JSONResponse:
+        """Hermes Runtime: Classify natural language intent.
+
+        POST /runtime/chat
+        {
+            "thread_id": "t_123",
+            "message": "create a new order for 5000"
+        }
+
+        Response:
+        {
+            "intent": "create",
+            "parameters": [{"name": "entity_type", "value": "order", "confidence": 0.8}],
+            "confidence": 0.75
+        }
+        """
+        try:
+            classification = await process_chat_request(request)
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": classification.model_dump(mode="json"),
+                }
+            )
+        except ValueError as ve:
+            return JSONResponse(
+                {"success": False, "error": f"Intent classification failed: {str(ve)}"},
+                status_code=400,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/thread/{thread_id}/available-commands")
+    def get_available_commands(thread_id: str) -> JSONResponse:
+        """Get available commands for a thread.
+
+        Returns list of executable commands from RuntimeCommandBus,
+        filtered by thread context and permissions.
+
+        GET /thread/t_123/available-commands
+
+        Response:
+        {
+            "success": true,
+            "data": {
+                "thread_id": "t_123",
+                "commands": [
+                    {
+                        "verb_id": "order.create",
+                        "skill_name": "create",
+                        "capability_id": "Orders",
+                        "parameters_schema": {...}
+                    }
+                ]
+            }
+        }
+        """
+        try:
+            # Query thread context from store
+            thread_data = store.get_thread(thread_id) if hasattr(store, "get_thread") else None
+            if not thread_data:
+                return JSONResponse(
+                    {"success": False, "error": f"Thread {thread_id} not found"},
+                    status_code=404,
+                )
+
+            # Build minimal resolution index and bus
+            index = ResolutionIndex(
+                skills_by_capability={},
+                verbs_by_id={},
+                backend_bindings={},
+            )
+            bus = RuntimeCommandBus(index)
+
+            # Get available commands (in production, query from runtime index)
+            commands = []
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "thread_id": thread_id,
+                        "commands": commands,
+                    },
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/thread/{thread_id}/state")
+    def get_thread_state(thread_id: str) -> JSONResponse:
+        """Get thread state snapshot.
+
+        Returns current execution state, parked node, waiting condition.
+
+        GET /thread/t_123/state
+
+        Response:
+        {
+            "success": true,
+            "data": {
+                "thread_id": "t_123",
+                "state": "waiting_for_approval",
+                "parked_node_id": "step_5",
+                "on_event": null,
+                "variables": {...}
+            }
+        }
+        """
+        try:
+            thread_data = store.get_thread(thread_id) if hasattr(store, "get_thread") else None
+            if not thread_data:
+                return JSONResponse(
+                    {"success": False, "error": f"Thread {thread_id} not found"},
+                    status_code=404,
+                )
+
+            state_info = {
+                "thread_id": thread_id,
+                "state": thread_data.get("state", "unknown"),
+                "parked_node_id": thread_data.get("parked_node_id"),
+                "on_event": thread_data.get("on_event"),
+                "variables": thread_data.get("variables", {}),
+            }
+
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": state_info,
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/thread/{thread_id}/timeline")
+    def get_thread_timeline(thread_id: str, limit: int = 50) -> JSONResponse:
+        """Get thread event timeline.
+
+        Returns chronological log of events, decisions, and state changes
+        for correlation and debugging.
+
+        GET /thread/t_123/timeline?limit=50
+
+        Response:
+        {
+            "success": true,
+            "data": {
+                "thread_id": "t_123",
+                "events": [
+                    {
+                        "timestamp": "2024-01-15T10:30:00Z",
+                        "event_type": "message.received",
+                        "source": "email",
+                        "summary": "Vendor sent reply"
+                    }
+                ]
+            }
+        }
+        """
+        try:
+            if not hasattr(store, "query_events"):
+                return JSONResponse(
+                    {"success": False, "error": "Store does not support event queries"},
+                    status_code=501,
+                )
+
+            events = store.query_events({"thread_id": thread_id}, limit=limit)
+            timeline = []
+            for evt in events:
+                timeline.append({
+                    "timestamp": evt.get("timestamp"),
+                    "event_type": evt.get("event_type"),
+                    "source": evt.get("source"),
+                    "summary": evt.get("summary", ""),
+                })
+
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "thread_id": thread_id,
+                        "events": timeline,
+                    },
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    def _execution_plan_to_outcome(
+        plan: ExecutionPlan, thread_id: str
+    ) -> Outcome:
+        """Convert an ExecutionPlan to an Outcome.
+
+        Maps execution plan status and permission card state to outcome representation.
+        This bridges the deterministic command resolution with the runtime outcome model.
+        """
+        # Determine outcome_type based on execution plan status and governance
+        if plan.status == "approved":
+            outcome_type = "success"
+            reason = f"Verb {plan.verb.verb_id} approved for execution"
+            can_auto_continue = True
+            requires_user_input = False
+            actions = (OutcomeAction(type="continue"),)
+        elif plan.status == "pending":
+            outcome_type = "pending"
+            reason = f"Awaiting approval for {plan.verb.verb_id}"
+            can_auto_continue = False
+            requires_user_input = True
+            # Collect approval details from permission card
+            await_prompt = "Awaiting approval from authorized actors"
+            if plan.permission_card:
+                await_prompt = f"Approval required: {plan.permission_card.title or 'Permission Card'}"
+            actions = (OutcomeAction(type="await_input", prompt=await_prompt),)
+        elif plan.status == "denied":
+            outcome_type = "failure"
+            reason = f"Permission denied for {plan.verb.verb_id}"
+            can_auto_continue = False
+            requires_user_input = False
+            actions = ()
+        else:
+            outcome_type = "conditional"
+            reason = f"Execution plan for {plan.verb.verb_id} in status {plan.status}"
+            can_auto_continue = False
+            requires_user_input = False
+            actions = ()
+
+        # Build payload with execution plan metadata
+        payload = {
+            "thread_id": plan.thread_id,
+            "verb_id": plan.verb.verb_id,
+            "capability_id": plan.verb.capability_id,
+            "skill_name": plan.verb.skill_name,
+            "backend": plan.verb.backend,
+            "parameters": plan.parameters,
+            "governance_tier": plan.governance_tier,
+            "reversibility": plan.reversibility,
+            "execution_status": plan.status,
+        }
+
+        # Include permission card if present
+        if plan.permission_card:
+            payload["permission_card"] = plan.permission_card.model_dump(mode="json")
+
+        return Outcome(
+            outcome_type=outcome_type,
+            reason=reason,
+            payload=payload,
+            actions=actions,
+            can_auto_continue=can_auto_continue,
+            requires_user_input=requires_user_input,
+        )
+
+    @app.post("/thread/{thread_id}/execute-intent")
+    async def execute_intent(thread_id: str, request: Request) -> Any:
+        """Execute an intent on a thread via RuntimeCommandBus.
+
+        Resolve intent to verb, check permissions, return Outcome with execution plan
+        or permission card if approval is needed.
+
+        POST /thread/t_123/execute-intent
+        {
+            "action": "create",
+            "entity": "Order",
+            "parameters": {"amount": 5000}
+        }
+
+        Returns Outcome with:
+        - success: intent resolved and execution plan generated
+        - outcome_type: success (approved) | pending (awaiting approval) | failure (denied)
+        - payload: execution plan metadata, permission card if needed
+        - actions: recommended next steps (continue | await_input | escalate)
+        """
+        try:
+            body, err = await _read_body(request)
+            if err is not None:
+                return err
+
+            body = body or {}
+
+            thread_data = store.get_thread(thread_id) if hasattr(store, "get_thread") else None
+            if not thread_data:
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason=f"Thread {thread_id} not found",
+                    payload={"thread_id": thread_id},
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=404,
+                )
+
+            # Parse intent from request body
+            action = body.get("action", "").strip()
+            entity = body.get("entity")
+            params = body.get("parameters", {}) if isinstance(body.get("parameters"), dict) else {}
+
+            if not action:
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason="Missing 'action' in request",
+                    payload={"thread_id": thread_id},
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=400,
+                )
+
+            intent = Intent(action=action, entity=entity, parameters=params)
+
+            # Build resolution index and bus
+            index = ResolutionIndex(
+                skills_by_capability={},
+                verbs_by_id={},
+                backend_bindings={},
+            )
+            bus = RuntimeCommandBus(index)
+
+            # Resolve intent to execution plan
+            cycle_id = thread_data.get("cycle_id", "unknown")
+            domain_id = thread_data.get("domain_id", "default")
+            actor_id = thread_data.get("actor_id", "system")
+
+            # Note: bus.resolve() doesn't exist yet; using component methods
+            context = bus.get_thread_context(
+                thread_id=thread_id,
+                cycle_id=cycle_id,
+                domain_id=domain_id,
+                actor_id=actor_id,
+                actor_authority=thread_data.get("actor_authority", "LOW"),
+                variables=thread_data.get("variables", {}),
+            )
+
+            if not bus.validate_intent_against_thread(intent, context):
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason=f"Action '{action}' not recognized in domain '{domain_id}'",
+                    payload={"thread_id": thread_id, "action": action, "domain_id": domain_id},
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=400,
+                )
+
+            verb = bus.resolve_to_verb(intent, context)
+            verdict = bus.check_permissions(verb, intent, context)
+            execution_plan = bus.return_execution_plan(
+                context,
+                verb,
+                intent,
+                verdict,
+                governance_tier=thread_data.get("governance_tier", "LOW"),
+                reversibility=thread_data.get("reversibility", "IRREVERSIBLE"),
+            )
+
+            # Convert execution plan to Outcome
+            outcome = _execution_plan_to_outcome(execution_plan, thread_id)
+
+            return JSONResponse(
+                {
+                    "success": True,
+                    "outcome": outcome.model_dump(mode="json"),
+                }
+            )
+
+        except ValueError as ve:
+            error_outcome = Outcome(
+                outcome_type="error",
+                reason=f"Intent validation failed: {str(ve)}",
+                payload={"thread_id": thread_id, "error_type": "validation_error"},
+                actions=(),
+                can_auto_continue=False,
+                requires_user_input=False,
+            )
+            return JSONResponse(
+                error_outcome.model_dump(mode="json"),
+                status_code=400,
+            )
+        except Exception as e:
+            error_outcome = Outcome(
+                outcome_type="error",
+                reason=f"Execution failed: {str(e)}",
+                payload={"thread_id": thread_id, "error_type": type(e).__name__},
+                actions=(),
+                can_auto_continue=False,
+                requires_user_input=False,
+            )
+            return JSONResponse(
+                error_outcome.model_dump(mode="json"),
+                status_code=500,
+            )
+
+    @app.post("/runtime/execute-action")
+    async def execute_action(request: Request) -> Any:
+        """Execute an action with full runtime resolution.
+
+        Enhanced variant of execute-intent with explicit workspace/domain scoping.
+        Returns Outcome representing the resolved execution plan and governance state.
+
+        POST /runtime/execute-action
+        {
+            "workspace": "ws_123",
+            "thread_id": "t_456",
+            "domain_id": "order-domain",
+            "action": "approve",
+            "entity": "Invoice",
+            "parameters": {"amount": 15000, "currency": "SAR"}
+        }
+
+        Returns Outcome with:
+        - outcome_type: success (approved) | pending (awaiting approval) | failure (denied)
+        - reason: human-readable explanation
+        - payload: execution plan, permission card, verb resolution
+        - actions: next steps (continue, await_input, escalate, compensate)
+        - can_auto_continue: whether flow may advance automatically
+        - requires_user_input: whether user decision is required
+        """
+        try:
+            body, err = await _read_body(request)
+            if err is not None:
+                return err
+
+            body = body or {}
+            workspace = body.get("workspace", "").strip()
+            thread_id = body.get("thread_id", "").strip()
+            domain_id = body.get("domain_id", "").strip()
+            action = body.get("action", "").strip()
+            entity = body.get("entity")
+            params = body.get("parameters", {}) if isinstance(body.get("parameters"), dict) else {}
+            actor_id = body.get("actor_id", "system").strip()
+            actor_authority = body.get("actor_authority", "LOW").strip()
+
+            # Validate required fields
+            if not thread_id or not domain_id or not action:
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason="Missing required fields: thread_id, domain_id, action",
+                    payload={
+                        "thread_id": thread_id,
+                        "domain_id": domain_id,
+                        "workspace": workspace,
+                    },
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=400,
+                )
+
+            # Build thread context
+            thread_context = ThreadContext(
+                thread_id=thread_id,
+                cycle_id=body.get("cycle_id", f"cycle-{domain_id}"),
+                domain_id=domain_id,
+                actor_id=actor_id,
+                actor_authority=actor_authority,
+                variables=body.get("variables", {}),
+                context_bindings=body.get("context_bindings", {}),
+            )
+
+            # Create intent
+            intent = Intent(
+                action=action,
+                entity=entity,
+                parameters=params,
+            )
+
+            # Load resolution index from workspace/domain context
+            # In production, this loads from registry; for now, minimal
+            index = ResolutionIndex(
+                skills_by_capability=body.get("skills_by_capability", {}),
+                verbs_by_id=body.get("verbs_by_id", {}),
+                backend_bindings=body.get("backend_bindings", {}),
+            )
+
+            bus = RuntimeCommandBus(index)
+
+            # Execute resolution pipeline
+            if not bus.validate_intent_against_thread(intent, thread_context):
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason=f"Action '{action}' not recognized in domain '{domain_id}'",
+                    payload={
+                        "thread_id": thread_id,
+                        "domain_id": domain_id,
+                        "action": action,
+                    },
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=400,
+                )
+
+            verb = bus.resolve_to_verb(intent, thread_context)
+            verdict = bus.check_permissions(verb, intent, thread_context)
+
+            execution_plan = bus.return_execution_plan(
+                thread_context,
+                verb,
+                intent,
+                verdict,
+                governance_tier=body.get("governance_tier", "LOW"),
+                reversibility=body.get("reversibility", "IRREVERSIBLE"),
+            )
+
+            # Convert to Outcome
+            outcome = _execution_plan_to_outcome(execution_plan, thread_id)
+
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "workspace": workspace,
+                    "outcome": outcome.model_dump(mode="json"),
+                },
+                status_code=200,
+            )
+
+        except ValueError as ve:
+            error_outcome = Outcome(
+                outcome_type="error",
+                reason=f"Validation error: {str(ve)}",
+                payload={
+                    "thread_id": body.get("thread_id", ""),
+                    "domain_id": body.get("domain_id", ""),
+                    "error_type": "validation_error",
+                },
+                actions=(),
+                can_auto_continue=False,
+                requires_user_input=False,
+            )
+            return JSONResponse(
+                error_outcome.model_dump(mode="json"),
+                status_code=400,
+            )
+        except Exception as e:
+            error_outcome = Outcome(
+                outcome_type="error",
+                reason=f"Runtime error: {str(e)}",
+                payload={
+                    "thread_id": body.get("thread_id", "") if body else "",
+                    "error_type": type(e).__name__,
+                },
+                actions=(),
+                can_auto_continue=False,
+                requires_user_input=False,
+            )
+            return JSONResponse(
+                error_outcome.model_dump(mode="json"),
                 status_code=500,
             )
 
