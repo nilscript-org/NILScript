@@ -947,6 +947,115 @@ def create_app(
         )
         return {"ok": True, "adapter": _redact(rec)}
 
+    # ── tenant lifecycle: accounts + workspaces + the baseline bundle (SaaS Phase 1) ─────────────
+    @app.post("/accounts")
+    async def create_account(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Mint (or idempotently return, by email) a billable account. Registry-gated: accounts are
+        created by the platform (the OS BFF after signup), never directly from a browser."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        acct = store.create_account(
+            email=body.get("email", "") or "", display_name=body.get("display_name", "") or ""
+        )
+        return {"ok": True, "account": acct}
+
+    @app.get("/accounts/{account_id}")
+    def get_account(
+        account_id: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        acct = store.get_account(account_id)
+        if acct is None:
+            return JSONResponse({"error": "no such account"}, status_code=404)
+        return {"account": acct, "workspaces": store.list_workspaces(account_id)}
+
+    @app.post("/workspaces")
+    async def create_workspace(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Workspace Genesis: mint a first-class workspace (`ws_<uuid>`) and materialize the
+        versioned baseline bundle into it — every new tenant gets the IDENTICAL governed platform
+        (strategies + capability catalog + implementing cycles), stamped with baseline_version.
+        Accepts `account_id` (or an inline `account:{email,display_name}` to mint one), `name`,
+        `plan_tier`, `region`; `workspace` adopts a legacy id instead of minting;
+        `apply_baseline:false` skips materialization (bare mint)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        account_id = body.get("account_id", "") or ""
+        inline = body.get("account") or {}
+        if not account_id and (inline.get("email") or inline.get("display_name")):
+            account_id = store.create_account(
+                email=inline.get("email", "") or "",
+                display_name=inline.get("display_name", "") or "",
+            )["account_id"]
+        ws_row = store.create_workspace(
+            account_id=account_id,
+            name=body.get("name", "") or "",
+            plan_tier=body.get("plan_tier", "starter") or "starter",
+            region=body.get("region", "") or "",
+            workspace=body.get("workspace", "") or "",
+        )
+        applied: dict[str, Any] | None = None
+        if body.get("apply_baseline", True):
+            from nilscript.baseline import apply_baseline
+
+            applied = apply_baseline(store, ws_row["workspace"])
+            ws_row = store.get_workspace(ws_row["workspace"]) or ws_row
+        return {"ok": True, "workspace": ws_row, "baseline": applied}
+
+    @app.get("/workspaces")
+    def list_workspaces(
+        account_id: str = "", authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return {"workspaces": store.list_workspaces(account_id)}
+
+    @app.get("/workspaces/{workspace}")
+    def get_workspace(
+        workspace: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        row = store.get_workspace(workspace)
+        if row is None:
+            return JSONResponse({"error": "no such workspace"}, status_code=404)
+        from nilscript.baseline import BASELINE_VERSION
+
+        return {
+            "workspace": row,
+            "baseline_current": BASELINE_VERSION,
+            "baseline_converged": row.get("baseline_version") == BASELINE_VERSION,
+        }
+
+    @app.post("/workspaces/{workspace}/baseline/apply")
+    def apply_workspace_baseline(
+        workspace: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Reconcile: (re)materialize the CURRENT baseline bundle into the workspace. Idempotent —
+        unchanged objects are content-hash no-ops; the workspace row is stamped with the installed
+        version. This is the fleet upgrade primitive: bump BASELINE_VERSION, apply per workspace."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if store.get_workspace(workspace) is None:
+            # Adopt-on-apply keeps the legacy path (ws_acme predates the workspaces table).
+            store.create_workspace(workspace=workspace)
+        from nilscript.baseline import apply_baseline
+
+        result = apply_baseline(store, workspace)
+        return {"ok": True, **result}
+
     @app.post("/tenants/provision")
     async def provision_tenant(
         request: Request, authorization: str | None = Header(default=None)
@@ -964,6 +1073,24 @@ def create_app(
         if not ws:
             return JSONResponse({"error": "workspace is required"}, status_code=400)
         steps: dict[str, Any] = {}
+        # Every provisioned tenant is a FIRST-CLASS workspace: adopt the id into the workspaces
+        # table (no-op when it exists) and materialize the versioned baseline so a provisioned
+        # tenant is never an empty shell. Baseline errors fail the call — a tenant without its
+        # governed catalog is not "provisioned".
+        if store.get_workspace(ws) is None:
+            store.create_workspace(
+                workspace=ws,
+                name=body.get("name", "") or "",
+                plan_tier=body.get("plan_tier", "starter") or "starter",
+            )
+            steps["workspace"] = "created"
+        else:
+            steps["workspace"] = "exists"
+        if body.get("apply_baseline", True):
+            from nilscript.baseline import apply_baseline
+
+            baseline = apply_baseline(store, ws)
+            steps["baseline_version"] = baseline["baseline_version"]
         secrets = body.get("secrets") or {}
         if secrets:
             try:

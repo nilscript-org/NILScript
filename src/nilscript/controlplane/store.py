@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import threading
+import uuid
 from typing import Any
 
 _DDL = """
@@ -378,6 +379,33 @@ CREATE TABLE IF NOT EXISTS discovery_audit (
 );
 CREATE INDEX IF NOT EXISTS ix_audit_session ON discovery_audit(session_id);
 CREATE INDEX IF NOT EXISTS ix_audit_timestamp ON discovery_audit(timestamp DESC);
+
+-- The first-class TENANT objects (SaaS Phase 1). An `account` is the billable owner (a person or
+-- company); a `workspace` is one isolated governed instance an account owns. Before these tables a
+-- "workspace" was only a TEXT column that sprang into being on first write — unmintable, unlistable,
+-- unbillable. Every provisioning path now goes through create_workspace(), and baseline_version is
+-- the fleet-wide reconcile signal (which bundle version this workspace runs).
+CREATE TABLE IF NOT EXISTS accounts (
+    account_id   TEXT PRIMARY KEY,
+    email        TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_accounts_email ON accounts(email) WHERE email != '';
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace        TEXT PRIMARY KEY,
+    account_id       TEXT NOT NULL DEFAULT '',
+    name             TEXT NOT NULL DEFAULT '',
+    plan_tier        TEXT NOT NULL DEFAULT 'starter',
+    status           TEXT NOT NULL DEFAULT 'active',
+    region           TEXT NOT NULL DEFAULT '',
+    baseline_version TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_workspaces_account ON workspaces(account_id);
 """
 
 # Columns surfaced by the automation registry reads (JSON columns parsed back by `_automation_row`).
@@ -1032,6 +1060,114 @@ class EventStore:
             )
             self._conn.commit()
         return self._adapter(workspace, adapter_id) or {}
+
+    # ── tenant objects: accounts + workspaces (SaaS Phase 1) ─────────────────────────────────────
+    def create_account(self, *, email: str = "", display_name: str = "") -> dict[str, Any]:
+        """Mint a billable account. Email is unique when given — re-creating with a known email
+        returns the EXISTING account (idempotent signup)."""
+        email = (email or "").strip().lower()
+        if email:
+            existing = self.find_account_by_email(email)
+            if existing:
+                return existing
+        account_id = f"acct_{uuid.uuid4().hex[:12]}"
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO accounts (account_id, email, display_name, status, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (account_id, email, display_name or "", "active", _now()),
+            )
+            self._conn.commit()
+        return self.get_account(account_id) or {}
+
+    def get_account(self, account_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_account_by_email(self, email: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM accounts WHERE email = ?", ((email or "").strip().lower(),)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_workspace(
+        self,
+        *,
+        account_id: str = "",
+        name: str = "",
+        plan_tier: str = "starter",
+        region: str = "",
+        workspace: str = "",
+    ) -> dict[str, Any]:
+        """Mint a first-class workspace (`ws_<12hex>`). Passing an explicit `workspace` id adopts a
+        LEGACY id (e.g. ws_acme) into the table instead of minting — idempotent: an existing row is
+        returned untouched (a workspace id is an identity, never silently re-provisioned)."""
+        ws = (workspace or "").strip() or f"ws_{uuid.uuid4().hex[:12]}"
+        existing = self.get_workspace(ws)
+        if existing:
+            return existing
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO workspaces (workspace, account_id, name, plan_tier, status, region, "
+                "baseline_version, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (ws, account_id or "", name or "", plan_tier or "starter", "active",
+                 region or "", "", now, now),
+            )
+            self._conn.commit()
+        return self.get_workspace(ws) or {}
+
+    def get_workspace(self, workspace: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM workspaces WHERE workspace = ?", (workspace,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_workspaces(self, account_id: str = "") -> list[dict[str, Any]]:
+        with self._lock:
+            if account_id:
+                rows = self._conn.execute(
+                    "SELECT * FROM workspaces WHERE account_id = ? ORDER BY created_at",
+                    (account_id,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM workspaces ORDER BY created_at"
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_workspace_baseline(self, workspace: str, baseline_version: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE workspaces SET baseline_version = ?, updated_at = ? WHERE workspace = ?",
+                (baseline_version, _now(), workspace),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_workspace_status(self, workspace: str, status: str) -> bool:
+        """Lifecycle: active | suspended | deleted (soft — rows stay for audit)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE workspaces SET status = ?, updated_at = ? WHERE workspace = ?",
+                (status, _now(), workspace),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_workspace_plan(self, workspace: str, plan_tier: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE workspaces SET plan_tier = ?, updated_at = ? WHERE workspace = ?",
+                (plan_tier, _now(), workspace),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
 
     # ── per-tenant secret vault (encrypted at rest) ──────────────────────────────────────────────
     @property
