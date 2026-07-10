@@ -977,10 +977,12 @@ def create_app(
     # ── metering + plan limits (SaaS Phase 5) ────────────────────────────────────────────────────
     # The plan tier on the workspace row maps to REAL limits here — one table the BFF enforces at
     # the tenant front door and the usage endpoints report against. Not env strings, not cosmetic.
+    # rate_per_minute/burst bound WRITE mutations only (reads are unthrottled at the BFF);
+    # daily_writes is the volume cap. Sized so normal interactive use never trips a false 429.
     PLAN_LIMITS: dict[str, dict[str, int]] = {
-        "starter": {"rate_per_minute": 120, "burst": 40, "daily_writes": 2000},
-        "pro": {"rate_per_minute": 600, "burst": 150, "daily_writes": 20000},
-        "enterprise": {"rate_per_minute": 3000, "burst": 600, "daily_writes": 200000},
+        "starter": {"rate_per_minute": 300, "burst": 120, "daily_writes": 5000},
+        "pro": {"rate_per_minute": 1200, "burst": 400, "daily_writes": 50000},
+        "enterprise": {"rate_per_minute": 6000, "burst": 1200, "daily_writes": 500000},
     }
 
     def _plan_limits(plan_tier: str) -> dict[str, int]:
