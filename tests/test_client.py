@@ -123,6 +123,20 @@ async def test_commit_reuses_key_as_sentence_id_and_surfaces_replay() -> None:
 
 
 @respx.mock
+async def test_commit_out_of_enum_state_parses_as_none_not_crash() -> None:
+    # D2-sibling: a backend answering a COMMIT with a non-ProposalState value must normalize to
+    # undecided (state=None), never raise a ValidationError that crashes the run.
+    respx.post(f"{BASE}/nil/v0.1/commit").mock(
+        return_value=httpx.Response(
+            200, json=server_envelope("STATUS", {"proposal": "prop-0001", "state": "unknown"})
+        )
+    )
+    outcome = await make_client().commit("prop-0001", idempotency_key="c" * 64)
+    assert isinstance(outcome, StatusBody)
+    assert outcome.state is None
+
+
+@respx.mock
 async def test_commit_refusal_returns_proposal_body() -> None:
     respx.post(f"{BASE}/nil/v0.1/commit").mock(
         return_value=httpx.Response(
@@ -199,6 +213,23 @@ async def test_status_round_trip() -> None:
     )
     status = await make_client().status("prop-0001")
     assert status.state is not None and status.state.value == "executing"
+
+
+@respx.mock
+async def test_status_undecided_gate_state_parses_as_none_not_crash() -> None:
+    # A backend may report an undecided/never-recorded proposal (a governance gate not yet decided)
+    # with a state OUTSIDE ProposalState — e.g. the control-plane decision store returns "unknown"
+    # (also "pending"). That is NOT a verdict. The status poll must treat it as undecided (state=None)
+    # so the caller keeps waiting / PARKS — it must never raise and crash the whole run.
+    for undecided in ("unknown", "pending"):
+        respx.get(f"{BASE}/nil/v0.1/status/prop-0001").mock(
+            return_value=httpx.Response(
+                200,
+                json=server_envelope("STATUS", {"proposal": "prop-0001", "state": undecided}),
+            )
+        )
+        status = await make_client().status("prop-0001")
+        assert status.state is None, f"{undecided!r} should normalize to undecided (None)"
 
 
 @respx.mock

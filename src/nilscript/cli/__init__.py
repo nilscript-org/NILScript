@@ -19,6 +19,7 @@ from pathlib import Path
 
 from nilscript.cli._openapi import build_openapi
 from nilscript.cli._spec import SPEC_VERSION, all_verbs, load_profile
+from nilscript.cli.compile import _cmd_compile
 
 
 def _verb_markers(verb) -> str:  # type: ignore[no-untyped-def]
@@ -503,6 +504,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_openapi.add_argument("--format", choices=["json", "yaml"], default="json")
     p_openapi.add_argument("-o", "--output", help="write to a file instead of stdout")
     p_openapi.set_defaults(func=_cmd_export_openapi)
+
+    p_compile = sub.add_parser("compile", help="compile a BizSpec to a CompiledPlan (L2→L3)")
+    p_compile.add_argument("--bizspec", required=True, help="path to BizSpec JSON")
+    p_compile.add_argument("--domain", required=True, help="path to Domain JSON")
+    p_compile.add_argument("--registry", required=True, help="path to capability registry JSON (array)")
+    p_compile.add_argument("-o", "--output", help="write compiled plan to a file (else stdout)")
+    p_compile.set_defaults(func=_cmd_compile)
 
     p_scaffold = sub.add_parser(
         "scaffold-shim", help="generate a bootable NIL shim skeleton for a system"

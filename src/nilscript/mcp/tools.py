@@ -20,6 +20,7 @@ The safety model is the SDK's, unchanged:
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -81,11 +82,16 @@ class NilTools:
         brain: Any = None,
         automation: Any = None,
         workspace: str = "",
+        describe_override: dict[str, Any] | None = None,
     ) -> None:
         if gate not in GATE_MODES:
             raise ValueError(f"gate must be one of {sorted(GATE_MODES)}, got {gate!r}")
         self._client = client
         self._transport = transport
+        # When several adapters are active for the workspace, `client` is a RoutingNilClient (routes
+        # each verb to its declaring backend) and this is the UNION of every adapter's describe — so
+        # nil_describe shows crm.* AND comms.* together, not just one backend's verbs.
+        self._describe_override = describe_override
         self._default_session = session_id
         self._gate = gate
         self._brain = brain  # optional BrainTools — owns graph/meta entities in nil_intent routing
@@ -104,10 +110,17 @@ class NilTools:
                 # the human preview (e.g. {"summary": "delete contact AHMED (43)"}) so the owner's
                 # approval screen can show WHAT they're approving, not a bare proposal id.
                 "preview": proposal.preview,
+                # the resolved field values + which are editable, so the decision card can show a
+                # filled-in, editable form — approving with edits re-proposes the tweaked values.
+                "resolved": proposal.resolved or {},
+                "modifiable": list(proposal.modifiable or ()),
             }
 
     async def describe(self) -> dict[str, Any]:
-        """Discovery: the adapter's skeleton {system, nil, verbs, targets, ready, missing}."""
+        """Discovery: the adapter skeleton {system, nil, verbs, targets, ready, missing}. When several
+        adapters are active, returns the pre-computed UNION so the agent sees every routable verb."""
+        if self._describe_override is not None:
+            return self._describe_override
         return await handshake(self._transport)
 
     async def propose(
@@ -267,6 +280,119 @@ class NilTools:
             proposals.append(await self.propose(verb, args, session_id=session_id))
         return proposals[0] if len(proposals) == 1 else {"outcome": "proposals", "items": proposals}
 
+    async def plan(
+        self, steps: list[dict[str, Any]], *, session_id: str | None = None
+    ) -> dict[str, Any]:
+        """Propose an ORDERED, LINKED dependent plan (governed dependent plans).
+
+        `steps` is an ordered list; each step = {verb, args, depends_on?: int (index of the
+        prerequisite step), handoff?: {arg_field: "$.step<i>.<field>"}}. This avoids a chicken-egg: a
+        dependent's FK reference can't be validated before its prerequisite exists.
+
+        Step 0 (the root prerequisite) is proposed to the active adapter NOW and registered HELD as a
+        plan card — even at MEDIUM tier, because it belongs to a gated plan. Every dependent step
+        (seq>=1) is registered as a PENDING PLANNED step in the control plane — NOT yet proposed (its
+        handoff ref isn't resolvable until the prerequisite commits). It gets a synthetic pending id so
+        the UI shows a blocked card. On the prerequisite's commit the control-plane executor resolves
+        the handoff, proposes the dependent for real, and unblocks it.
+
+        Returns the plan {plan_id, steps:[{seq, proposal_id, verb, tier, preview, depends_on, blocked}]}.
+        """
+        sid = self._sid(session_id)
+        if not steps:
+            return {"outcome": "refused", "code": "EMPTY_PLAN", "message": "a plan needs at least one step"}
+        base = os.environ.get("NIL_APPROVAL_URL", "").rstrip("/")
+        if not base:
+            return {
+                "outcome": "refused",
+                "code": "NO_CONTROL_PLANE",
+                "message": "a dependent plan needs a control plane (NIL_APPROVAL_URL) to hold its ordered cards",
+            }
+        plan_id = f"plan_{uuid.uuid4().hex[:12]}"
+        out_steps: list[dict[str, Any]] = []
+
+        # Step 0: the root prerequisite — PROPOSE now, then register it HELD (even at MEDIUM).
+        root = steps[0]
+        proposal = await self._client.propose(
+            root.get("verb", ""), root.get("args") or {},
+            session_id=sid, request_timestamp=datetime.now(UTC),
+        )
+        self._remember(sid, proposal)
+        if proposal.is_refusal or not proposal.id:
+            return {
+                "outcome": "refused", "plan_id": plan_id, "code": proposal.code or "REFUSED",
+                "message": f"root step refused: {proposal.message or proposal.code or 'refused'}",
+            }
+        root_id = proposal.id
+        root_tier = proposal.tier.value if proposal.tier is not None else None
+        await self._await_plan_card(
+            base, root_id, verb=proposal.verb, tier=root_tier, preview=proposal.preview,
+            resolved=proposal.resolved or {}, modifiable=list(proposal.modifiable or ()),
+            plan_id=plan_id, seq=0, depends_on=None,
+        )
+        out_steps.append({
+            "seq": 0, "proposal_id": root_id, "verb": proposal.verb, "tier": root_tier,
+            "preview": proposal.preview, "depends_on": None, "blocked": False, "planned": False,
+        })
+
+        # Dependents (seq>=1): register as PLANNED (not yet proposed). Their depends_on resolves to the
+        # prerequisite's REAL proposal_id via the step index; the handoff placeholder stays in args.
+        seq_to_id = {0: root_id}
+        for seq, step in enumerate(steps[1:], start=1):
+            dep_idx = step.get("depends_on")
+            dep_idx = int(dep_idx) if dep_idx is not None else seq - 1  # default: the prior step
+            dep_id = seq_to_id.get(dep_idx)
+            handoff = step.get("handoff") or {}
+            synthetic = f"planned:{plan_id}:{seq}"
+            await self._register_planned(
+                base, synthetic, plan_id=plan_id, seq=seq, depends_on=dep_id,
+                verb=step.get("verb", ""), args=step.get("args") or {}, handoff=handoff,
+                preview=None, tier=None,
+            )
+            seq_to_id[seq] = synthetic
+            out_steps.append({
+                "seq": seq, "proposal_id": synthetic, "verb": step.get("verb"), "tier": None,
+                "preview": None, "depends_on": dep_id, "blocked": True, "planned": True,
+            })
+        return {"outcome": "plan", "plan_id": plan_id, "steps": out_steps}
+
+    async def _await_plan_card(
+        self, base: str, proposal_id: str, *, verb: Any, tier: Any, preview: Any,
+        resolved: Any, modifiable: Any, plan_id: str, seq: int, depends_on: str | None,
+    ) -> None:
+        """Register a proposed step as a HELD plan card in the control plane (fails soft — a
+        transient CP error must not crash plan authoring; the card is re-registerable/idempotent)."""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                await c.post(
+                    f"{base}/proposals/{proposal_id}/await",
+                    json={
+                        "verb": verb, "tier": tier, "preview": preview,
+                        "workspace": self._workspace, "resolved": resolved, "modifiable": modifiable,
+                        "plan_id": plan_id, "seq": seq, "depends_on": depends_on,
+                    },
+                )
+        except httpx.HTTPError:
+            pass
+
+    async def _register_planned(
+        self, base: str, synthetic_id: str, *, plan_id: str, seq: int, depends_on: str | None,
+        verb: str, args: dict[str, Any], handoff: dict[str, Any], preview: Any, tier: Any,
+    ) -> None:
+        """Register a not-yet-proposed dependent step in the control plane (fails soft)."""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                await c.post(
+                    f"{base}/plans/{plan_id}/steps",
+                    json={
+                        "proposal_id": synthetic_id, "seq": seq, "depends_on": depends_on,
+                        "verb": verb, "args": args, "handoff": handoff, "preview": preview,
+                        "tier": tier, "workspace": self._workspace,
+                    },
+                )
+        except httpx.HTTPError:
+            pass
+
     async def count(self, target: str, filter: Any = None) -> dict[str, Any]:
         """Just {count} — the first call for any 'how many / does X exist'. Never list to count."""
         return await self.query("nil.count", {"target": target, "filter": filter or []})
@@ -366,7 +492,16 @@ class NilTools:
             async with httpx.AsyncClient(timeout=5.0) as c:
                 await c.post(
                     f"{base}/proposals/{proposal_id}/await",
-                    json={"verb": prop.get("verb"), "tier": tier, "preview": prop.get("preview")},
+                    json={
+                        "verb": prop.get("verb"),
+                        "tier": tier,
+                        "preview": prop.get("preview"),
+                        "workspace": self._workspace,  # SaaS isolation: the hold carries its tenant
+                        # the editable field values, so the owner's card is a filled-in form and an
+                        # approve-with-edits can re-propose exactly the tweaked args.
+                        "resolved": prop.get("resolved") or {},
+                        "modifiable": prop.get("modifiable") or [],
+                    },
                 )
         except httpx.HTTPError:
             pass

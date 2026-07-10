@@ -27,6 +27,129 @@ from pocketbase_nil_adapter.translate import QUERY_VERBS, WRITE_VERBS, entity_re
 NIL = "0.1"
 SYSTEM = "pocketbase"
 
+# The kernel's intent router drives the GENERIC spine: reads via nil.* verbs, writes via resource.*
+# with fields sent FLAT ({target, **fields}) — never nested under `data`. And a structured entity
+# (an invoice referencing a client) can only be built by its CURATED to_native. So the generic path
+# must (a) accept flat fields and (b) delegate to the curated mapping when the target has one. This
+# map + helper are the bridge that makes nil_intent work against a real, non-uniform backend.
+_CURATED_BY_DOCTYPE = {v.doctype: v for v in WRITE_VERBS.values()}
+_READ_VERBS = ("nil.intent", "nil.get", "nil.count", "resource.read")
+
+# An agent may name an entity in Odoo/generic terms (res.partner, client, customer). We resolve it to
+# whatever THIS backend actually DECLARES — never a hardcoded per-backend table. A noun maps to a
+# concept; a concept matches any declared target whose name carries one of the concept's words. So the
+# SAME logic works for pocketbase (`clients`), odoo (`res.partner`), erpnext (`Customer`), etc.
+_NOUN_CONCEPT = {
+    "client": "client", "customer": "client", "contact": "client", "partner": "client",
+    "res.partner": "client", "company": "client", "account": "client", "party": "client",
+    "invoice": "invoice", "bill": "invoice", "account.move": "invoice",
+    "product": "product", "item": "product", "product.product": "product",
+    "supplier": "supplier", "vendor": "supplier",
+    "payment": "payment", "purchase": "purchase", "purchase_invoice": "purchase",
+}
+_CONCEPT_WORDS = {
+    "client": ("client", "customer", "partner", "contact", "party"),
+    "invoice": ("invoice", "bill", "move"),
+    "product": ("product", "item"),
+    "supplier": ("supplier", "vendor"),
+    "payment": ("payment",),
+    "purchase": ("purchase",),
+}
+
+
+def _resolve_target(name: Any) -> Any:
+    """Normalize an entity noun to a DECLARED target — generic, driven by this adapter's own targets:
+    exact (case-insensitive), singular↔plural, concept synonym, then substring. Never a per-backend
+    hardcode, so the identical logic is portable to every adapter."""
+    if not isinstance(name, str) or not name:
+        return name
+    declared = sorted({v.doctype for v in WRITE_VERBS.values()})
+    if name in declared:
+        return name
+    low = name.strip().lower()
+    for d in declared:  # case-insensitive exact, then singular↔plural
+        dl = d.lower()
+        if dl == low or dl == low + "s" or low == dl + "s":
+            return d
+    concept = _NOUN_CONCEPT.get(low)  # concept synonym → a declared target that carries the concept
+    if concept:
+        for d in declared:
+            if any(w in d.lower() for w in _CONCEPT_WORDS.get(concept, ())):
+                return d
+    for d in declared:  # last resort: substring either way
+        if low in d.lower() or d.lower() in low:
+            return d
+    return name
+
+
+def _apply_match(rows: list[dict[str, Any]], match: dict[str, Any]) -> list[dict[str, Any]]:
+    """Client-side substring filter, tolerant to differing field names — a `name` query also matches
+    `business_name`/`first_name`/`last_name` (backends store the display name under different fields)."""
+    out = rows
+    for key, value in (match or {}).items():
+        fields = ("business_name", "name", "first_name", "last_name") if key == "name" else (key,)
+        needle = str(value).lower()
+        out = [r for r in out if any(needle in str(r.get(f, "")).lower() for f in fields)]
+    return out
+
+
+def _resource_data(args: dict[str, Any]) -> dict[str, Any]:
+    """The write payload from a resource.* arg bag: an explicit `data` dict, else the flat fields
+    (everything but target/id) — the shape the kernel's generic-CRUD spine actually sends."""
+    explicit = args.get("data")
+    if isinstance(explicit, dict):
+        return explicit
+    return {k: v for k, v in args.items() if k not in ("target", "id", "data")}
+
+
+def _native_for(target: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Shape a create payload for `target`: the curated to_native (handles structured entities) when
+    one is declared, else the raw fields. Falls back to raw if a curated mapping needs a field the
+    caller did not supply (never a hard crash on the generic path)."""
+    curated = _CURATED_BY_DOCTYPE.get(target)
+    if curated is None:
+        return data
+    try:
+        return curated.to_native(data)
+    except (KeyError, TypeError):
+        return data
+
+
+def _prerequisite_gap(verb: Any, data: dict[str, Any], client: SystemClient) -> tuple[str, str] | None:
+    """Enforce a create's DECLARED prerequisites at PROPOSE — the universal 'refuse early, honestly'
+    mechanism (not a per-adapter shim). Two checks, both driven by what the verb declares:
+      1. required fields present, and
+      2. every referenced record (a foreign key like invoice.party_id) actually EXISTS.
+    Returns (message, field) to refuse with, or None when all prerequisites hold. Runs for BOTH the
+    curated and the generic (nil_intent) paths, so no write is ever attempted with a broken premise."""
+    miss = [f for f in verb.required if data.get(f) in (None, "", [])]
+    if miss:
+        return (f"'{verb.doctype}' requires '{miss[0]}' — provide it before this can be committed.", miss[0])
+    for field_name, target in getattr(verb, "references", {}).items():
+        value = data.get(field_name)
+        if value in (None, "", []):
+            continue  # absent-and-optional: only a *required* ref is missing above
+        if client.get(target, str(value)) is None:
+            noun = target[:-1] if target.endswith("s") else target
+            return (
+                f"'{field_name}' points to a {noun} that does not exist ({value}); "
+                f"create the {noun} first, then retry.",
+                field_name,
+            )
+    return None
+
+
+def _match_from(criteria: Any) -> dict[str, Any]:
+    """Fold a nil.* `where`/`filter` ([{attr,rel,value}] or [attr,op,value] triples) into a flat
+    field=value match the system client can filter on (substring/equality — lean by design)."""
+    match: dict[str, Any] = {}
+    for w in criteria or []:
+        if isinstance(w, dict) and w.get("attr") and w.get("value") is not None:
+            match[str(w["attr"])] = w["value"]
+        elif isinstance(w, (list, tuple)) and len(w) == 3 and w[2] is not None:
+            match[str(w[0])] = w[2]
+    return match
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -165,7 +288,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             op = verb_name.split(".", 1)[1]
             if op not in ("create", "update", "delete"):
                 return _refusal(env, "UNKNOWN_VERB", f"unknown resource op: {op}")
-            target = args.get("target")
+            target = _resolve_target(args.get("target"))
             if not target:
                 return _refusal(env, "INVALID_ARGS", "missing required arg: target", field="target")
             # Skeleton bound (advertised ≡ committable): resource.* may only touch a DECLARED target
@@ -176,25 +299,49 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                                 f"target '{target}' is not in this adapter's declared skeleton")
             if op in ("update", "delete") and not args.get("id"):
                 return _refusal(env, "INVALID_ARGS", "missing required arg: id", field="id")
-            if op in ("create", "update") and not isinstance(args.get("data"), dict):
-                return _refusal(env, "INVALID_ARGS", "missing required arg: data", field="data")
+            # Fields arrive FLAT from the kernel's generic spine ({target, **fields}); accept that as
+            # the write payload (or an explicit `data` dict). A create must carry at least one field.
+            data = _resource_data(args)
+            if op in ("create", "update") and not data:
+                return _refusal(env, "INVALID_ARGS", "missing record fields", field="data")
             if not client.exists(target):
                 return _refusal(env, "UPSTREAM_UNAVAILABLE",
                                 f"backend target '{target}' is not provisioned on this system")
+            # Universal prerequisite enforcement: even via the generic spine, a create inherits the
+            # curated verb's declared required-fields + references and is refused HONESTLY at propose
+            # if a premise is missing (e.g. an invoice with no/unknown client) — never a late failure.
+            curated = _CURATED_BY_DOCTYPE.get(target)
+            if op == "create" and curated is not None:
+                gap = _prerequisite_gap(curated, data, client)
+                if gap is not None:
+                    return _refusal(env, "INVALID_ARGS", gap[0], field=gap[1])
             pid = uuid4().hex[:16]
-            state.proposals[pid] = {"verb": verb_name, "args": args, "resource": True}
-            en, ar = _resource_phrase(op, target, args)
+            # Persist the RESOLVED target (e.g. client→clients) so COMMIT — which reads the stored
+            # target — writes to the real declared collection, not the raw noun the agent used.
+            state.proposals[pid] = {"verb": verb_name, "args": {**args, "target": target}, "data": data, "resource": True}
+            en, ar = _resource_phrase(op, target, {"data": data})
+            # Governance is NOT downgraded by the generic spine: a create inherits the curated verb's
+            # tier for this target (an invoice stays HIGH → held for approval), so routing through
+            # resource.create can never sneak a financial write past the gate.
+            tier = (
+                curated.tier
+                if op == "create" and curated is not None
+                else {"create": "MEDIUM", "update": "MEDIUM", "delete": "HIGH"}[op]
+            )
             return _envelope("PROPOSAL", env, {
                 "outcome": "proposal", "id": pid, "verb": verb_name,
-                "tier": {"create": "MEDIUM", "update": "MEDIUM", "delete": "HIGH"}[op],
-                "preview": {"en": en, "ar": ar}, "resolved": args, "modifiable": [], "expires_at": _now()})
+                "tier": tier,
+                "preview": {"en": en, "ar": ar}, "resolved": {"target": target, "data": data},
+                "modifiable": [f"data.{k}" for k in sorted(data)], "expires_at": _now()})
 
         verb = WRITE_VERBS.get(verb_name)
         if verb is None:
             return _refusal(env, "UNKNOWN_VERB", f"verb not supported by this backend: {verb_name}")
-        missing = verb.missing(args)
-        if missing:
-            return _refusal(env, "INVALID_ARGS", f"missing required arg: {missing[0]}", field=missing[0])
+        # Prerequisite enforcement (universal): required fields present AND every referenced record
+        # (e.g. the invoice's client) actually exists — refused honestly here, never at commit-time.
+        gap = _prerequisite_gap(verb, args, client)
+        if gap is not None:
+            return _refusal(env, "INVALID_ARGS", gap[0], field=gap[1])
         # Preflight (universal): refuse honestly at PROPOSE if the native target isn't provisioned,
         # so the agent learns now instead of a COMMIT-time failure. exists() lives in system.py.
         if not client.exists(verb.doctype):
@@ -232,10 +379,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             op = stored["verb"].split(".", 1)[1]
             target = stored["args"]["target"]
             rid = str(stored["args"].get("id", ""))
-            data = stored["args"].get("data") or {}
+            data = stored.get("data") or _resource_data(stored["args"])
             try:
                 if op == "create":
-                    created = client.create(target, data)
+                    # Delegate to the curated to_native so a structured entity (referenced records,
+                    # bilingual field maps) is built correctly even through the generic spine.
+                    created = client.create(target, _native_for(target, data))
                     rid = str(created.get("id") or created.get("name") or "")
                     # reversal of a create = delete the created record (synthesized, no per-verb authoring)
                     rev_verb, rev_args, rev = "resource.delete", {"target": target, "id": rid}, "REVERSIBLE"
@@ -353,14 +502,26 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         _auth(authorization)
         body = env.get("body", {})
         verb_name = body.get("verb")
-        # Generic resource.read (universal): list/inspect any target the skeleton exposes, by
-        # optional field match — lets the agent resolve human values → records/ids in realtime.
-        if verb_name == "resource.read":
+        # The kernel's read spine speaks nil.intent/nil.get/nil.count (and the legacy resource.read);
+        # all are lean list/inspect reads over a DECLARED target — the agent resolves human values →
+        # records/ids in realtime. `about` (nil.*) or `target` (resource.read) names the entity.
+        if verb_name in _READ_VERBS:
             qargs = body.get("args", {}) or {}
-            target = qargs.get("target")
+            target = _resolve_target(qargs.get("about") or qargs.get("target"))
             if not target or target not in {v.doctype for v in WRITE_VERBS.values()} or not client.exists(target):
                 raise HTTPException(status_code=404, detail=f"unknown or undeclared target: {target}")
-            rows = client.list(target, qargs.get("match") or None)
+            if verb_name == "nil.get" and qargs.get("id"):
+                rec = client.get(target, str(qargs["id"]))
+                return {"data": {"target": target, "item": rec}}
+            match = _match_from(qargs.get("where") or qargs.get("filter") or qargs.get("match"))
+            # Fetch, then match CLIENT-SIDE — tolerant to backend field names (a `name` search also
+            # matches business_name/first_name/last_name), and robust to unreliable server filtering.
+            rows = _apply_match(client.list(target, None), match)
+            if verb_name == "nil.count" or qargs.get("seek") == "count":
+                return {"data": {"target": target, "count": len(rows)}}
+            rows = rows[: int(qargs.get("limit") or 50)]
+            if qargs.get("seek") == "the":
+                return {"data": {"target": target, "item": rows[0] if rows else None}}
             return {"data": {"target": target, "count": len(rows), "items": rows}}
         verb = QUERY_VERBS.get(verb_name)
         if verb is None:
@@ -442,11 +603,80 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         for t in names:
             s = client.schema(t)  # the live skeleton: field list, or None if not provisioned
             targets[t] = {"exists": s is not None, "fields": s or []}
+
+        # Per-verb governance metadata, DECLARED by this adapter (the only authority on its own
+        # verbs). Consumers must use these fields instead of guessing tier/type from verb names —
+        # a verb absent here is metadata-unknown and must be treated fail-closed downstream.
+        # Reversibility comes from COMPENSATIONS; omission = IRREVERSIBLE (the honest default).
+        verb_details: list[dict[str, Any]] = []
+        for verb_name in sorted(WRITE_VERBS):
+            v = WRITE_VERBS[verb_name]
+            comp = COMPENSATIONS.get(verb_name) or {}
+            verb_details.append(
+                {
+                    "verb": verb_name,
+                    "type": "write",
+                    "tier": v.tier,
+                    "reversibility": comp.get("reversibility", "IRREVERSIBLE"),
+                    "doctype": v.doctype,
+                    "entity_type": v.entity_type,
+                    "required_args": list(v.required),
+                    # older WriteVerb tables predate declared references — tolerate both
+                    "references": dict(getattr(v, "references", {}) or {}),
+                }
+            )
+        for verb_name in sorted(QUERY_VERBS):
+            verb_details.append(
+                {
+                    "verb": verb_name,
+                    "type": "query",
+                    "tier": "LOW",
+                    "reversibility": "REVERSIBLE",
+                    "doctype": "",
+                    "entity_type": "",
+                    "required_args": [],
+                    "references": {},
+                }
+            )
+        for verb_name in ("resource.read",):
+            verb_details.append(
+                {
+                    "verb": verb_name,
+                    "type": "query",
+                    "tier": "LOW",
+                    "reversibility": "REVERSIBLE",
+                    "doctype": "",
+                    "entity_type": "",
+                    "required_args": ["target"],
+                    "references": {},
+                }
+            )
+        for verb_name, tier in (
+            ("resource.create", "MEDIUM"),
+            ("resource.update", "MEDIUM"),
+            ("resource.delete", "HIGH"),
+        ):
+            # Generic CRUD over any declared target: reversibility is synthesized by the
+            # resource layer (create→delete, update→restore, delete→recreate).
+            verb_details.append(
+                {
+                    "verb": verb_name,
+                    "type": "write",
+                    "tier": tier,
+                    "reversibility": "REVERSIBLE",
+                    "doctype": "",
+                    "entity_type": "",
+                    "required_args": ["target"],
+                    "references": {},
+                }
+            )
+
         return {
             "nil": NIL,
             "system": SYSTEM,
             "verbs": ["resource.create", "resource.read", "resource.update", "resource.delete"]
                      + sorted(WRITE_VERBS) + sorted(QUERY_VERBS),
+            "verb_details": verb_details,
             "targets": targets,
         }
 

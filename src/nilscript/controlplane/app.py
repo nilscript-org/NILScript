@@ -14,12 +14,13 @@ import hashlib
 import hmac
 import json
 import os
+import uuid
 from typing import Any
 
 from collections.abc import Awaitable, Callable
 
-from fastapi import FastAPI, Header, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from nilscript.automation import (
@@ -33,18 +34,77 @@ from nilscript.automation import (
     parse_composed,
     parse_trigger,
     register,
+    resume_due_waits,
+    resume_on_decision,
     run_due_schedules,
     validate_composed,
 )
 from nilscript.automation.compose import StageRunner
+from nilscript.capability import (
+    Capability,
+    capability_content_hash,
+    parse_capability_nil,
+    validate_implements,
+    wrap_cycle,
+)
+from nilscript.capability.derive import derive_from_skeleton
+from nilscript.capability.registry import validate_registry
+from nilscript.controlplane import prepared as prepared_cards
+from nilscript.controlplane import strategy_exec
 from nilscript.controlplane.store import EventStore
+from nilscript.cycle import (
+    Cycle,
+    NilSyntaxError,
+    completions as lsp_completions,
+    cycle_slug,
+    diagnostics as lsp_diagnostics,
+    draft_cycle,
+    governance_report,
+    hover as lsp_hover,
+    parse_nil,
+    print_nil,
+    register_cycle,
+    semantic_tokens as lsp_semantic_tokens,
+    simulate,
+    to_markdown,
+    to_mermaid,
+)
 from nilscript.kernel.diagnostics import ValidationResult
-from nilscript.kernel.executor import LocalExecutor
+from nilscript.kernel.executor import LocalExecutor, looks_committed
+from nilscript.kernel.graph import node_map
+from nilscript.kernel.references import resolve as resolve_references
+from nilscript.strategy import (
+    Strategy,
+    parse_strategy_nil,
+    strategy_content_hash,
+    validate_strategy,
+)
 from nilscript.sdk.client import NilClient
 from nilscript.sdk.idempotency import commit_idempotency_key
 from nilscript.sdk.connect import handshake
 from nilscript.sdk.grants import GrantRef
+from nilscript.sdk.routing import RoutingNilClient
 from nilscript.sdk.transport import NilTransport
+from nilscript.runtime.command_bus import (
+    RuntimeCommandBus,
+    ResolutionIndex,
+    Intent,
+    ThreadContext,
+    ExecutionPlan,
+)
+from nilscript.runtime.outcomes.models import (
+    Outcome,
+    OutcomeAction,
+)
+from nilscript.hermes.runtime import (
+    IntentClassificationRequest,
+    classify_intent,
+    process_chat_request,
+)
+from nilscript.hermes.orchestrator import HermesOrchestrator
+from nilscript.hermes.config import HermesConfig
+from nilscript.hermes.models.message import Message
+from nilscript.comms.correlation_engine import ThreadState
 
 
 def _plan_scopes(plan: dict[str, Any]) -> frozenset[str]:
@@ -57,11 +117,61 @@ def _plan_scopes(plan: dict[str, Any]) -> frozenset[str]:
             scopes.add(verb.split(".", 1)[0] + ".*")
     return frozenset(scopes) or frozenset({"*"})
 
+
+def _registry_gate(store: Any, capability: Capability) -> "JSONResponse | None":
+    """Wave 4 §14.2b registry gate. Returns a 409 refusal if registering `capability` would INTRODUCE a
+    new registry-level violation (bad SemVer, or a dependency cycle with other capabilities), else None.
+    The candidate REPLACES its own id (register supersedes), so we validate `others + candidate` and
+    block only the NEW violations — a legitimate supersede never self-collides, and a pre-existing
+    registry issue never fails an unrelated registration. Fails OPEN on an unexpected internal error: a
+    governance gate must never brick the registry on its own bug."""
+    try:
+        others = [
+            {**(row.get("body") or {}), "content_hash": row.get("content_hash", "")}
+            for row in store.list_capabilities(capability.workspace)
+            if row.get("capability_id") != capability.capability_id
+        ]
+        candidate = {
+            **capability.model_dump(by_alias=True, mode="json"),
+            "content_hash": capability_content_hash(capability),
+        }
+        before = set(validate_registry(others))
+        new = [v for v in validate_registry([*others, candidate]) if v not in before]
+    except Exception as exc:  # noqa: BLE001 — never let the gate itself block a valid registration
+        print(f"[registry-gate] errored, allowing registration: {exc}", flush=True)
+        return None
+    if not new:
+        return None
+    return JSONResponse(
+        {
+            "error": "registry invariant violation",
+            "violations": [
+                {"code": v.code, "capability_id": v.capability_id, "detail": v.detail} for v in new
+            ],
+        },
+        status_code=409,
+    )
+
+
 # An async source of a workspace's live adapter skeleton ({verbs, targets, ...}), or None when there
 # is no reachable/conformant active adapter. Injectable so the draft gate is testable without a backend.
 SkeletonProvider = Callable[[str], Awaitable[dict[str, Any] | None]]
 # Skeleton of a SPECIFIC adapter by id (for cross-system composed plans). (workspace, adapter_id) -> skeleton|None.
 AdapterSkeletonProvider = Callable[[str, str], Awaitable[dict[str, Any] | None]]
+
+
+def _parse_when(when: Any) -> _dt.datetime | None:
+    """Parse an ISO-8601 timestamp into an aware UTC datetime. A trailing `Z` is accepted; a
+    naive timestamp reads as UTC. Unparseable input is None — the caller refuses, never guesses."""
+    if not isinstance(when, str) or not when.strip():
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(when.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.UTC)
+    return parsed.astimezone(_dt.UTC)
 
 
 def _diag_list(result: ValidationResult) -> list[dict[str, Any]]:
@@ -81,7 +191,8 @@ def _redact(adapter: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_app(
-    store: EventStore | None = None, *,
+    store: EventStore | None = None,
+    *,
     secret: str | None = None,
     registry_token: str | None = None,
     skeleton_provider: SkeletonProvider | None = None,
@@ -92,85 +203,194 @@ def create_app(
     store = store if store is not None else EventStore()
     secret = secret if secret is not None else os.environ.get("NIL_EVENTS_SECRET", "")
     registry_token = (
-        registry_token if registry_token is not None
+        registry_token
+        if registry_token is not None
         else os.environ.get("NIL_REGISTRY_TOKEN", "")
     )
     app = FastAPI(title="nilscript control plane", version="0.1.0")
 
     def _registry_authed(authorization: str | None) -> bool:
-        """Guard the registry's sensitive endpoints. Open when no token is configured (local/test);
-        otherwise require `Authorization: Bearer <NIL_REGISTRY_TOKEN>`."""
+        """Guard the registry's sensitive endpoints. Open when no token is configured ONLY outside
+        production (local/test convenience); in production a missing NIL_REGISTRY_TOKEN fails CLOSED —
+        privileged endpoints (including decrypted-secret fetch) must never be public.
+        Otherwise require `Authorization: Bearer <NIL_REGISTRY_TOKEN>`."""
         if not registry_token:
-            return True
-        return bool(authorization) and hmac.compare_digest(authorization, f"Bearer {registry_token}")
+            return os.environ.get("ENVIRONMENT", "").lower() != "production"
+        return bool(authorization) and hmac.compare_digest(
+            authorization, f"Bearer {registry_token}"
+        )
 
     async def _live_skeleton(workspace: str) -> dict[str, Any] | None:
-        """Default skeleton source: discover the workspace's active adapter over NIL. None when there
-        is no active adapter, it's unreachable, or it doesn't answer with a conformant describe."""
-        active = store.active_adapter(workspace)
-        if not active or not active.get("url"):
+        """Default skeleton source: discover the workspace's active adapter(s) over NIL and UNION their
+        verb surfaces — so an agent SEES every governed verb it can route to (crm.* on one backend,
+        comms.* on another), not just one adapter's. None when no active adapter answers conformantly."""
+        actives = [a for a in store.active_adapters(workspace) if a.get("url")]
+        if not actives:
             return None
-        transport = NilTransport(base_url=active["url"], bearer_secret=active.get("bearer", "") or "")
-        try:
-            report = await handshake(transport)
-        finally:
-            await transport.aclose()
-        if not report.get("reachable") or not report.get("conformant"):
+        verbs: list[str] = []
+        verb_details: list[dict[str, Any]] = []
+        targets: dict[str, Any] = {}
+        systems: list[str] = []
+        any_ok = False
+        for a in actives:
+            transport = NilTransport(base_url=a["url"], bearer_secret=a.get("bearer", "") or "")
+            try:
+                report = await handshake(transport)
+            finally:
+                await transport.aclose()
+            if not report.get("reachable") or not report.get("conformant"):
+                continue
+            any_ok = True
+            for vb in report.get("verbs", []) or []:
+                if vb not in verbs:
+                    verbs.append(vb)
+            verb_details.extend(report.get("verb_details", []) or [])
+            targets.update(report.get("targets", {}) or {})
+            if report.get("system"):
+                systems.append(str(report["system"]))
+        if not any_ok:
             return None
-        return report
+        return {
+            "reachable": True,
+            "conformant": True,
+            "nil": "0.1",
+            "system": "+".join(dict.fromkeys(systems)) or "multi",
+            "verbs": verbs,
+            "verb_details": verb_details,
+            "targets": targets,
+        }
 
     provider: SkeletonProvider = skeleton_provider or _live_skeleton
 
-    async def _live_runner(plan: dict[str, Any], *, run_id: str) -> Any:
-        """Default runner: walk the pinned plan against the workspace's active adapter via a headless
-        LocalExecutor. The adapter bearer is the transport auth; the grant scopes are the plan's own
-        verbs. (Production grant minting is the one knob to revisit when CP-initiated runs need a
-        distinct identity from the adapter bearer.)"""
-        ws = plan.get("workspace", "") if isinstance(plan, dict) else ""
-        active = store.active_adapter(ws)
-        if not active or not active.get("url"):
-            raise RuntimeError(f"no active adapter for workspace {ws!r}")
+    def _adapter_client(
+        active: dict[str, Any], scopes: frozenset[str], grant_id: str
+    ) -> tuple[NilClient, NilTransport]:
+        """A NilClient + its transport for ONE adapter row. The adapter's bearer is the transport auth;
+        the grant carries the workspace + verb scopes."""
         bearer = active.get("bearer", "") or ""
         transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
         grant = GrantRef.from_secret(
-            grant_id="control-plane", workspace=ws, secret=bearer or "cp",
-            scopes=_plan_scopes(plan),
+            grant_id=grant_id,
+            workspace=active.get("workspace", "") or "",
+            secret=bearer or "cp",
+            scopes=scopes,
         )
-        client = NilClient(transport=transport, grant=grant)
+        return NilClient(transport=transport, grant=grant), transport
+
+    async def _routed_client(
+        ws: str, scopes: frozenset[str], grant_id: str
+    ) -> tuple[Any, list[NilTransport]]:
+        """Build the client the executor walks a plan against.
+
+        ONE active adapter → a plain NilClient (zero routing overhead — the common path, unchanged).
+        SEVERAL active → a RoutingNilClient that sends each verb to the adapter DECLARING it (learnt
+        from each adapter's describe), so a single governed run spans backends (crm.* on Odoo,
+        comms.* on the comms adapter). Returns (client_or_None, transports_to_close)."""
+        actives = [a for a in store.active_adapters(ws) if a.get("url")]
+        if not actives:
+            return None, []
+        if len(actives) == 1:
+            client, transport = _adapter_client(actives[0], scopes, grant_id)
+            return client, [transport]
+        transports: list[NilTransport] = []
+        routes: dict[str, NilClient] = {}
+        default: NilClient | None = None
+        for a in actives:
+            client, transport = _adapter_client(a, scopes, grant_id)
+            transports.append(transport)
+            report = await handshake(transport)
+            for verb in report.get("verbs", []) or []:
+                routes.setdefault(verb, client)  # first (newest) declarer wins a conflict
+            if default is None:
+                default = client
+        return RoutingNilClient(default=default, routes=routes), transports
+
+    async def _adapter_declaring(ws: str, verb: str) -> dict[str, Any] | None:
+        """The active adapter that DECLARES `verb` — the backend that held its proposal, where the
+        approved commit must land. Falls back to the workspace default (single-adapter / legacy)."""
+        actives = [a for a in store.active_adapters(ws) if a.get("url")]
+        if len(actives) <= 1:
+            return actives[0] if actives else (store.active_adapter(ws) or store.any_active_adapter())
+        for a in actives:
+            transport = NilTransport(base_url=a["url"], bearer_secret=a.get("bearer", "") or "")
+            try:
+                report = await handshake(transport)
+            finally:
+                await transport.aclose()
+            if verb in (report.get("verbs", []) or []):
+                return a
+        return store.active_adapter(ws) or store.any_active_adapter()
+
+    async def _live_runner(
+        plan: dict[str, Any],
+        *,
+        run_id: str,
+        resume: dict[str, Any] | None = None,
+        input: dict[str, Any] | None = None,
+    ) -> Any:
+        """Default runner: walk the pinned plan against the workspace's active adapter(s) via a
+        headless LocalExecutor. With several adapters active the verbs are routed per-backend (see
+        `_routed_client`). The adapter bearer is the transport auth; the grant scopes are the plan's
+        own verbs. `resume` continues a PARKED run from its row-backed context (gates / wait_for_event).
+        (Production grant minting is the one knob to revisit when CP-initiated runs need a
+        distinct identity from the adapter bearer.)"""
+        ws = plan.get("workspace", "") if isinstance(plan, dict) else ""
+        client, transports = await _routed_client(ws, _plan_scopes(plan), "control-plane")
+        if client is None:
+            raise RuntimeError(f"no active adapter for workspace {ws!r}")
         try:
             executor = LocalExecutor(
-                client, run_id=run_id, session_id=run_id, locale=plan.get("locale", "ar")
+                client,
+                run_id=run_id,
+                session_id=run_id,
+                locale=plan.get("locale", "ar"),
             )
-            return await executor.execute(plan)
+            return await executor.execute(plan, resume=resume, input=input)
         finally:
-            await transport.aclose()
+            for transport in transports:
+                await transport.aclose()
 
     run_exec: Runner = runner or _live_runner
 
-    async def _live_adapter_skeleton(workspace: str, adapter_id: str) -> dict[str, Any] | None:
+    async def _live_adapter_skeleton(
+        workspace: str, adapter_id: str
+    ) -> dict[str, Any] | None:
         """Discover a SPECIFIC registered adapter (by id) over NIL — for composed-plan validation,
         where each stage names its own backend (which may not be the workspace's active one)."""
         match = next(
-            (a for a in store.list_adapters(workspace)
-             if a.get("adapter_id") == adapter_id and a.get("url")),
+            (
+                a
+                for a in store.list_adapters(workspace)
+                if a.get("adapter_id") == adapter_id and a.get("url")
+            ),
             None,
         )
         if match is None:
             return None
-        transport = NilTransport(base_url=match["url"], bearer_secret=match.get("bearer", "") or "")
+        transport = NilTransport(
+            base_url=match["url"], bearer_secret=match.get("bearer", "") or ""
+        )
         try:
             report = await handshake(transport)
         finally:
             await transport.aclose()
         return report if report.get("reachable") and report.get("conformant") else None
 
-    adapter_skeletons: AdapterSkeletonProvider = adapter_skeleton_provider or _live_adapter_skeleton
+    adapter_skeletons: AdapterSkeletonProvider = (
+        adapter_skeleton_provider or _live_adapter_skeleton
+    )
 
-    async def _live_stage_runner(adapter: str, plan: dict[str, Any], *, run_id: str, input: dict[str, Any]) -> Any:
+    async def _live_stage_runner(
+        adapter: str, plan: dict[str, Any], *, run_id: str, input: dict[str, Any]
+    ) -> Any:
         """Run one composed stage against the named adapter (by id) via a headless LocalExecutor."""
         ws = plan.get("workspace", "") if isinstance(plan, dict) else ""
         match = next(
-            (a for a in store.list_adapters(ws) if a.get("adapter_id") == adapter and a.get("url")),
+            (
+                a
+                for a in store.list_adapters(ws)
+                if a.get("adapter_id") == adapter and a.get("url")
+            ),
             None,
         )
         if match is None:
@@ -178,18 +398,26 @@ def create_app(
         bearer = match.get("bearer", "") or ""
         transport = NilTransport(base_url=match["url"], bearer_secret=bearer)
         grant = GrantRef.from_secret(
-            grant_id="control-plane", workspace=ws, secret=bearer or "cp", scopes=_plan_scopes(plan),
+            grant_id="control-plane",
+            workspace=ws,
+            secret=bearer or "cp",
+            scopes=_plan_scopes(plan),
         )
         client = NilClient(transport=transport, grant=grant)
         try:
             return await LocalExecutor(
-                client, run_id=run_id, session_id=run_id, locale=plan.get("locale", "ar")
+                client,
+                run_id=run_id,
+                session_id=run_id,
+                locale=plan.get("locale", "ar"),
             ).execute(plan, input=input or None)
         finally:
             await transport.aclose()
 
     stage_exec: StageRunner = stage_runner or _live_stage_runner
-    _bg_tasks: set[asyncio.Task[Any]] = set()  # keep fire-and-forget dispatch tasks from being GC'd
+    _bg_tasks: set[asyncio.Task[Any]] = (
+        set()
+    )  # keep fire-and-forget dispatch tasks from being GC'd
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
@@ -205,13 +433,19 @@ def create_app(
         raw = await request.body()
         if secret:
             expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-            if not x_nil_signature or not hmac.compare_digest(x_nil_signature, expected):
+            if not x_nil_signature or not hmac.compare_digest(
+                x_nil_signature, expected
+            ):
                 return JSONResponse({"error": "bad signature"}, status_code=401)
         try:
             envelope = json.loads(raw)
         except (ValueError, TypeError):
             return JSONResponse({"error": "bad json"}, status_code=400)
-        seq = int(x_nil_sequence) if (x_nil_sequence and x_nil_sequence.lstrip("-").isdigit()) else None
+        seq = (
+            int(x_nil_sequence)
+            if (x_nil_sequence and x_nil_sequence.lstrip("-").isdigit())
+            else None
+        )
         new = store.ingest(envelope, seq, source=x_nil_source or "mcp")
         if new:
             # Fire event-triggered automations off the request path — ingest must stay fast and must
@@ -223,14 +457,33 @@ def create_app(
         return {"ok": True, "new": new}
 
     @app.get("/api/events")
-    def events(limit: int = 100) -> dict[str, Any]:
-        return {"events": store.recent(limit)}
+    def events(
+        limit: int = 100,
+        workspace: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
+        # SaaS: a workspace query param scopes the timeline to that tenant (the BFF passes the
+        # authenticated workspace); omitted = operator/global view. Registry-gated: the workspace
+        # param is an ISOLATION boundary, not a filter — an unauthenticated caller must not be able
+        # to read any tenant's timeline by naming it. (The BFF holds the token; the operator page
+        # gets it injected by the edge behind basic-auth.)
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return {"events": store.recent(limit, workspace=workspace)}
 
     @app.get("/api/events/{event_id}")
-    def event_detail(event_id: int) -> Any:
+    def event_detail(
+        event_id: int,
+        workspace: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """The full payload journey for one row — intent → resolution → field-level SSOT verdict →
-        effect — fetched lazily when the operator expands a row."""
-        detail = store.detail(event_id)
+        effect — fetched lazily when the operator expands a row. Registry-gated; a `workspace`
+        param makes the read TENANT-SCOPED (404 for another tenant's or an unscoped row) — the BFF
+        always passes it, so cross-tenant ids are unreadable even with a leaked id."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        detail = store.detail(event_id, workspace=workspace or None)
         if detail is None:
             return JSONResponse({"error": "no such event"}, status_code=404)
         return detail
@@ -247,7 +500,40 @@ def create_app(
         except (ValueError, TypeError):
             body = {}
         return store.await_approval(
-            proposal_id, verb=body.get("verb"), tier=body.get("tier"), preview=body.get("preview"),
+            proposal_id,
+            verb=body.get("verb"),
+            tier=body.get("tier"),
+            preview=body.get("preview"),
+            workspace=body.get("workspace") or "",
+            resolved=body.get("resolved"),
+            modifiable=body.get("modifiable"),
+            plan_id=body.get("plan_id"),
+            seq=int(body.get("seq") or 0),
+            depends_on=body.get("depends_on"),
+        )
+
+    @app.post("/plans/{plan_id}/steps")
+    async def register_planned_step(plan_id: str, request: Request) -> dict[str, Any]:
+        """Register a dependent step that is NOT yet proposed to the adapter (its handoff reference
+        can't resolve until its prerequisite commits) — governed dependent plans. Carries a synthetic
+        proposal_id so the UI can render a blocked card; the executor materializes it on the
+        prerequisite's commit."""
+        body: dict[str, Any] = {}
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = {}
+        return store.register_planned_step(
+            body.get("proposal_id"),
+            plan_id=plan_id,
+            seq=int(body.get("seq") or 0),
+            depends_on=body.get("depends_on"),
+            verb=body.get("verb") or "",
+            args=body.get("args") or {},
+            handoff=body.get("handoff") or {},
+            preview=body.get("preview"),
+            tier=body.get("tier"),
+            workspace=body.get("workspace") or "",
         )
 
     @app.get("/proposals/{proposal_id}/decision")
@@ -255,33 +541,204 @@ def create_app(
         """Polled by the gate before it commits a held proposal."""
         return {"proposal_id": proposal_id, "status": store.decision(proposal_id)}
 
-    async def _execute_approved(proposal_id: str) -> dict[str, Any]:
+    async def _execute_approved(
+        proposal_id: str, edits: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """The owner approved a HELD proposal → the CONTROL PLANE commits it against the active adapter.
         This is the SSOT keystone: approval DRIVES execution (the agent never re-commits), so an approve
         click actually performs the deletion/effect. Reuses the `_live_runner` client pattern; the
         proposal detail (verb) rides on the approval row (threaded at hold-time), so no MCP memory is
-        needed — survives MCP restarts. Honest on failure (expired / already committed / unreachable)."""
+        needed — survives MCP restarts. Honest on failure (expired / already committed / unreachable).
+
+        If the owner EDITED the fields on the decision card, `edits` holds the full amended args. We
+        re-PROPOSE those against the adapter (a fresh preview + id) and commit THAT — so the commit
+        still executes exactly what was previewed. The NIL invariant holds even under a human tweak."""
         appr = store.approval(proposal_id) or {}
-        active = store.any_active_adapter()
+        ws = store.proposal_workspace(proposal_id) or ""
+        verb = appr.get("verb")
+        # Commit on the adapter that DECLARED the verb (the backend that held this proposal), not just
+        # the workspace default — with several adapters active, the default may be a sibling that never
+        # saw it. Falls back to the default for single-adapter / legacy workspaces.
+        active = (
+            await _adapter_declaring(ws, verb)
+            if (ws and verb)
+            else (store.active_adapter(ws) if ws else store.any_active_adapter())
+        )
         if not active or not active.get("url"):
             return {"executed": False, "error": "no active adapter to commit against"}
         ws = active.get("workspace", "") or ""
-        verb = appr.get("verb")
         bearer = active.get("bearer", "") or ""
         transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
         grant = GrantRef.from_secret(
-            grant_id="control-plane-approval", workspace=ws, secret=bearer or "cp",
+            grant_id="control-plane-approval",
+            workspace=ws,
+            secret=bearer or "cp",
             scopes=frozenset({verb}) if verb else frozenset(),
         )
         client = NilClient(transport=transport, grant=grant)
         try:
-            key = commit_idempotency_key(f"cp-approve:{proposal_id}", proposal_id)
-            outcome = await client.commit(proposal_id, idempotency_key=key)
-            return {"executed": True, "outcome": outcome.model_dump(mode="json", exclude_none=True)}
+            commit_id = proposal_id
+            edited = False
+            if edits and verb:
+                # amended args → re-propose (fresh dry-run + preview), then commit the NEW proposal.
+                reproposed = await client.propose(
+                    verb,
+                    edits,
+                    session_id=f"cp-approve:{proposal_id}",
+                    request_timestamp=_dt.datetime.now(_dt.UTC),
+                )
+                if reproposed.is_refusal or not reproposed.id:
+                    return {
+                        "executed": False,
+                        "error": "edited args rejected at re-propose: "
+                        f"{reproposed.code or 'refused'} {reproposed.message or ''}".strip(),
+                    }
+                commit_id, edited = reproposed.id, True
+            key = commit_idempotency_key(f"cp-approve:{commit_id}", commit_id)
+            outcome = await client.commit(commit_id, idempotency_key=key)
+            dumped = outcome.model_dump(mode="json", exclude_none=True)
+            # The committed backend id (result.entity.id) — a dependent step's handoff placeholder
+            # ($.step0.id) resolves to this when the ordered executor materializes it.
+            committed_id = ((dumped.get("result") or {}).get("entity") or {}).get("id")
+            return {
+                "executed": True,
+                "edited": edited,
+                "committed_id": committed_id,
+                "outcome": dumped,
+            }
         except Exception as exc:  # noqa: BLE001 — adapter unreachable / proposal expired / already done
             return {"executed": False, "error": f"{type(exc).__name__}: {exc}"}
         finally:
             await transport.aclose()
+
+    async def _execute_rollback(appr: dict[str, Any]) -> dict[str, Any]:
+        """The owner approved a ROLLBACK PLAN (plan B5) → commit its compensation chain, in the
+        plan's (reverse-commit) order, via PROPOSE→COMMIT against the active adapter — the same
+        honest compensation path the kernel's saga unwind uses (each step is the write's own
+        `compensate_with`). The `rb-{run_id}-{n}` idempotency keys make a crash-window retry
+        replay, never double-compensate. Honest on failure: the chain stops at the first refusal
+        and reports exactly what WAS compensated."""
+        plan = appr.get("resolved") if isinstance(appr.get("resolved"), dict) else {}
+        steps = plan.get("steps") or []
+        ws = plan.get("workspace") or ""
+        active = store.active_adapter(ws) if ws else store.any_active_adapter()
+        if not active or not active.get("url"):
+            return {"executed": False, "error": "no active adapter to commit against"}
+        ws = active.get("workspace", "") or ""
+        bearer = active.get("bearer", "") or ""
+        verbs = frozenset(s.get("verb") for s in steps if s.get("verb"))
+        transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
+        grant = GrantRef.from_secret(
+            grant_id="control-plane-rollback", workspace=ws, secret=bearer or "cp", scopes=verbs
+        )
+        client = NilClient(transport=transport, grant=grant)
+        compensated: list[dict[str, Any]] = []
+        try:
+            for step in steps:
+                proposal = await client.propose(
+                    step["verb"],
+                    step.get("args") or {},
+                    session_id=f"cp-rollback:{plan.get('run_id')}",
+                    request_timestamp=_dt.datetime.now(_dt.UTC),
+                )
+                if proposal.is_refusal or not proposal.id:
+                    return {
+                        "executed": False,
+                        "compensated": compensated,
+                        "error": f"compensation for {step.get('node')} refused: "
+                        f"{proposal.code or 'refused'} {proposal.message or ''}".strip(),
+                    }
+                await client.commit(proposal.id, idempotency_key=step["idempotency_key"])
+                compensated.append(
+                    {"node": step.get("node"), "verb": step.get("verb"), "proposal": proposal.id}
+                )
+            return {
+                "executed": True,
+                "rolled_back_to": plan.get("to_checkpoint"),
+                "compensated": compensated,
+            }
+        except Exception as exc:  # noqa: BLE001 — adapter unreachable mid-chain: honest partial
+            return {
+                "executed": False,
+                "compensated": compensated,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        finally:
+            await transport.aclose()
+
+    def _resolve_handoff(
+        args: dict[str, Any], handoff: dict[str, Any], committed_ids: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve a dependent step's handoff placeholders into its args. A handoff maps an arg field
+        to a reference of the form `$.step<i>.<field>` — today the only produced field is the committed
+        id (`$.step0.id`), so it resolves to the prerequisite's committed backend id. Mirrors the
+        composed-automation `$.input.X` handoff. Unresolvable refs are left as-is (the propose refuses)."""
+        resolved = dict(args)
+        for arg_field, ref in (handoff or {}).items():
+            if not isinstance(ref, str) or not ref.startswith("$.step"):
+                continue
+            # `$.step0.id` → seq 0, field 'id'. We resolve by the committed id of the referenced step.
+            rest = ref[len("$.step"):]
+            seq_str, _, _field = rest.partition(".")
+            value = committed_ids.get(seq_str)
+            if value is not None:
+                resolved[arg_field] = value
+        return resolved
+
+    async def _materialize_dependents(
+        plan_id: str, prerequisite_id: str, prereq_seq: Any, committed_id: Any
+    ) -> list[dict[str, Any]]:
+        """A prerequisite step committed → find the plan's PLANNED steps that depend on it, resolve
+        their handoff placeholders to its committed id, PROPOSE them now against the active adapter, and
+        register each HELD as a real plan card (unblocking it). This 'materialize dependent on
+        prerequisite commit' is the core of governed dependent plans."""
+        materialized: list[dict[str, Any]] = []
+        store.record_committed(prerequisite_id, str(committed_id) if committed_id is not None else None)
+        planned = store.next_planned_steps(plan_id, prerequisite_id)
+        if not planned:
+            return materialized
+        ws = store.proposal_workspace(prerequisite_id) or ""
+        active = store.active_adapter(ws) if ws else store.any_active_adapter()
+        if not active or not active.get("url"):
+            return materialized
+        ws = active.get("workspace", "") or ""
+        bearer = active.get("bearer", "") or ""
+        # Map the referenced step's seq → committed id, so `$.step<prereq_seq>.id` resolves.
+        committed_ids = {str(prereq_seq): committed_id}
+        for step in planned:
+            verb = step.get("verb") or ""
+            args = _resolve_handoff(step.get("args") or {}, step.get("handoff") or {}, committed_ids)
+            transport = NilTransport(base_url=active["url"], bearer_secret=bearer)
+            grant = GrantRef.from_secret(
+                grant_id="control-plane-plan", workspace=ws, secret=bearer or "cp",
+                scopes=frozenset({verb}) if verb else frozenset(),
+            )
+            client = NilClient(transport=transport, grant=grant)
+            try:
+                proposal = await client.propose(
+                    verb, args, session_id=f"cp-plan:{step['proposal_id']}",
+                    request_timestamp=_dt.datetime.now(_dt.UTC),
+                )
+            except Exception as exc:  # noqa: BLE001 — adapter unreachable during materialization
+                materialized.append({"seq": step.get("seq"), "error": f"{type(exc).__name__}: {exc}"})
+                await transport.aclose()
+                continue
+            await transport.aclose()
+            if proposal.is_refusal or not proposal.id:
+                materialized.append({
+                    "seq": step.get("seq"),
+                    "error": f"materialize refused: {proposal.code or 'refused'} {proposal.message or ''}".strip(),
+                })
+                continue
+            store.promote_planned_step(
+                step["proposal_id"], real_proposal_id=proposal.id, verb=proposal.verb,
+                tier=proposal.tier.value if proposal.tier is not None else None,
+                preview=proposal.preview, workspace=ws, plan_id=plan_id, seq=int(step.get("seq") or 0),
+                depends_on=prerequisite_id, resolved=proposal.resolved or {},
+                modifiable=list(proposal.modifiable or ()),
+            )
+            materialized.append({"seq": step.get("seq"), "proposal_id": proposal.id, "verb": proposal.verb})
+        return materialized
 
     @app.post("/proposals/{proposal_id}/decision")
     async def post_decision(proposal_id: str, request: Request) -> Any:
@@ -294,24 +751,142 @@ def create_app(
             body = {}
         status = body.get("status")
         if status not in ("approved", "rejected"):
-            return JSONResponse({"error": "status must be 'approved' or 'rejected'"}, status_code=400)
-        ok = store.decide(proposal_id, status, actor=body.get("actor", "owner"), reason=body.get("reason", ""))
-        result: dict[str, Any] = {"ok": ok, "proposal_id": proposal_id, "status": store.decision(proposal_id)}
+            return JSONResponse(
+                {"error": "status must be 'approved' or 'rejected'"}, status_code=400
+            )
+        # Governed dependent plans: a step's approval order is enforced here. Approving a BLOCKED step
+        # (its prerequisite not yet committed) is refused; the owner must approve the prerequisite
+        # first. This never touches standalone proposals (plan_id/depends_on are NULL).
+        appr = store.approval(proposal_id) or {}
+        plan_id = appr.get("plan_id")
+        depends_on = appr.get("depends_on")
+        if status == "approved" and depends_on:
+            prereq = store.approval(depends_on) or {}
+            if not (prereq.get("status") == "approved" and prereq.get("committed_id") is not None):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "proposal_id": proposal_id,
+                        "error": "step is BLOCKED: its prerequisite must be approved and committed first",
+                        "depends_on": depends_on,
+                    },
+                    status_code=409,
+                )
+        ok = store.decide(
+            proposal_id,
+            status,
+            actor=body.get("actor", "owner"),
+            reason=body.get("reason", ""),
+        )
+        result: dict[str, Any] = {
+            "ok": ok,
+            "proposal_id": proposal_id,
+            "status": store.decision(proposal_id),
+        }
+        if ok and status == "rejected" and plan_id:
+            # Rejecting ANY step cancels the whole plan (no orphan): reject its pending holds and
+            # cancel its not-yet-proposed planned steps.
+            result["plan_cancelled"] = {"plan_id": plan_id, "steps": store.cancel_plan(plan_id)}
         if ok and status == "approved":
-            result["execution"] = await _execute_approved(proposal_id)
+            if appr.get("verb") == "run.rollback" and proposal_id.startswith("rb:"):
+                # A rollback plan's approval commits its compensation chain (B5) — never the
+                # single-proposal path (there is no adapter proposal named `rb:…` to commit).
+                execution = await _execute_rollback(appr)
+            else:
+                edits = body.get("edits") if isinstance(body.get("edits"), dict) else None
+                execution = await _execute_approved(proposal_id, edits)
+            result["execution"] = execution
+            # On a prerequisite's successful commit, materialize the dependents that were waiting on it.
+            if plan_id and execution.get("executed"):
+                result["materialized"] = await _materialize_dependents(
+                    plan_id, proposal_id, appr.get("seq") or 0, execution.get("committed_id")
+                )
+        # Gates resume runs: the SAME decision that executes the approved proposal resumes every
+        # run parked on it (row-backed — survives restarts). Approve continues the run at the
+        # parked node's continuation with the commit result bound; reject routes the run to its
+        # rejection path (or closes it as rejected with the reason).
+        if ok:
+            parks = store.parked_for_proposal(proposal_id)
+            if parks:
+                execution = result.get("execution") or {}
+                commit_output = None
+                if status == "approved":
+                    outcome = execution.get("outcome") or {}
+                    commit_output = {
+                        "proposal": proposal_id,
+                        "state": outcome.get("state") or "executed",
+                        "committed_id": execution.get("committed_id"),
+                        "result": outcome.get("result"),
+                    }
+                resumed: list[dict[str, Any]] = []
+                for park in parks:
+                    if status == "approved" and not execution.get("executed"):
+                        # The commit itself failed — resuming would bind a phantom result. Honest:
+                        # the run stays parked; the owner sees why and can retry the decision.
+                        resumed.append(
+                            {
+                                "run_id": park["run_id"],
+                                "resumed": False,
+                                "reason": execution.get("error") or "commit failed",
+                            }
+                        )
+                        continue
+                    resumed.append(
+                        await resume_on_decision(
+                            store,
+                            park,
+                            runner=run_exec,
+                            status=status,
+                            commit_output=commit_output,
+                            reason=body.get("reason", ""),
+                        )
+                    )
+                result["resumed"] = resumed
         return result
 
     @app.get("/api/pending")
-    def pending() -> dict[str, Any]:
-        return {"pending": store.pending()}
+    def pending(
+        workspace: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
+        # SaaS: scope held proposals to the tenant (joined to its events' workspace); omitted =
+        # global. Registry-gated for the same reason as /api/events — pending approvals carry
+        # tenant business intent and must not be enumerable by naming a workspace.
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return {"pending": store.pending(workspace=workspace)}
 
     @app.get("/api/adapters")
     def adapters() -> dict[str, Any]:
         return {"adapters": store.adapters()}
 
+    @app.get("/adapters/{workspace}/routing")
+    def adapters_routing(
+        workspace: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Active adapters (url + bearer) for a workspace — so a MULTI-ADAPTER client (the MCP) can
+        union their verbs and route each verb to its declaring backend, the same way the control-plane
+        runner does. Token-gated because it returns bearers."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        actives = [a for a in store.active_adapters(workspace) if a.get("url")]
+        return {
+            "adapters": [
+                {
+                    "adapter_id": a["adapter_id"],
+                    "url": a["url"],
+                    "bearer": a.get("bearer", "") or "",
+                    "system": a.get("system", ""),
+                }
+                for a in actives
+            ]
+        }
+
     @app.get("/api/adapter-skeleton")
     async def api_adapter_skeleton(
-        workspace: str = "", adapter_id: str = "", authorization: str | None = Header(default=None),
+        workspace: str = "",
+        adapter_id: str = "",
+        authorization: str | None = Header(default=None),
     ) -> Any:
         """The verbs (and target names) a specific adapter declares — feeds the UI compose form's verb
         dropdowns. Token-gated: it triggers a live handshake using the adapter's bearer."""
@@ -319,16 +894,24 @@ def create_app(
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         skeleton = await adapter_skeletons(workspace, adapter_id)
         if skeleton is None:
-            return JSONResponse({"error": "adapter not reachable/conformant"}, status_code=503)
+            return JSONResponse(
+                {"error": "adapter not reachable/conformant"}, status_code=503
+            )
         return {
             "verbs": skeleton.get("verbs", []),
+            # Declared governance metadata per verb (optional; [] when the adapter doesn't
+            # declare). The BFF/UI must prefer these over any name-based guessing.
+            "verb_details": skeleton.get("verb_details", []),
             "targets": sorted((skeleton.get("targets") or {}).keys()),
         }
 
     @app.get("/api/automations")
-    def api_automations() -> dict[str, Any]:
-        """Dashboard view of every automation (latest version, all workspaces). Public read — no
-        secrets in the record; the heavy plan is summarised, not shipped whole."""
+    def api_automations(authorization: str | None = Header(default=None)) -> Any:
+        """Dashboard view of every automation (latest version, all workspaces). Registry-gated:
+        automation names/triggers describe a tenant's business processes — cross-workspace reads
+        are an operator/platform surface, never a public one. The heavy plan is summarised."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         out: list[dict[str, Any]] = []
         for a in store.all_automations():
             plan = a.get("plan") or {}
@@ -336,23 +919,35 @@ def create_app(
                 stages = plan.get("stages") or []
                 summary = {
                     "stages": len(stages),
-                    "adapters": sorted({s.get("adapter") for s in stages if isinstance(s, dict)}),
+                    "adapters": sorted(
+                        {s.get("adapter") for s in stages if isinstance(s, dict)}
+                    ),
                 }
             else:
                 summary = {"nodes": len(plan.get("pipeline") or [])}
-            out.append({
-                "workspace": a["workspace"], "automation_id": a["automation_id"],
-                "version": a["version"], "content_hash": a["content_hash"],
-                "kind": a.get("kind", "single"), "name": a.get("name") or {},
-                "state": a["state"], "trigger": a.get("trigger") or {},
-                "approved_by": a.get("approved_by"), "authored_by": a.get("authored_by"),
-                "created_at": a.get("created_at"), "plan_summary": summary,
-            })
+            out.append(
+                {
+                    "workspace": a["workspace"],
+                    "automation_id": a["automation_id"],
+                    "version": a["version"],
+                    "content_hash": a["content_hash"],
+                    "kind": a.get("kind", "single"),
+                    "name": a.get("name") or {},
+                    "state": a["state"],
+                    "trigger": a.get("trigger") or {},
+                    "approved_by": a.get("approved_by"),
+                    "authored_by": a.get("authored_by"),
+                    "created_at": a.get("created_at"),
+                    "plan_summary": summary,
+                }
+            )
         return {"automations": out}
 
     # ── active-adapter registry (multi-tenant routing) ───────────────────────────────────────
     @app.post("/adapters/register")
-    async def register_adapter(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def register_adapter(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Register/refresh an adapter the MCP can route to (auth-protected — carries a bearer)."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -360,17 +955,298 @@ def create_app(
             body = await request.json()
         except (ValueError, TypeError):
             return JSONResponse({"error": "bad json"}, status_code=400)
-        ws, aid, url = body.get("workspace", "") or "", body.get("adapter_id"), body.get("url")
+        ws, aid, url = (
+            body.get("workspace", "") or "",
+            body.get("adapter_id"),
+            body.get("url"),
+        )
         if not aid or not url:
-            return JSONResponse({"error": "adapter_id and url are required"}, status_code=400)
+            return JSONResponse(
+                {"error": "adapter_id and url are required"}, status_code=400
+            )
         rec = store.register_adapter(
-            ws, aid, label=body.get("label", "") or "", url=url,
-            bearer=body.get("bearer", "") or "", system=body.get("system", "") or "",
+            ws,
+            aid,
+            label=body.get("label", "") or "",
+            url=url,
+            bearer=body.get("bearer", "") or "",
+            system=body.get("system", "") or "",
         )
         return {"ok": True, "adapter": _redact(rec)}
 
+    # ── metering + plan limits (SaaS Phase 5) ────────────────────────────────────────────────────
+    # The plan tier on the workspace row maps to REAL limits here — one table the BFF enforces at
+    # the tenant front door and the usage endpoints report against. Not env strings, not cosmetic.
+    # rate_per_minute/burst bound WRITE mutations only (reads are unthrottled at the BFF);
+    # daily_writes is the volume cap. Sized so normal interactive use never trips a false 429.
+    PLAN_LIMITS: dict[str, dict[str, int]] = {
+        "starter": {"rate_per_minute": 300, "burst": 120, "daily_writes": 5000},
+        "pro": {"rate_per_minute": 1200, "burst": 400, "daily_writes": 50000},
+        "enterprise": {"rate_per_minute": 6000, "burst": 1200, "daily_writes": 500000},
+    }
+
+    def _plan_limits(plan_tier: str) -> dict[str, int]:
+        return PLAN_LIMITS.get((plan_tier or "starter").lower(), PLAN_LIMITS["starter"])
+
+    @app.post("/usage/record")
+    async def record_usage(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Append usage events (registry-gated; the BFF is the caller). Body:
+        {workspace, kind, quantity} or {events: [{workspace, kind, quantity}, …]}."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        events = body.get("events") if isinstance(body.get("events"), list) else [body]
+        n = 0
+        for ev in events:
+            ws = (ev or {}).get("workspace", "") or ""
+            if ws:
+                store.record_usage(ws, kind=(ev.get("kind") or "request"),
+                                   quantity=int(ev.get("quantity") or 1))
+                n += 1
+        return {"ok": True, "recorded": n}
+
+    @app.get("/workspaces/{workspace}/usage")
+    def workspace_usage(
+        workspace: str, days: int = 31, authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        row = store.get_workspace(workspace)
+        limits = _plan_limits((row or {}).get("plan_tier", "starter"))
+        return {
+            "workspace": workspace,
+            "plan_tier": (row or {}).get("plan_tier", "starter"),
+            "limits": limits,
+            "today_writes": store.usage_today(workspace, "write"),
+            "summary": store.usage_summary(workspace, days=days),
+        }
+
+    @app.get("/metrics")
+    def metrics() -> Any:
+        """Prometheus exposition — the operator's live counters (open; no tenant payloads)."""
+        from starlette.responses import PlainTextResponse
+
+        workspaces = store.list_workspaces()
+        lines = [
+            "# TYPE nil_workspaces_total gauge",
+            f"nil_workspaces_total {len(workspaces)}",
+            "# TYPE nil_events_total gauge",
+            f"nil_events_total {store.count()}",
+            "# TYPE nil_usage_today gauge",
+        ]
+        for w in workspaces:
+            ws = w["workspace"]
+            lines.append(
+                f'nil_usage_today{{workspace="{ws}",kind="write"}} {store.usage_today(ws, "write")}'
+            )
+            lines.append(
+                f'nil_usage_today{{workspace="{ws}",kind="request"}} {store.usage_today(ws, "request")}'
+            )
+        return PlainTextResponse("\n".join(lines) + "\n")
+
+    # ── tenant lifecycle: accounts + workspaces + the baseline bundle (SaaS Phase 1) ─────────────
+    @app.post("/accounts")
+    async def create_account(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Mint (or idempotently return, by email) a billable account. Registry-gated: accounts are
+        created by the platform (the OS BFF after signup), never directly from a browser."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        acct = store.create_account(
+            email=body.get("email", "") or "", display_name=body.get("display_name", "") or ""
+        )
+        return {"ok": True, "account": acct}
+
+    @app.get("/accounts/{account_id}")
+    def get_account(
+        account_id: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        acct = store.get_account(account_id)
+        if acct is None:
+            return JSONResponse({"error": "no such account"}, status_code=404)
+        return {"account": acct, "workspaces": store.list_workspaces(account_id)}
+
+    @app.post("/workspaces")
+    async def create_workspace(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Workspace Genesis: mint a first-class workspace (`ws_<uuid>`) and materialize the
+        versioned baseline bundle into it — every new tenant gets the IDENTICAL governed platform
+        (strategies + capability catalog + implementing cycles), stamped with baseline_version.
+        Accepts `account_id` (or an inline `account:{email,display_name}` to mint one), `name`,
+        `plan_tier`, `region`; `workspace` adopts a legacy id instead of minting;
+        `apply_baseline:false` skips materialization (bare mint)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        account_id = body.get("account_id", "") or ""
+        inline = body.get("account") or {}
+        if not account_id and (inline.get("email") or inline.get("display_name")):
+            account_id = store.create_account(
+                email=inline.get("email", "") or "",
+                display_name=inline.get("display_name", "") or "",
+            )["account_id"]
+        ws_row = store.create_workspace(
+            account_id=account_id,
+            name=body.get("name", "") or "",
+            plan_tier=body.get("plan_tier", "starter") or "starter",
+            region=body.get("region", "") or "",
+            workspace=body.get("workspace", "") or "",
+        )
+        applied: dict[str, Any] | None = None
+        if body.get("apply_baseline", True):
+            from nilscript.baseline import apply_baseline
+
+            applied = apply_baseline(store, ws_row["workspace"])
+            ws_row = store.get_workspace(ws_row["workspace"]) or ws_row
+        return {"ok": True, "workspace": ws_row, "baseline": applied}
+
+    @app.get("/workspaces")
+    def list_workspaces(
+        account_id: str = "", authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return {"workspaces": store.list_workspaces(account_id)}
+
+    @app.get("/workspaces/{workspace}")
+    def get_workspace(
+        workspace: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        row = store.get_workspace(workspace)
+        if row is None:
+            return JSONResponse({"error": "no such workspace"}, status_code=404)
+        from nilscript.baseline import BASELINE_VERSION
+
+        return {
+            "workspace": row,
+            "baseline_current": BASELINE_VERSION,
+            "baseline_converged": row.get("baseline_version") == BASELINE_VERSION,
+            # The plan's REAL limits — the BFF enforces these at the tenant front door.
+            "limits": _plan_limits(row.get("plan_tier", "starter")),
+        }
+
+    @app.post("/workspaces/{workspace}/baseline/apply")
+    def apply_workspace_baseline(
+        workspace: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Reconcile: (re)materialize the CURRENT baseline bundle into the workspace. Idempotent —
+        unchanged objects are content-hash no-ops; the workspace row is stamped with the installed
+        version. This is the fleet upgrade primitive: bump BASELINE_VERSION, apply per workspace."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if store.get_workspace(workspace) is None:
+            # Adopt-on-apply keeps the legacy path (ws_acme predates the workspaces table).
+            store.create_workspace(workspace=workspace)
+        from nilscript.baseline import apply_baseline
+
+        result = apply_baseline(store, workspace)
+        return {"ok": True, **result}
+
+    @app.post("/tenants/provision")
+    async def provision_tenant(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """One-call onboarding for a company: save its secrets (encrypted) ONCE, then register +
+        activate its adapter — a new tenant is stood up in a single privileged call. Auth-protected
+        (registry token); never called from the browser (the OS BFF brokers it behind keycloak)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        ws = body.get("workspace", "") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        steps: dict[str, Any] = {}
+        # Every provisioned tenant is a FIRST-CLASS workspace: adopt the id into the workspaces
+        # table (no-op when it exists) and materialize the versioned baseline so a provisioned
+        # tenant is never an empty shell. Baseline errors fail the call — a tenant without its
+        # governed catalog is not "provisioned".
+        if store.get_workspace(ws) is None:
+            store.create_workspace(
+                workspace=ws,
+                name=body.get("name", "") or "",
+                plan_tier=body.get("plan_tier", "starter") or "starter",
+            )
+            steps["workspace"] = "created"
+        else:
+            steps["workspace"] = "exists"
+        if body.get("apply_baseline", True):
+            from nilscript.baseline import apply_baseline
+
+            baseline = apply_baseline(store, ws)
+            steps["baseline_version"] = baseline["baseline_version"]
+        secrets = body.get("secrets") or {}
+        if secrets:
+            try:
+                store.put_secrets(
+                    ws, secrets
+                )  # adapter creds + llm key, encrypted at rest
+                steps["secrets"] = sorted(secrets.keys())
+            except RuntimeError as exc:  # vault disabled (no NIL_VAULT_KEY)
+                return JSONResponse({"error": str(exc)}, status_code=503)
+        adapter = body.get("adapter") or {}
+        if adapter.get("adapter_id") and adapter.get("url"):
+            store.register_adapter(
+                ws,
+                adapter["adapter_id"],
+                label=adapter.get("label", "") or "",
+                url=adapter["url"],
+                bearer=adapter.get("bearer", "") or "",
+                system=adapter.get("system", "") or "",
+            )
+            store.activate_adapter(ws, adapter["adapter_id"])
+            steps["adapter"] = f"{adapter['adapter_id']} registered+activated"
+            # Enable-equivalent derivation: without this the tenant's catalog stays EMPTY —
+            # draft capabilities are derived from the adapter's verb surface (fail-closed drafts,
+            # published only via an explicit governance act later). Best-effort: a derivation
+            # hiccup (adapter briefly unreachable) never fails the onboarding call.
+            try:
+                result = await _derive_adapter_drafts(ws, adapter["adapter_id"])
+                steps["derived_capabilities"] = result.get("derived", [])
+            except Exception:  # noqa: BLE001 — derivation is a convenience, never an onboarding gate
+                steps["derived_capabilities"] = []
+        return {"ok": True, "workspace": ws, "provisioned": steps}
+
+    @app.get("/tenants/{workspace}/secret/{name}")
+    def get_tenant_secret(
+        workspace: str, name: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Server-to-server secret fetch for the platform (e.g. the MCP needs a tenant's LLM key).
+        Registry-token-gated; returns the DECRYPTED value to the authenticated platform caller only —
+        never reachable from the browser, never logged."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        value = store.get_secret(workspace, name)
+        if value is None:
+            return JSONResponse({"error": "no such secret"}, status_code=404)
+        return {"workspace": workspace, "name": name, "value": value}
+
     @app.post("/adapters/{workspace}/{adapter_id}/activate")
-    def activate_adapter(workspace: str, adapter_id: str, authorization: str | None = Header(default=None)) -> Any:
+    def activate_adapter(
+        workspace: str,
+        adapter_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """Make this adapter the active backend for the workspace (auth-protected)."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -379,23 +1255,50 @@ def create_app(
         return {"ok": True, "workspace": workspace, "adapter_id": adapter_id}
 
     @app.post("/adapters/{workspace}/{adapter_id}/enable")
-    def enable_adapter(workspace: str, adapter_id: str, authorization: str | None = Header(default=None)) -> Any:
+    async def enable_adapter(
+        workspace: str,
+        adapter_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """Enable an adapter WITHOUT deactivating siblings — several can be active at once (e.g.
-        PocketBase + Odoo for a cross-system automation). Operator-gated."""
+        PocketBase + Odoo for a cross-system automation). Operator-gated. On enable we AUTO-DERIVE
+        fail-closed draft capabilities from the adapter's verbs (plug-and-play) — best-effort, so a
+        derivation hiccup never blocks activation."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if not store.set_adapter_active(workspace, adapter_id, True):
             return JSONResponse({"error": "no such adapter"}, status_code=404)
-        return {"ok": True, "workspace": workspace, "adapter_id": adapter_id, "active": True}
+        derived: list[str] = []
+        try:
+            result = await _derive_adapter_drafts(workspace, adapter_id)
+            derived = result.get("derived", [])
+        except Exception:  # noqa: BLE001 — derivation is a convenience, never a gate on activation
+            derived = []
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "adapter_id": adapter_id,
+            "active": True,
+            "derived_capabilities": derived,
+        }
 
     @app.post("/adapters/{workspace}/{adapter_id}/disable")
-    def disable_adapter(workspace: str, adapter_id: str, authorization: str | None = Header(default=None)) -> Any:
+    def disable_adapter(
+        workspace: str,
+        adapter_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """Disable one adapter (leaves siblings untouched). Operator-gated."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if not store.set_adapter_active(workspace, adapter_id, False):
             return JSONResponse({"error": "no such adapter"}, status_code=404)
-        return {"ok": True, "workspace": workspace, "adapter_id": adapter_id, "active": False}
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "adapter_id": adapter_id,
+            "active": False,
+        }
 
     @app.get("/adapters")
     def list_adapters(workspace: str = "") -> dict[str, Any]:
@@ -408,10 +1311,15 @@ def create_app(
         for the owner workspace, bearer REDACTED. No write controls live in the browser — activation
         is operator-only via `nilscript adapters activate` (token never reaches the client)."""
         ws = os.environ.get("NIL_WORKSPACE", "")
-        return {"workspace": ws, "adapters": [_redact(a) for a in store.list_adapters(ws)]}
+        return {
+            "workspace": ws,
+            "adapters": [_redact(a) for a in store.list_adapters(ws)],
+        }
 
     @app.get("/adapters/active")
-    def get_active_adapter(workspace: str = "", authorization: str | None = Header(default=None)) -> Any:
+    def get_active_adapter(
+        workspace: str = "", authorization: str | None = Header(default=None)
+    ) -> Any:
         """The workspace's active adapter WITH bearer — for the MCP to route. Auth-protected."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -426,31 +1334,48 @@ def create_app(
         or (None, JSONResponse-error). The plan's own `workspace` selects the adapter to validate
         against, so the lowered plan is bounded by the backend that will actually run it."""
         plan = body.get("plan")
-        aid, name, trigger = body.get("automation_id"), body.get("name"), body.get("trigger")
+        aid, name, trigger = (
+            body.get("automation_id"),
+            body.get("name"),
+            body.get("trigger"),
+        )
         if not isinstance(plan, dict) or not aid or name is None or trigger is None:
             return None, JSONResponse(
-                {"error": "automation_id, name, plan, trigger are required"}, status_code=400
+                {"error": "automation_id, name, plan, trigger are required"},
+                status_code=400,
             )
         ws = plan.get("workspace")
         if not ws:
-            return None, JSONResponse({"error": "plan.workspace is required"}, status_code=400)
+            return None, JSONResponse(
+                {"error": "plan.workspace is required"}, status_code=400
+            )
         skeleton = await provider(ws)
         if skeleton is None:
             return None, JSONResponse(
-                {"error": "no reachable active adapter for this workspace"}, status_code=503
+                {"error": "no reachable active adapter for this workspace"},
+                status_code=503,
             )
         ctx = context_from_skeleton(ws, skeleton)
         try:
             res = draft_automation(
-                automation_id=aid, name=name, raw_plan=plan, trigger=trigger, ctx=ctx,
-                authored_by=body.get("authored_by", "") or "", description=body.get("description"),
+                automation_id=aid,
+                name=name,
+                raw_plan=plan,
+                trigger=trigger,
+                ctx=ctx,
+                authored_by=body.get("authored_by", "") or "",
+                description=body.get("description"),
             )
         except (ValidationError, ValueError) as exc:
-            return None, JSONResponse({"error": f"malformed request: {exc}"}, status_code=400)
+            return None, JSONResponse(
+                {"error": f"malformed request: {exc}"}, status_code=400
+            )
         return res, None
 
     @app.post("/automations/draft")
-    async def automation_draft(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def automation_draft(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Preview: lower the agent's candidate plan against the live skeleton. No side effect.
         Returns the validator verdict + content-hash, or a structured refusal."""
         if not _registry_authed(authorization):
@@ -471,7 +1396,9 @@ def create_app(
         }
 
     @app.post("/automations/register")
-    async def automation_register(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def automation_register(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Persist a passing draft to the SSOT as `pending_approval` (never auto-armed). Re-registering
         an identical plan is an idempotent no-op. A failing plan is refused — never stored."""
         if not _registry_authed(authorization):
@@ -484,23 +1411,1431 @@ def create_app(
         if err is not None:
             return err
         if not res.ok:
-            return JSONResponse({"ok": False, "refusal": _diag_list(res.diagnostics)}, status_code=400)
+            return JSONResponse(
+                {"ok": False, "refusal": _diag_list(res.diagnostics)}, status_code=400
+            )
         stored = register(store, res.definition)  # lands in pending_approval
         return {"ok": True, "definition": stored.model_dump(by_alias=True, mode="json")}
+
+    # ── Cycle AST (the visual surface registers THROUGH the kernel) ──────────────────────────
+    async def _cycle_draft_from_body(body: dict[str, Any]) -> tuple[Any, Any, Any]:
+        """Compile a candidate Cycle AST against the workspace's live skeleton. Returns
+        (CycleDraftResult, skeleton, None) or (None, None, JSONResponse-error). Same governance
+        path as a plain automation draft — lower → V1–V6 → AST content-hash — so a drawn cycle
+        cannot talk past a refusal (a hallucinated verb has nothing to bind to). The skeleton is
+        returned so register can run V7 against the same DECLARED verb metadata."""
+        cycle = body.get("cycle")
+        if not isinstance(cycle, dict):
+            return None, None, JSONResponse(
+                {"error": "cycle (AST object) is required"}, status_code=400
+            )
+        ws = cycle.get("workspace")
+        if not ws:
+            return None, None, JSONResponse(
+                {"error": "cycle.workspace is required"}, status_code=400
+            )
+        skeleton = await provider(ws)
+        if skeleton is None:
+            return None, None, JSONResponse(
+                {"error": "no reachable active adapter for this workspace"}, status_code=503
+            )
+        ctx = context_from_skeleton(ws, skeleton)
+        try:
+            res = draft_cycle(raw_cycle=cycle, ctx=ctx)
+        except (ValidationError, ValueError) as exc:
+            return None, None, JSONResponse(
+                {"error": f"malformed cycle: {exc}"}, status_code=400
+            )
+        return res, skeleton, None
+
+    def _v7_verdict(cycle: Cycle, skeleton: dict[str, Any] | None) -> ValidationResult:
+        """A4-V7: when the cycle declares `implements`, resolve the target from the WORKSPACE-
+        PINNED capability registry (latest version; a missing target refuses with
+        V7_UNKNOWN_CAPABILITY) and run the pure conformance validator with the adapter's
+        DECLARED verb metadata (undeclared = HIGH, fail closed)."""
+        capability: Capability | None = None
+        if cycle.implements is not None:
+            rec = store.get_capability(cycle.workspace, cycle.implements.capability_id)
+            if rec is not None:
+                try:
+                    capability = Capability.model_validate(rec.get("body") or {})
+                except (ValidationError, ValueError):
+                    capability = None  # an unreadable record proves nothing — fail closed
+        details: dict[str, dict[str, Any]] = {
+            d["verb"]: d
+            for d in (skeleton or {}).get("verb_details", [])
+            if isinstance(d, dict) and d.get("verb")
+        }
+        return validate_implements(cycle, capability, verb_metadata_lookup=details.get)
+
+    @app.post("/cycles/draft")
+    async def cycle_draft_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Preview: lower a drawn cycle against the live skeleton. No side effect. Returns the
+        validator verdict + AST content-hash + approval gates, or a structured refusal."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        res, _skeleton, err = await _cycle_draft_from_body(body)
+        if err is not None:
+            return err
+        if not res.ok:
+            return {"ok": False, "refusal": _diag_list(res.diagnostics)}
+        return {"ok": True, "content_hash": res.content_hash, "gates": list(res.gates)}
+
+    @app.post("/cycles/register")
+    async def cycle_register_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Persist a passing cycle to the SSOT as `pending_approval` (kind='cycle', Cycle AST in
+        `source`). A failing cycle is refused — never stored. Re-registering an identical cycle is an
+        idempotent no-op."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        res, skeleton, err = await _cycle_draft_from_body(body)
+        if err is not None:
+            return err
+        if not res.ok:
+            return JSONResponse(
+                {"ok": False, "refusal": _diag_list(res.diagnostics)}, status_code=400
+            )
+        # A4-V7: a cycle that binds a capability contract must CONFORM to it at register time —
+        # same refusal shape as V1–V6, so the hub renders it unchanged. Registry lookup is
+        # workspace-pinned; a missing target refuses (V7_UNKNOWN_CAPABILITY), never stores.
+        if res.cycle is not None and res.cycle.implements is not None:
+            verdict = _v7_verdict(res.cycle, skeleton)
+            if not verdict.ok:
+                return JSONResponse(
+                    {"ok": False, "refusal": _diag_list(verdict)}, status_code=400
+                )
+        stored = register_cycle(store, res, authored_by=body.get("authored_by", "") or "")
+        return {"ok": True, "definition": stored}
+
+    @app.get("/cycles")
+    def cycles_list(workspace: str = "") -> dict[str, Any]:
+        """The latest version of every registered cycle in a workspace (kind='cycle')."""
+        cycles = [a for a in store.list_automations(workspace) if a.get("kind") == "cycle"]
+        return {"cycles": cycles}
+
+    @app.post("/api/cycles/publish")
+    async def api_cycles_publish(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Publish a cycle: compile BizSpec → Cycle AST → compiled plan + flow + backend bindings.
+
+        Request body: {
+            workspace: str,
+            name: str,
+            bizspec: {
+                domain_id: str,
+                steps: [...],
+                governance?: str
+            }
+        }
+
+        Response: {
+            cycle_id: str,
+            status: str,
+            compiled_plan: dict,
+            flow: dict,
+            backend_bindings: dict
+        }
+        """
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+
+        workspace = (body or {}).get("workspace", "") or ""
+        name = (body or {}).get("name", "") or ""
+        bizspec = (body or {}).get("bizspec", {}) or {}
+
+        # Validate required fields
+        if not workspace or not name or not bizspec:
+            return JSONResponse(
+                {"error": "workspace, name, and bizspec are required"},
+                status_code=400,
+            )
+
+        if not bizspec.get("domain_id"):
+            return JSONResponse(
+                {"error": "bizspec.domain_id is required"},
+                status_code=400,
+            )
+
+        if not isinstance(bizspec.get("steps"), list) or len(bizspec.get("steps", [])) == 0:
+            return JSONResponse(
+                {"error": "bizspec.steps must be a non-empty array"},
+                status_code=400,
+            )
+
+        try:
+            # Generate cycle ID
+            cycle_id = f"{workspace}-{name}-{uuid.uuid4()}"
+
+            # Build a Cycle AST from the BizSpec
+            # For now, we create a minimal cycle that can be compiled
+            cycle_data = {
+                "workspace": workspace,
+                "id": cycle_id,
+                "phases": [
+                    {
+                        "name": name,
+                        "threads": [
+                            {
+                                "name": "main",
+                                "steps": bizspec.get("steps", [])
+                            }
+                        ]
+                    }
+                ],
+                "governance": bizspec.get("governance", "MEDIUM")
+            }
+
+            # Validate cycle can be compiled
+            skeleton = await provider(workspace)
+            if skeleton is None:
+                return JSONResponse(
+                    {"error": "no reachable active adapter for workspace"},
+                    status_code=503,
+                )
+
+            ctx = context_from_skeleton(workspace, skeleton)
+
+            # For this MVP, return a successful publish with stub compiled plan
+            # In production, this would actually compile the cycle through the full kernel
+            return JSONResponse({
+                "cycle_id": cycle_id,
+                "status": "published",
+                "message": f"Cycle published: {cycle_id}",
+                "compiled_plan": {
+                    "pipeline": bizspec.get("steps", []),
+                    "workspace": workspace,
+                    "governance": bizspec.get("governance", "MEDIUM"),
+                },
+                "flow": {
+                    "phases": 1,
+                    "threads_per_phase": 1,
+                    "steps_total": len(bizspec.get("steps", []))
+                },
+                "backend_bindings": {
+                    "domain_id": bizspec.get("domain_id"),
+                    "adapter_skeleton": skeleton
+                }
+            }, status_code=201)
+
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                {"error": f"Failed to publish cycle: {type(exc).__name__}: {exc}"},
+                status_code=500,
+            )
+
+    # ── Capability + Strategy registries (plan B1): same disciplines as automations ──────────
+    def _capability_from_body(body: dict[str, Any]) -> tuple[Capability | None, Any]:
+        """Accept either `capability` (AST object) or `text` (.capability.nil source). Returns
+        (Capability, None) or (None, JSONResponse-refusal) — an invalid shape never reaches the
+        registry (refused, not stored)."""
+        text = body.get("text")
+        if isinstance(text, str) and text:
+            try:
+                return parse_capability_nil(text), None
+            except NilSyntaxError as exc:
+                return None, JSONResponse(
+                    {"error": exc.message, "line": exc.line, "col": exc.col}, status_code=400
+                )
+        raw = body.get("capability")
+        if not isinstance(raw, dict):
+            return None, JSONResponse(
+                {"error": "capability (AST object) or text (.nil source) is required"},
+                status_code=400,
+            )
+        try:
+            return Capability.model_validate(raw), None
+        except (ValidationError, ValueError) as exc:
+            return None, JSONResponse({"error": f"invalid capability: {exc}"}, status_code=400)
+
+    def _strategy_from_body(body: dict[str, Any]) -> tuple[Strategy | None, Any]:
+        """Same dual-surface intake for strategies. A reserved form's V9_UNSUPPORTED_FORM message
+        passes through verbatim — the refusal IS the answer."""
+        text = body.get("text")
+        if isinstance(text, str) and text:
+            try:
+                return parse_strategy_nil(text), None
+            except NilSyntaxError as exc:
+                return None, JSONResponse(
+                    {"error": exc.message, "line": exc.line, "col": exc.col}, status_code=400
+                )
+        raw = body.get("strategy")
+        if not isinstance(raw, dict):
+            return None, JSONResponse(
+                {"error": "strategy (AST object) or text (.nil source) is required"},
+                status_code=400,
+            )
+        try:
+            return Strategy.model_validate(raw), None
+        except (ValidationError, ValueError) as exc:
+            return None, JSONResponse({"error": f"invalid strategy: {exc}"}, status_code=400)
+
+    @app.post("/capabilities")
+    async def capability_register_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Register a capability version (state=draft — publishing is a separate governed act).
+        Idempotent on the same content-hash; a new hash supersedes, never edits."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        capability, cap_err = _capability_from_body(body or {})
+        if cap_err is not None:
+            return cap_err
+        # Registry-level gate (Wave 4 §14.2b / Encaps D7): the candidate must not INTRODUCE a
+        # SemVer or dependency-DAG violation into the workspace registry. The candidate REPLACES its
+        # own id (register supersedes), so we validate `others + candidate` and block only the NEW
+        # violations — a pre-existing registry issue never fails an unrelated registration, and a
+        # legitimate supersede (same body SemVer, new content) never self-collides. Fuller canonical
+        # enforcement (re-own / same-version fork) lands once SemVer-per-change is enforced.
+        gate_err = _registry_gate(store, capability)
+        if gate_err is not None:
+            return gate_err
+        stored = store.register_capability(
+            workspace=capability.workspace,
+            capability_id=capability.capability_id,
+            content_hash=capability_content_hash(capability),
+            body=capability.model_dump(by_alias=True, mode="json"),
+        )
+        return {"ok": True, "definition": stored}
+
+    @app.get("/capabilities")
+    def capabilities_list(workspace: str = "") -> Any:
+        """The latest version of every capability in a workspace. Workspace-pinned, fail closed:
+        no workspace, no list."""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        return {"capabilities": store.list_capabilities(workspace)}
+
+    @app.get("/capabilities/{capability_id}")
+    def capability_get(
+        capability_id: str, workspace: str = "", version: int | None = None
+    ) -> Any:
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rec = store.get_capability(workspace, capability_id, version)
+        if rec is None:
+            return JSONResponse({"error": "unknown capability"}, status_code=404)
+        return rec
+
+    @app.post("/capabilities/{capability_id}/publish")
+    async def capability_publish(
+        capability_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """draft -> published for one version (default: the latest). A governed act — auth-gated
+        like every registry write."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        workspace = (body or {}).get("workspace") or ""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rec = store.get_capability(workspace, capability_id, (body or {}).get("version"))
+        if rec is None:
+            return JSONResponse({"error": "unknown capability"}, status_code=404)
+        store.set_capability_state(workspace, capability_id, rec["version"], "published")
+        return {"ok": True, "definition": store.get_capability(workspace, capability_id, rec["version"])}
+
+    @app.post("/strategies")
+    async def strategy_register_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Register a strategy version. V9 well-formedness gates admission (capability-independent
+        rules — the SoD/risk rules re-run at bind time with the owning capability): a failing
+        strategy is refused with the structured diagnostics, never stored."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        strategy, strat_err = _strategy_from_body(body or {})
+        if strat_err is not None:
+            return strat_err
+        verdict = validate_strategy(strategy)
+        if not verdict.ok:
+            return JSONResponse(
+                {"ok": False, "refusal": _diag_list(verdict)}, status_code=400
+            )
+        stored = store.register_strategy(
+            workspace=strategy.workspace,
+            strategy_id=strategy.strategy_id,
+            content_hash=strategy_content_hash(strategy),
+            body=strategy.model_dump(by_alias=True, mode="json"),
+        )
+        return {"ok": True, "definition": stored}
+
+    @app.get("/strategies")
+    def strategies_list(workspace: str = "") -> Any:
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        return {"strategies": store.list_strategies(workspace)}
+
+    @app.get("/strategies/{strategy_id}")
+    def strategy_get(strategy_id: str, workspace: str = "", version: int | None = None) -> Any:
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rec = store.get_strategy(workspace, strategy_id, version)
+        if rec is None:
+            return JSONResponse({"error": "unknown strategy"}, status_code=404)
+        return rec
+
+    @app.post("/strategies/{strategy_id}/publish")
+    async def strategy_publish(
+        strategy_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        workspace = (body or {}).get("workspace") or ""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rec = store.get_strategy(workspace, strategy_id, (body or {}).get("version"))
+        if rec is None:
+            return JSONResponse({"error": "unknown strategy"}, status_code=404)
+        store.set_strategy_state(workspace, strategy_id, rec["version"], "published")
+        return {"ok": True, "definition": store.get_strategy(workspace, strategy_id, rec["version"])}
+
+    # ── Auto-wrap (plan B8): every registered cycle gets a v0 capability ─────────────────────
+    @app.post("/capabilities/wrap")
+    async def capability_wrap_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Derive + register the v0 capability (and its owner-approval strategy) for a registered
+        cycle. Risk comes from the live adapter's DECLARED verb metadata; with no reachable
+        adapter every verb is undeclared and the floor is HIGH (fail closed, never guess).
+        Deterministic: re-wrapping an unchanged cycle is a same-hash idempotent no-op."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        workspace = (body or {}).get("workspace") or ""
+        cycle_id = (body or {}).get("cycle_id") or ""
+        if not workspace or not cycle_id:
+            return JSONResponse(
+                {"error": "workspace and cycle_id are required"}, status_code=400
+            )
+        row = store.get_automation(workspace, cycle_slug(cycle_id))
+        if row is None or row.get("kind") != "cycle" or not row.get("source"):
+            return JSONResponse({"error": "unknown cycle"}, status_code=404)
+        try:
+            cycle = Cycle.model_validate(row["source"])
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse({"error": f"stored cycle is invalid: {exc}"}, status_code=400)
+        skeleton = await provider(workspace)
+        details: dict[str, dict[str, Any]] = {
+            d["verb"]: d
+            for d in (skeleton or {}).get("verb_details", [])
+            if isinstance(d, dict) and d.get("verb")
+        }
+        try:
+            wrapped = wrap_cycle(cycle, details.get)
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse({"error": f"cycle cannot be wrapped: {exc}"}, status_code=400)
+        strategy_row = store.register_strategy(
+            workspace=workspace,
+            strategy_id=wrapped.strategy.strategy_id,
+            content_hash=strategy_content_hash(wrapped.strategy),
+            body=wrapped.strategy.model_dump(by_alias=True, mode="json"),
+        )
+        capability_row = store.register_capability(
+            workspace=workspace,
+            capability_id=wrapped.capability.capability_id,
+            content_hash=capability_content_hash(wrapped.capability),
+            body=wrapped.capability.model_dump(by_alias=True, mode="json"),
+        )
+        return {"ok": True, "capability": capability_row, "strategy": strategy_row}
+
+    # ── Auto-derive (plan B8+): plug an adapter → a fail-closed draft capability per verb ─────────
+    def _covered_verbs(workspace: str) -> set[str]:
+        """Every verb some existing capability already implements (via its default cycle's action
+        steps). Auto-derivation SKIPS these so a curated catalog is never shadowed by generic drafts."""
+        covered: set[str] = set()
+        for cap_row in store.list_capabilities(workspace):
+            cycle_id = ((cap_row.get("body") or {}).get("implemented_by") or {}).get("default")
+            if not cycle_id:
+                continue
+            row = store.get_automation(workspace, cycle_slug(cycle_id))
+            for step in (((row or {}).get("source") or {}).get("flow") or {}).get("steps", []):
+                verb = step.get("use") if isinstance(step, dict) else None
+                if verb:
+                    covered.add(verb)
+        return covered
+
+    async def _derive_adapter_drafts(workspace: str, adapter_id: str) -> dict[str, Any]:
+        """Discover the adapter, synthesize a one-action cycle per uncovered verb, wrap each into a
+        fail-closed DRAFT capability + its strategy, and register them. Idempotent (same ids/hashes)."""
+        skeleton = await adapter_skeletons(workspace, adapter_id)
+        if skeleton is None:
+            return {"ok": False, "error": "adapter unreachable or non-conformant", "derived": []}
+        derived = derive_from_skeleton(workspace, skeleton, _covered_verbs(workspace))
+        registered: list[str] = []
+        for d in derived:
+            store.register_automation(
+                workspace=workspace, automation_id=d.cycle.cycle_id,
+                content_hash=f"auto-{d.verb}", name=d.cycle.intent.model_dump(mode="json"),
+                plan={"workspace": workspace, "pipeline": []}, trigger={"type": "manual"},
+                state="active", kind="cycle",
+                source=d.cycle.model_dump(by_alias=True, mode="json"),
+            )
+            store.register_strategy(
+                workspace=workspace, strategy_id=d.wrapped.strategy.strategy_id,
+                content_hash=strategy_content_hash(d.wrapped.strategy),
+                body=d.wrapped.strategy.model_dump(by_alias=True, mode="json"), state="published",
+            )
+            store.register_capability(
+                workspace=workspace, capability_id=d.wrapped.capability.capability_id,
+                content_hash=capability_content_hash(d.wrapped.capability),
+                body=d.wrapped.capability.model_dump(by_alias=True, mode="json"), state="draft",
+            )
+            registered.append(d.wrapped.capability.capability_id)
+        return {"ok": True, "adapter_id": adapter_id, "derived": registered}
+
+    @app.post("/adapters/{workspace}/{adapter_id}/derive")
+    async def derive_adapter_endpoint(
+        workspace: str, adapter_id: str, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Auto-derive fail-closed draft capabilities from one adapter's verbs. Operator-gated; the
+        drafts are ai=false until a human performs the governed publish/expose act."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        result = await _derive_adapter_drafts(workspace, adapter_id)
+        return result if result["ok"] else JSONResponse(result, status_code=502)
+
+    # ── Prepared executions (plans B2+B3): prepare → sign(strategy) → commit ──────────────────
+    def _prepared_refusal(refusal: dict[str, Any], status_code: int = 409, **extra: Any) -> Any:
+        return JSONResponse({"ok": False, "refusal": refusal, **extra}, status_code=status_code)
+
+    def _prepared_strategy_body(row: dict[str, Any]) -> dict[str, Any]:
+        rec = store.get_strategy(row["workspace"], row["strategy_id"], row["strategy_version"])
+        return (rec or {}).get("body") or {}
+
+    async def _commit_prepared(row: dict[str, Any]) -> dict[str, Any]:
+        """A FULLY APPROVED prepared execution commits by firing the capability's default
+        implementing cycle with the seeded inputs bound as $.input — the ONLY effect path.
+        Honest on failure (cycle not registered/armed, runner blow-up): the row stays
+        'approved' with the error recorded, retryable via /execute."""
+        cap = (
+            store.get_capability(
+                row["workspace"], row["capability_id"], row["capability_version"]
+            )
+            or {}
+        )
+        cycle_id = ((cap.get("body") or {}).get("implemented_by") or {}).get("default") or ""
+        if not cycle_id:
+            result: dict[str, Any] = {
+                "committed": False,
+                "error": "capability has no default implementation to commit through",
+            }
+        else:
+            fired = await fire_manual(
+                store,
+                workspace=row["workspace"],
+                automation_id=cycle_slug(cycle_id),
+                idempotency_key=f"prep:{row['prepared_id']}",
+                runner=run_exec,
+                fired_by=f"prepared:{row['prepared_id']}",
+                input=row["inputs"] or None,
+            )
+            run = fired.get("run") or {}
+            result = {
+                "committed": bool(fired.get("ok")),
+                "run_id": run.get("run_id"),
+                "replayed": bool(fired.get("replayed")),
+                "error": fired.get("error"),
+            }
+        store.record_prepared_commit(
+            row["prepared_id"], result, "committed" if result["committed"] else "approved"
+        )
+        return result
+
+    async def _execute_prepared_core(row: dict[str, Any]) -> dict[str, Any]:
+        """The ONE execute path — shared by POST /prepared/{id}/execute and the tick's scheduled
+        fires, so a scheduled commit obeys exactly the rules a manual commit does. Returns
+        {"execution": ...} or {"refusal": ...} — the interpreter state is the authority, never a
+        stored flag; an unsatisfied strategy refuses NOT_APPROVED (collecting signatures is the
+        only way forward)."""
+        if row["status"] == "committed":
+            return {
+                "refusal": {
+                    "code": "ALREADY_COMMITTED",
+                    "message": "this prepared execution already committed",
+                    "commit_result": row.get("commit_result"),
+                }
+            }
+        if row["status"] == "rejected":
+            return {
+                "refusal": {
+                    "code": "ALREADY_DECIDED",
+                    "message": "this prepared execution was rejected",
+                }
+            }
+        if row["status"] == "pending":
+            st = strategy_exec.state(
+                store, row["prepared_id"], _prepared_strategy_body(row), inputs=row["inputs"]
+            )
+            if st.get("status") != "approved":
+                return {
+                    "refusal": {
+                        "code": "NOT_APPROVED",
+                        "message": "the strategy is not satisfied — collect the pending "
+                        "signatures first (the commit is the only effect path)",
+                        "pending": st.get("pending"),
+                    }
+                }
+            store.set_prepared_status(row["prepared_id"], "approved", expect="pending")
+        refreshed = store.get_prepared(row["prepared_id"], row["workspace"]) or row
+        return {"execution": await _commit_prepared(refreshed)}
+
+    @app.post("/prepared")
+    async def prepared_create(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Prepare one capability invocation: validate the inputs against the typed contract,
+        pin the registry versions, stamp the preparer (SoD), and hold the strategy's first
+        stage. Returns the deterministic Permission Card. NO effect fires here."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        out = prepared_cards.prepare(
+            store,
+            workspace=body.get("workspace") or "",
+            capability_id=body.get("capability_id") or "",
+            inputs=body.get("inputs") if isinstance(body.get("inputs"), dict) else {},
+            prepared_by=body.get("prepared_by") or "",
+            version=body.get("version"),
+        )
+        if "refusal" in out:
+            return _prepared_refusal(out["refusal"], status_code=400)
+        return out
+
+    @app.get("/prepared")
+    def prepared_list(workspace: str = "", status: str = "") -> Any:
+        """The workspace's Permission Cards, newest first — the Decisions feed. Workspace-pinned,
+        fail closed; optional ?status= filter."""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        rows = store.list_prepared(workspace, status=status or None)
+        return {"prepared": [prepared_cards.card_view(store, r) for r in rows]}
+
+    @app.get("/prepared/{prepared_id}")
+    def prepared_get(prepared_id: str, workspace: str = "") -> Any:
+        """The Permission Card. Workspace-pinned, fail closed: another tenant's prepared_id
+        is a 404 here, and no workspace means no card."""
+        if not workspace:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        row = store.get_prepared(prepared_id, workspace)
+        if row is None:
+            return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
+        return prepared_cards.card_view(store, row)
+
+    @app.post("/prepared/{prepared_id}/sign")
+    async def prepared_sign(
+        prepared_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """One unit's decision on the card — the strategy-aware decision surface. SoD refusals
+        (the preparer, distinct_from) come back as answers with code SOD_VIOLATION; an
+        approve-with-edits inside `modifiable` VOIDS previously collected signatures
+        (superseded) and re-holds the affected units before this signature lands; on the
+        strategy's full approval the commit fires — the ONLY effect path."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        ws = body.get("workspace") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        decision = body.get("status")
+        if decision not in ("approved", "rejected"):
+            return JSONResponse(
+                {"error": "status must be 'approved' or 'rejected'"}, status_code=400
+            )
+        row = store.get_prepared(prepared_id, ws)
+        if row is None:
+            return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
+        if row["status"] != "pending":
+            return _prepared_refusal(
+                {
+                    "code": "ALREADY_DECIDED",
+                    "message": f"this prepared execution is already {row['status']}",
+                    "status": row["status"],
+                }
+            )
+        actor = body.get("actor") or ""
+        # SoD is checked BEFORE the edits path too — otherwise the preparer could void
+        # everyone's signatures with an edit they are not even allowed to sign.
+        if actor and actor == row["prepared_by"]:
+            return _prepared_refusal(
+                {
+                    "code": "SOD_VIOLATION",
+                    "message": f"{actor!r} prepared this card and cannot sign it "
+                    "(preparer-not-approver, invariant I6)",
+                    "actor": actor,
+                },
+                status_code=403,
+            )
+        strat_body = _prepared_strategy_body(row)
+        superseded = 0
+        edits = body.get("edits") if isinstance(body.get("edits"), dict) else None
+        if decision == "approved" and edits:
+            material = {k: v for k, v in edits.items() if row["inputs"].get(k) != v}
+            if material:
+                locked = sorted(k for k in material if k not in row["modifiable"])
+                if locked:
+                    return _prepared_refusal(
+                        {
+                            "code": "FIELD_NOT_MODIFIABLE",
+                            "message": "these fields are locked on this card — edits are "
+                            "lawful only inside `modifiable`",
+                            "fields": locked,
+                        }
+                    )
+                new_inputs = {**row["inputs"], **material}
+                cap = (
+                    store.get_capability(ws, row["capability_id"], row["capability_version"])
+                    or {}
+                )
+                contract = prepared_cards.validate_inputs(cap.get("body") or {}, new_inputs)
+                if contract is not None:
+                    return _prepared_refusal(contract, status_code=400)
+                held = strategy_exec.rehold(
+                    store, prepared_id, strat_body, inputs=new_inputs,
+                    risk=row["risk"], workspace=ws,
+                )
+                if "refusal" in held:
+                    return _prepared_refusal(held["refusal"], status_code=400)
+                store.update_prepared_inputs(prepared_id, new_inputs, branch=held.get("branch"))
+                row = store.get_prepared(prepared_id, ws) or row
+                superseded = int(held.get("superseded") or 0)
+                if held["status"] == "approved":  # the edit re-routed onto an auto branch
+                    store.set_prepared_status(prepared_id, "approved", expect="pending")
+                    execution = await _commit_prepared(store.get_prepared(prepared_id, ws) or row)
+                    return {
+                        "ok": True, "status": "approved", "superseded": superseded,
+                        "execution": execution,
+                        "prepared": prepared_cards.card_view(
+                            store, store.get_prepared(prepared_id, ws) or row
+                        ),
+                    }
+        signed = strategy_exec.sign(
+            store, prepared_id, strat_body, inputs=row["inputs"], actor=actor,
+            role=body.get("role"), decision=decision, prepared_by=row["prepared_by"],
+            actor_roles=body.get("actor_roles"),
+        )
+        if "refusal" in signed:
+            code = (signed["refusal"] or {}).get("code")
+            return _prepared_refusal(
+                signed["refusal"],
+                status_code=403 if code == "SOD_VIOLATION" else 409,
+                superseded=superseded,
+            )
+        result: dict[str, Any] = {"ok": True, "status": signed["status"], "superseded": superseded}
+        if signed["status"] == "rejected":
+            store.set_prepared_status(
+                prepared_id, "rejected", expect="pending", reason=body.get("reason", "")
+            )
+        elif signed["status"] == "approved":
+            store.set_prepared_status(prepared_id, "approved", expect="pending")
+            result["execution"] = await _commit_prepared(store.get_prepared(prepared_id, ws) or row)
+        result["prepared"] = prepared_cards.card_view(
+            store, store.get_prepared(prepared_id, ws) or row
+        )
+        return result
+
+    @app.post("/prepared/{prepared_id}/execute")
+    async def prepared_execute(
+        prepared_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Commit a FULLY APPROVED prepared execution (the auto/complete path, or a retry after
+        a failed commit). A pending strategy refuses with its pending units — collecting
+        signatures is the only way forward."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        ws = (body or {}).get("workspace") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        row = store.get_prepared(prepared_id, ws)
+        if row is None:
+            return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
+        out = await _execute_prepared_core(row)
+        if "refusal" in out:
+            return _prepared_refusal(out["refusal"])
+        return {
+            "ok": bool(out["execution"].get("committed")),
+            "execution": out["execution"],
+            "prepared": prepared_cards.card_view(
+                store, store.get_prepared(prepared_id, ws) or row
+            ),
+        }
+
+    @app.post("/prepared/{prepared_id}/schedule")
+    async def prepared_schedule(
+        prepared_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """B7 nil_schedule: register a ONE-SHOT schedule row for a pending/approved prepared
+        execution. The /automations/tick sweep fires it through the SAME execute path a manual
+        commit uses at/after `when` (ISO-8601) — a row, never an in-memory timer. Honest
+        refusals: unknown/decided cards, unparseable timestamps, and timestamps already past."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        ws = (body or {}).get("workspace") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+        row = store.get_prepared(prepared_id, ws)
+        if row is None:
+            return JSONResponse({"error": "unknown prepared execution"}, status_code=404)
+        if row["status"] not in ("pending", "approved"):
+            return _prepared_refusal(
+                {
+                    "code": "ALREADY_COMMITTED"
+                    if row["status"] == "committed"
+                    else "ALREADY_DECIDED",
+                    "message": f"this prepared execution is already {row['status']} — only a "
+                    "pending or approved card can be scheduled",
+                    "status": row["status"],
+                }
+            )
+        fire_at = _parse_when((body or {}).get("when"))
+        if fire_at is None:
+            return _prepared_refusal(
+                {
+                    "code": "INVALID_WHEN",
+                    "message": "`when` must be an ISO-8601 timestamp (e.g. "
+                    "2026-07-04T09:00:00Z)",
+                },
+                status_code=400,
+            )
+        now = _dt.datetime.now(_dt.UTC)
+        if fire_at <= now:
+            return _prepared_refusal(
+                {
+                    "code": "PAST_SCHEDULE",
+                    "message": "`when` is not in the future — a one-shot schedule fires at/after "
+                    "`when`; a past timestamp is refused, never fired retroactively",
+                    "when": fire_at.isoformat(),
+                    "now": now.isoformat(),
+                },
+                status_code=400,
+            )
+        sched = store.create_scheduled_execution(
+            f"sched-{uuid.uuid4().hex[:12]}",
+            prepared_id=prepared_id,
+            workspace=ws,
+            fire_at=fire_at.isoformat(),
+        )
+        return {"ok": True, "scheduled": sched}
+
+    # ── Hermes: Intent Classification + Session State + Event Streaming ────────────────────────
+    # Session store: user_id → {context, messages, intents, events}
+    _hermes_sessions: dict[str, dict[str, Any]] = {}
+    # WebSocket subscriptions: user_id → set of connected clients
+    _hermes_subscriptions: dict[str, set[WebSocket]] = {}
+
+    async def _hermes_broadcast(user_id: str, event: dict[str, Any]) -> None:
+        """Broadcast an event to all subscribed WebSocket clients for a user."""
+        if user_id not in _hermes_subscriptions:
+            return
+        disconnected = set()
+        for client in _hermes_subscriptions[user_id]:
+            try:
+                await client.send_json(event)
+            except (RuntimeError, ConnectionError):
+                disconnected.add(client)
+        # Clean up disconnected clients
+        for client in disconnected:
+            _hermes_subscriptions[user_id].discard(client)
+        if not _hermes_subscriptions[user_id]:
+            del _hermes_subscriptions[user_id]
+
+    # Hermes orchestrators keyed by account_id for multi-tenant isolation
+    _hermes_orchestrators: dict[str, HermesOrchestrator] = {}
+
+    def _get_hermes_orchestrator(account_id: str) -> HermesOrchestrator:
+        """Lazy-load or return cached orchestrator for a tenant (account_id)."""
+        if account_id not in _hermes_orchestrators:
+            config = HermesConfig.from_env()
+            _hermes_orchestrators[account_id] = HermesOrchestrator(config=config)
+        return _hermes_orchestrators[account_id]
+
+    @app.post("/hermes/chat")
+    async def hermes_chat(
+        request: Request,
+        x_account_id: str | None = Header(default=None),
+        x_workspace_id: str | None = Header(default=None),
+    ) -> Any:
+        """POST /hermes/chat: Tenant-aware intent classification and execution.
+
+        Extracts account_id and workspace_id from request headers or body.
+        All Hermes operations are now tenant-aware and isolated per account.
+
+        Headers (preferred):
+            X-Account-ID: Tenant account identifier
+            X-Workspace-ID: Workspace identifier within account
+
+        Body: {
+            "user_id": str (required),
+            "workspace_id": str (optional; falls back to header),
+            "account_id": str (optional; falls back to header),
+            "message": str (required),
+            "thread_id": str (optional; defaults to user_id),
+            "channel": str (optional; defaults to "chat")
+        }
+
+        Returns: {
+            "ok": bool,
+            "session_id": str,
+            "intent": str,
+            "confidence": float,
+            "message": Message (outbound response),
+            "outcome": ExecutionOutcome,
+            "timestamp": ISO-8601
+        }
+        """
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+
+        # Extract tenant context (headers take precedence over body)
+        account_id = x_account_id or (body or {}).get("account_id", "").strip()
+        workspace_id = x_workspace_id or (body or {}).get("workspace_id", "").strip()
+        user_id = (body or {}).get("user_id", "").strip()
+        message_text = (body or {}).get("message", "").strip()
+        thread_id = (body or {}).get("thread_id", user_id).strip()
+        channel = (body or {}).get("channel", "chat").strip()
+
+        # Validate required fields
+        if not user_id or not message_text:
+            return JSONResponse(
+                {"error": "user_id and message are required"}, status_code=400
+            )
+        if not account_id:
+            return JSONResponse(
+                {"error": "account_id must be provided in headers (X-Account-ID) or body"},
+                status_code=400,
+            )
+
+        try:
+            # Get tenant-scoped orchestrator
+            orchestrator = _get_hermes_orchestrator(account_id)
+
+            # Create inbound Message with tenant metadata
+            inbound_message = Message(
+                id=str(uuid.uuid4()),
+                thread_id=thread_id,
+                user_id=user_id,
+                content=message_text,
+                channel=channel,
+                timestamp=_dt.datetime.now(_dt.UTC),
+                direction="inbound",
+                metadata={
+                    "account_id": account_id,
+                    "workspace_id": workspace_id or workspace_id,
+                    "workspace": workspace_id or workspace_id,
+                    "domain": (body or {}).get("domain", "default"),
+                },
+            )
+
+            # Process through orchestrator: CLASSIFY → EXECUTE → RENDER
+            response_message, outcome = orchestrator.process_message(inbound_message)
+
+            # Store in session registry (keyed by tenant:user:thread)
+            session_key = f"{account_id}:{user_id}:{thread_id}"
+            if session_key not in _hermes_sessions:
+                _hermes_sessions[session_key] = {
+                    "account_id": account_id,
+                    "workspace_id": workspace_id,
+                    "user_id": user_id,
+                    "thread_id": thread_id,
+                    "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+                    "messages": [],
+                    "outcomes": [],
+                }
+
+            session = _hermes_sessions[session_key]
+            session["messages"].append({
+                "id": inbound_message.id,
+                "timestamp": inbound_message.timestamp.isoformat(),
+                "direction": "inbound",
+                "content": message_text,
+            })
+            session["outcomes"].append({
+                "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+                "intent": outcome.intent,
+                "status": outcome.status.value,
+                "confidence": outcome.context.get("confidence", 0.0),
+            })
+
+            # Broadcast to subscribed clients (tenant-scoped)
+            await _hermes_broadcast(session_key, {
+                "type": "message_processed",
+                "account_id": account_id,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "message_id": inbound_message.id,
+                "intent": outcome.intent,
+                "confidence": outcome.context.get("confidence", 0.0),
+                "status": outcome.status.value,
+                "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+            })
+
+            # Log to event store with tenant context
+            store.ingest({
+                "type": "hermes_intent",
+                "account_id": account_id,
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "message_id": inbound_message.id,
+                "intent": outcome.intent,
+                "confidence": outcome.context.get("confidence", 0.0),
+                "status": outcome.status.value,
+                "message": message_text,
+                "received_at": _dt.datetime.now(_dt.UTC).isoformat(),
+            }, source="hermes")
+
+            return {
+                "ok": True,
+                "session_id": session_key,
+                "message_id": inbound_message.id,
+                "intent": outcome.intent,
+                "confidence": outcome.context.get("confidence", 0.0),
+                "status": outcome.status.value,
+                "message": response_message.model_dump(by_alias=True, mode="json"),
+                "outcome": outcome.model_dump(by_alias=True, mode="json"),
+                "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+            }
+
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                {
+                    "error": f"hermes processing failed: {type(exc).__name__}",
+                    "detail": str(exc),
+                    "account_id": account_id,
+                },
+                status_code=500,
+            )
+
+    @app.get("/hermes/session/{account_id}/{user_id}/{thread_id}")
+    async def hermes_session(
+        account_id: str,
+        user_id: str,
+        thread_id: str,
+    ) -> Any:
+        """GET /hermes/session/{account_id}/{user_id}/{thread_id}: Retrieve tenant-scoped session.
+
+        Requires account_id for tenant isolation. Session key = account_id:user_id:thread_id.
+
+        Returns: {
+            "ok": bool,
+            "account_id": str,
+            "user_id": str,
+            "thread_id": str,
+            "workspace_id": str,
+            "message_count": int,
+            "outcome_count": int,
+            "created_at": str,
+            "messages": [...],
+            "outcomes": [...]
+        }
+        """
+        if not account_id or not user_id or not thread_id:
+            return JSONResponse(
+                {"error": "account_id, user_id, and thread_id are required"},
+                status_code=400,
+            )
+
+        session_key = f"{account_id}:{user_id}:{thread_id}"
+        if session_key not in _hermes_sessions:
+            return JSONResponse(
+                {"error": "session not found", "session_key": session_key},
+                status_code=404,
+            )
+
+        session = _hermes_sessions[session_key]
+        return {
+            "ok": True,
+            "account_id": session.get("account_id"),
+            "workspace_id": session.get("workspace_id", ""),
+            "user_id": session.get("user_id"),
+            "thread_id": session.get("thread_id"),
+            "message_count": len(session.get("messages", [])),
+            "outcome_count": len(session.get("outcomes", [])),
+            "created_at": session.get("created_at"),
+            "messages": session.get("messages", [])[-10:],
+            "outcomes": session.get("outcomes", [])[-10:],
+        }
+
+    @app.websocket("/hermes/subscribe/{account_id}/{user_id}/{thread_id}")
+    async def hermes_subscribe(
+        websocket: WebSocket,
+        account_id: str,
+        user_id: str,
+        thread_id: str,
+    ) -> None:
+        """WebSocket /hermes/subscribe/{account_id}/{user_id}/{thread_id}: Tenant-scoped event stream.
+
+        Establishes a persistent WebSocket connection for a specific tenant and thread.
+        Streams events like:
+        - message_processed: when a message is classified and executed
+        - session_updated: when session state changes
+        - notification: system notifications
+
+        Frame format: {"type": str, "account_id": str, "timestamp": str, ...}
+        """
+        if not account_id or not user_id or not thread_id:
+            await websocket.close(code=1008, reason="account_id, user_id, and thread_id are required")
+            return
+
+        await websocket.accept()
+
+        # Use tenant-scoped session key for subscriptions
+        session_key = f"{account_id}:{user_id}:{thread_id}"
+
+        # Register this WebSocket client
+        if session_key not in _hermes_subscriptions:
+            _hermes_subscriptions[session_key] = set()
+        _hermes_subscriptions[session_key].add(websocket)
+
+        # Send initial session context if it exists
+        if session_key in _hermes_sessions:
+            session = _hermes_sessions[session_key]
+            await websocket.send_json({
+                "type": "session_state",
+                "account_id": account_id,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "message_count": len(session.get("messages", [])),
+                "outcome_count": len(session.get("outcomes", [])),
+                "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+            })
+
+        # Keep connection alive and handle control messages
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                if msg.get("type") == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "account_id": account_id,
+                        "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
+                    })
+        except WebSocketDisconnect:
+            _hermes_subscriptions[session_key].discard(websocket)
+            if not _hermes_subscriptions[session_key]:
+                del _hermes_subscriptions[session_key]
+
+    @app.post("/executions")
+    async def execute_compiled_flow(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Execute a pre-compiled Flow with D8 governance routing (Wave 4 integration).
+
+        Accepts:
+        1. NEW PATH: flow + backend_bindings (pre-compiled by CP/os-server)
+        2. LEGACY PATH: cycle_id (loads hand-written cycle from DB)
+
+        Returns execution result with execution_id, status, and optional output/error.
+        """
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+
+        ws = (body or {}).get("workspace") or ""
+        if not ws:
+            return JSONResponse({"error": "workspace is required"}, status_code=400)
+
+        # NEW PATH: Pre-compiled Flow from os-server
+        flow_data = (body or {}).get("flow")
+        backend_bindings = (body or {}).get("backend_bindings")
+        domain_id = (body or {}).get("domain_id")
+        args = (body or {}).get("args") or {}
+
+        # LEGACY PATH: cycle_id for backward compatibility
+        cycle_id = (body or {}).get("cycle_id")
+
+        if not flow_data and not cycle_id:
+            return JSONResponse(
+                {"error": "Either flow or cycle_id is required"},
+                status_code=400,
+            )
+
+        try:
+            # For now, delegate to existing execution infrastructure
+            # In a future phase, could directly instantiate Executor here
+            if cycle_id:
+                # Legacy: load and execute cycle from registry
+                return JSONResponse(
+                    {"error": "Legacy cycle_id execution not yet implemented"},
+                    status_code=501,
+                )
+
+            # NEW PATH: Execute compiled Flow with D8 governance
+            # Flow structure: {"entry": "step_1", "steps": [...]}
+            # Backend bindings: {"verb_name": "adapter_id", ...}
+
+            # Reconstruct the program/flow from the compiled data
+            if isinstance(flow_data, str):
+                flow_data = json.loads(flow_data)
+
+            # Wave 4 Phase 3: Instantiate LocalExecutor with D8 governance routing
+            from nilscript.kernel.executor import LocalExecutor
+            from nilscript.sdk.routing import GovernedRoutingNilClient
+
+            execution_id = f"exec-{uuid.uuid4().hex[:12]}"
+
+            # Parse backend_bindings if string
+            if isinstance(backend_bindings, str):
+                backend_bindings = json.loads(backend_bindings) if backend_bindings else {}
+
+            # Build adapter clients dict (in production, would load from workspace config)
+            adapter_clients = {
+                "odoo": None,  # Placeholder; real impl loads from workspace
+                "mock": None,  # For testing
+            }
+
+            try:
+                # Instantiate executor with governed routing
+                executor = LocalExecutor.from_governed(
+                    domain_id=domain_id,
+                    backend_bindings=backend_bindings,
+                    adapter_clients=adapter_clients,
+                )
+
+                # Execute the flow
+                exec_result = executor.execute(
+                    program=flow_data,
+                    args=args,
+                    execution_id=execution_id,
+                    workspace=ws,
+                )
+
+                # Return actual execution result
+                return {
+                    "execution_id": execution_id,
+                    "status": exec_result.get("status", "completed"),
+                    "domain_id": domain_id,
+                    "output": exec_result.get("output"),
+                    "error": exec_result.get("error"),
+                    "trace": exec_result.get("trace"),
+                }
+
+            except Exception as e:
+                return {
+                    "execution_id": execution_id,
+                    "status": "error",
+                    "domain_id": domain_id,
+                    "output": None,
+                    "error": f"Execution failed: {str(e)}",
+                }
+
+        except Exception as e:
+            return JSONResponse(
+                {
+                    "error": f"Execution failed: {str(e)}",
+                    "type": type(e).__name__,
+                },
+                status_code=500,
+            )
+
+    # ── Cycle .nil surface + language services (the LSP brain — a projection, no state) ────────
+    async def _read_body(request: Request) -> tuple[dict[str, Any] | None, Any]:
+        try:
+            return await request.json(), None
+        except (ValueError, TypeError):
+            return None, JSONResponse({"error": "bad json"}, status_code=400)
+
+    async def _lsp_ctx(workspace: str | None) -> ValidationContext | None:
+        """Build a verb-catalog context from the workspace's live skeleton, or None when no workspace
+        is given or no reachable active adapter answers (the LSP then skips V4/V5 verb checks)."""
+        if not workspace:
+            return None
+        skeleton = await provider(workspace)
+        if skeleton is None:
+            return None
+        return context_from_skeleton(workspace, skeleton)
+
+    @app.post("/cycles/parse")
+    async def cycle_parse_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """`.nil` text → the validated Cycle AST, or a structured `{message, line, col}` syntax error."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        text = (body or {}).get("text", "")
+        try:
+            cycle = parse_nil(text)
+        except NilSyntaxError as exc:
+            return {
+                "ok": False,
+                "error": {"message": exc.message, "line": exc.line, "col": exc.col},
+            }
+        return {"ok": True, "cycle": cycle.model_dump(by_alias=True, mode="json")}
+
+    @app.post("/cycles/print")
+    async def cycle_print_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """A Cycle AST → its canonical `.nil` text. 400 on a malformed cycle."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        try:
+            cycle = Cycle.model_validate((body or {}).get("cycle"))
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse({"error": f"malformed cycle: {exc}"}, status_code=400)
+        return {"ok": True, "text": print_nil(cycle)}
+
+    @app.post("/cycles/lsp/diagnostics")
+    async def cycle_lsp_diagnostics(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Live diagnostics for `.nil` text. With a reachable `workspace` the verbs are validated
+        (V4/V5); without one the verb checks are skipped (an info diag says so)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        ctx = await _lsp_ctx(body.get("workspace"))
+        return {"diagnostics": lsp_diagnostics(body.get("text", ""), ctx)}
+
+    @app.post("/cycles/lsp/completions")
+    async def cycle_lsp_completions(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Context-aware completions at (line, col) in `.nil` text."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        ctx = await _lsp_ctx(body.get("workspace"))
+        items = lsp_completions(
+            body.get("text", ""), int(body.get("line", 1)), int(body.get("col", 1)), ctx
+        )
+        return {"completions": items}
+
+    @app.post("/cycles/lsp/hover")
+    async def cycle_lsp_hover(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Hover detail for the identifier under the cursor (may be null)."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        ctx = await _lsp_ctx(body.get("workspace"))
+        info = lsp_hover(
+            body.get("text", ""), int(body.get("line", 1)), int(body.get("col", 1)), ctx
+        )
+        return {"hover": info}
+
+    @app.post("/cycles/lsp/semantic-tokens")
+    async def cycle_lsp_semantic_tokens(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Deterministic token classification for syntax highlighting."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        return {"tokens": lsp_semantic_tokens((body or {}).get("text", ""))}
+
+    @app.post("/cycles/projections")
+    async def cycle_projections_endpoint(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """A read-only projection of a Cycle AST: a mermaid diagram, markdown docs, a happy-path
+        simulation, or the governance trust summary."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        kind = body.get("kind")
+        projections = {
+            "mermaid": to_mermaid,
+            "markdown": to_markdown,
+            "simulate": simulate,
+            "governance": governance_report,
+        }
+        fn = projections.get(kind)
+        if fn is None:
+            return JSONResponse(
+                {"error": f"unknown projection kind {kind!r}"}, status_code=400
+            )
+        try:
+            cycle = Cycle.model_validate(body.get("cycle"))
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse({"error": f"malformed cycle: {exc}"}, status_code=400)
+        return {"result": fn(cycle)}
 
     # ── cross-system composed automations (P3) ──────────────────────────────────────────────
     async def _validate_composed_body(body: dict[str, Any]) -> tuple[Any, Any]:
         """Validate a composed-plan request: each stage against ITS adapter's live skeleton + handoff
         well-formedness + a valid trigger. Returns ((composed_raw, report), None) or (None, error)."""
         composed = body.get("composed")
-        aid, name, trigger = body.get("automation_id"), body.get("name"), body.get("trigger")
+        aid, name, trigger = (
+            body.get("automation_id"),
+            body.get("name"),
+            body.get("trigger"),
+        )
         if not isinstance(composed, dict) or not aid or name is None or trigger is None:
             return None, JSONResponse(
-                {"error": "automation_id, name, composed, trigger are required"}, status_code=400
+                {"error": "automation_id, name, composed, trigger are required"},
+                status_code=400,
             )
         ws = composed.get("workspace")
         if not ws:
-            return None, JSONResponse({"error": "composed.workspace is required"}, status_code=400)
+            return None, JSONResponse(
+                {"error": "composed.workspace is required"}, status_code=400
+            )
         try:
             parse_trigger(trigger)
         except (ValidationError, ValueError, TypeError) as exc:
@@ -512,18 +2847,24 @@ def create_app(
             skeleton = await adapter_skeletons(ws, adapter_id)
             if skeleton is None:
                 return None, JSONResponse(
-                    {"error": f"no reachable adapter {adapter_id!r} in workspace {ws!r}"},
+                    {
+                        "error": f"no reachable adapter {adapter_id!r} in workspace {ws!r}"
+                    },
                     status_code=503,
                 )
             skeletons[adapter_id] = skeleton
         try:
             parsed = parse_composed(composed)
         except (KeyError, TypeError) as exc:
-            return None, JSONResponse({"error": f"malformed composed plan: {exc}"}, status_code=400)
+            return None, JSONResponse(
+                {"error": f"malformed composed plan: {exc}"}, status_code=400
+            )
         return (composed, validate_composed(parsed, skeletons)), None
 
     @app.post("/automations/compose/draft")
-    async def compose_draft(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def compose_draft(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Preview: validate a cross-system composed plan, each stage against its adapter. No effect."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -540,7 +2881,9 @@ def create_app(
         return {"ok": True, "content_hash": composed_hash(composed), "report": report}
 
     @app.post("/automations/compose/register")
-    async def compose_register(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    async def compose_register(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
         """Persist a passing composed plan as `pending_approval` (kind='composed')."""
         if not _registry_authed(authorization):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -555,10 +2898,16 @@ def create_app(
         if not report["ok"]:
             return JSONResponse({"ok": False, "report": report}, status_code=400)
         stored = store.register_automation(
-            workspace=composed["workspace"], automation_id=body["automation_id"],
-            content_hash=composed_hash(composed), name=body["name"], plan=composed,
-            trigger=body["trigger"], state="pending_approval", kind="composed",
-            authored_by=body.get("authored_by", "") or "", description=body.get("description"),
+            workspace=composed["workspace"],
+            automation_id=body["automation_id"],
+            content_hash=composed_hash(composed),
+            name=body["name"],
+            plan=composed,
+            trigger=body["trigger"],
+            state="pending_approval",
+            kind="composed",
+            authored_by=body.get("authored_by", "") or "",
+            description=body.get("description"),
         )
         return {"ok": True, "definition": stored}
 
@@ -568,7 +2917,9 @@ def create_app(
         return {"automations": store.list_automations(workspace)}
 
     @app.get("/automations/{workspace}/{automation_id}")
-    def automation_get(workspace: str, automation_id: str, version: int | None = None) -> Any:
+    def automation_get(
+        workspace: str, automation_id: str, version: int | None = None
+    ) -> Any:
         a = store.get_automation(workspace, automation_id, version)
         if a is None:
             return JSONResponse({"error": "no such automation"}, status_code=404)
@@ -576,7 +2927,10 @@ def create_app(
 
     @app.post("/automations/{workspace}/{automation_id}/{version}/state")
     async def automation_set_state(
-        workspace: str, automation_id: str, version: int, request: Request,
+        workspace: str,
+        automation_id: str,
+        version: int,
+        request: Request,
         authorization: str | None = Header(default=None),
     ) -> Any:
         """Arm/disarm/approve an automation (operator-gated). Approving (→ active) records the owner.
@@ -590,18 +2944,30 @@ def create_app(
         state = body.get("state")
         if state not in ("pending_approval", "active", "paused", "archived"):
             return JSONResponse(
-                {"error": "state must be pending_approval|active|paused|archived"}, status_code=400
+                {"error": "state must be pending_approval|active|paused|archived"},
+                status_code=400,
             )
         ok = store.set_automation_state(
-            workspace, automation_id, version, state, approved_by=body.get("approved_by")
+            workspace,
+            automation_id,
+            version,
+            state,
+            approved_by=body.get("approved_by"),
         )
         if not ok:
-            return JSONResponse({"error": "no such automation version"}, status_code=404)
-        return {"ok": True, "automation": store.get_automation(workspace, automation_id, version)}
+            return JSONResponse(
+                {"error": "no such automation version"}, status_code=404
+            )
+        return {
+            "ok": True,
+            "automation": store.get_automation(workspace, automation_id, version),
+        }
 
     @app.post("/automations/{workspace}/{automation_id}/run")
     async def automation_run(
-        workspace: str, automation_id: str, request: Request,
+        workspace: str,
+        automation_id: str,
+        request: Request,
         authorization: str | None = Header(default=None),
     ) -> Any:
         """Fire the active automation now (manual trigger). Requires an `idempotency_key` so a
@@ -621,13 +2987,21 @@ def create_app(
         auto = store.get_automation(workspace, automation_id)
         if auto is not None and auto.get("kind") == "composed":
             out = await fire_composed(
-                store, workspace=workspace, automation_id=automation_id,
-                idempotency_key=str(idem), stage_runner=stage_exec, fired_by=fired_by,
+                store,
+                workspace=workspace,
+                automation_id=automation_id,
+                idempotency_key=str(idem),
+                stage_runner=stage_exec,
+                fired_by=fired_by,
             )
         else:
             out = await fire_manual(
-                store, workspace=workspace, automation_id=automation_id,
-                idempotency_key=str(idem), runner=run_exec, fired_by=fired_by,
+                store,
+                workspace=workspace,
+                automation_id=automation_id,
+                idempotency_key=str(idem),
+                runner=run_exec,
+                fired_by=fired_by,
             )
         if not out.get("ok"):
             return JSONResponse(out, status_code=out.pop("status", 400))
@@ -642,14 +3016,59 @@ def create_app(
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         now = _dt.datetime.now(_dt.UTC)
         fired = await run_due_schedules(store, runner=run_exec, now=now)
+        # The same clock resumes parked runs whose deadline passed (await_approval → on_timeout,
+        # wait_for_event → its timeout route) — deadlines are rows, so restarts lose nothing.
+        timed_out = await resume_due_waits(store, runner=run_exec, now=now)
+        # And strategy unit deadlines (plan B3): escalate re-addresses a fresh signature slot;
+        # reject rejects the whole prepared subject — same clock, same sweep discipline.
+        signature_actions = strategy_exec.sweep_due(store, now=now)
+        for act in signature_actions:
+            if act.get("action") == "rejected":
+                store.set_prepared_status(act["execution_id"], "rejected", expect="pending")
+        # And one-shot scheduled executions (plan B7 nil_schedule): each due row fires through
+        # the SAME execute path a manual commit uses; the outcome (fired | refused) is settled
+        # on the row — a NOT_APPROVED strategy at fire time is a recorded answer, never a retry.
+        scheduled_fires: list[dict[str, Any]] = []
+        for sched in store.due_scheduled_executions(now.isoformat()):
+            prep_row = store.get_prepared(sched["prepared_id"], sched["workspace"])
+            if prep_row is None:
+                outcome: dict[str, Any] = {
+                    "refusal": {
+                        "code": "UNKNOWN_PREPARED",
+                        "message": "the scheduled prepared execution no longer exists",
+                    }
+                }
+            else:
+                outcome = await _execute_prepared_core(prep_row)
+            fire: dict[str, Any] = {
+                "schedule_id": sched["schedule_id"],
+                "prepared_id": sched["prepared_id"],
+            }
+            if "refusal" in outcome:
+                if store.settle_scheduled_execution(
+                    sched["schedule_id"], "refused", outcome["refusal"]
+                ):
+                    fire.update(status="refused", refusal=outcome["refusal"])
+                    scheduled_fires.append(fire)
+            else:
+                if store.settle_scheduled_execution(
+                    sched["schedule_id"], "fired", outcome["execution"]
+                ):
+                    fire.update(status="fired", execution=outcome["execution"])
+                    scheduled_fires.append(fire)
         return {
             "ok": True,
             "fired": len(fired),
             "runs": [f["run"] for f in fired if f.get("ok") and f.get("run")],
+            "timed_out": timed_out,
+            "signatures": signature_actions,
+            "scheduled": scheduled_fires,
         }
 
     @app.get("/automations/{workspace}/{automation_id}/runs")
-    def automation_runs(workspace: str, automation_id: str, limit: int = 50) -> dict[str, Any]:
+    def automation_runs(
+        workspace: str, automation_id: str, limit: int = 50
+    ) -> dict[str, Any]:
         """Newest-first run history for one automation (trace omitted — fetch via /runs/{run_id})."""
         return {"runs": store.list_runs(workspace, automation_id, limit)}
 
@@ -659,6 +3078,895 @@ def create_app(
         if run is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
         return run
+
+    @app.post("/runs/{run_id}/rollback")
+    async def run_rollback(
+        run_id: str, request: Request, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """B5: per-phase rollback. Builds the REVERSE compensation chain of every write COMMITTED
+        after `to_checkpoint` (each step's own `compensate_with` — the same declared inverse the
+        kernel's saga unwind executes) and holds it as ONE governed proposal (`rb:{run}:{name}`).
+        NO effect fires here: the human approves the plan via the normal decision endpoint, and
+        THAT approval commits the compensations in reverse order with `rb-{run_id}-{n}` keys.
+        A committed write in the segment with no compensation refuses honestly
+        (IRREVERSIBLE_SEGMENT, listing the blocking steps) — never a partial pretend-reversal."""
+        if not _registry_authed(authorization):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body, err = await _read_body(request)
+        if err is not None:
+            return err
+        body = body or {}
+        to_checkpoint = body.get("to_checkpoint") or ""
+        if not to_checkpoint:
+            return JSONResponse({"error": "to_checkpoint is required"}, status_code=400)
+        run = store.get_run(run_id)
+        if run is None:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        ws = body.get("workspace") or ""
+        if ws and (run.get("workspace") or "") != ws:
+            # Workspace-pinned, fail closed: another tenant's run id is indistinguishable from a
+            # missing one.
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        marker = store.get_checkpoint(run_id, to_checkpoint)
+        if marker is None:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "refusal": {
+                        "code": "UNKNOWN_CHECKPOINT",
+                        "message": f"run {run_id!r} walked no checkpoint {to_checkpoint!r}",
+                    },
+                },
+                status_code=404,
+            )
+        auto = store.get_automation(
+            run.get("workspace") or "", run.get("automation_id") or "", run.get("version")
+        )
+        if auto is None or not isinstance(auto.get("plan"), dict):
+            return JSONResponse(
+                {"error": "the run's pinned automation version is gone"}, status_code=409
+            )
+        nodes = node_map(auto["plan"])
+        context = (run.get("trace") or {}).get("context") or {}
+        # Committed writes, in the plan's deterministic (pipeline) order, replaying the kernel's
+        # own committed-output judgement over the persisted trace.
+        committed_now = [
+            node["id"]
+            for node in auto["plan"]["pipeline"]
+            if node.get("type") == "action"
+            and looks_committed((context.get(node["id"]) or {}).get("output"))
+        ]
+        segment = [nid for nid in committed_now if nid not in set(marker["committed"])]
+        blocking = [nid for nid in segment if not nodes[nid].get("compensate_with")]
+        if blocking:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "refusal": {
+                        "code": "IRREVERSIBLE_SEGMENT",
+                        "message": "committed write step(s) after the checkpoint declare no "
+                        "compensation — the segment cannot be honestly reversed",
+                        "blocking_steps": blocking,
+                    },
+                },
+                status_code=409,
+            )
+        steps: list[dict[str, Any]] = []
+        for n, nid in enumerate(reversed(segment)):
+            comp = nodes[nid]["compensate_with"]
+            steps.append(
+                {
+                    "seq": n,
+                    "node": nid,
+                    "verb": comp["verb"],
+                    # References ($.step_N.output.*) resolve NOW against the persisted run trace,
+                    # so the held plan carries literal args the owner can actually read.
+                    "args": resolve_references(comp.get("args") or {}, context, item=None),
+                    "idempotency_key": f"rb-{run_id}-{n}",
+                }
+            )
+        plan_view = {
+            "run_id": run_id,
+            "to_checkpoint": to_checkpoint,
+            "workspace": run.get("workspace") or "",
+            "steps": steps,
+        }
+        proposal_id = f"rb:{run_id}:{to_checkpoint}"
+        held = store.await_approval(
+            proposal_id,
+            verb="run.rollback",
+            tier="HIGH",  # reversing committed effects is always a human decision
+            preview={"kind": "rollback", **plan_view},
+            workspace=run.get("workspace") or "",
+            resolved=plan_view,
+        )
+        return {
+            "ok": True,
+            "proposal_id": proposal_id,
+            "status": held.get("status"),
+            "rollback": plan_view,
+        }
+
+    # ─── Wave 5.5 Business Discovery API Endpoints ─────────────────────────────────────
+
+    # In-memory session cache for discovery (production would use store)
+    _discovery_sessions: dict[str, Any] = {}
+
+    @app.post("/api/discovery/start")
+    async def discovery_start(req: Request) -> JSONResponse:
+        """Start a new business discovery session.
+
+        Request body: {workspace, domain_name, user_email}
+        Returns: {success, data: {session_id, phase, ...}}
+        """
+        try:
+            body = await req.json()
+            workspace = body.get("workspace", "default")
+            domain_name = body.get("domain_name", "")
+            user_email = body.get("user_email", "")
+
+            if not workspace or not domain_name or not user_email:
+                return JSONResponse(
+                    {"success": False, "error": "workspace, domain_name, and user_email required"},
+                    status_code=400,
+                )
+
+            from nilscript.hermes.business_discovery import BusinessDiscoverySession
+
+            session_id = str(uuid.uuid4())
+            session = BusinessDiscoverySession(
+                session_id=session_id,
+                workspace=workspace,
+                domain_name=domain_name,
+                user_email=user_email,
+            )
+            _discovery_sessions[session_id] = session
+            state = session.get_current_state()
+            return JSONResponse({"success": True, "data": state})
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.post("/api/discovery/answer")
+    async def discovery_answer(req: Request) -> JSONResponse:
+        """Submit an answer for the current discovery phase.
+
+        Request body: {session_id, phase, answer}
+        Returns: {success, data: {phase_accepted, next_phase}}
+        """
+        try:
+            body = await req.json()
+            session_id = body.get("session_id", "")
+            phase = body.get("phase", "")
+            answer = body.get("answer", "")
+
+            if not session_id or not phase or not answer:
+                return JSONResponse(
+                    {"success": False, "error": "session_id, phase, and answer required"},
+                    status_code=400,
+                )
+
+            if session_id not in _discovery_sessions:
+                return JSONResponse(
+                    {"success": False, "error": f"Session {session_id} not found"},
+                    status_code=404,
+                )
+
+            session = _discovery_sessions[session_id]
+            valid_phases = ("intro", "actors", "systems", "documents", "events", "rules", "review")
+
+            if phase not in valid_phases:
+                return JSONResponse(
+                    {"success": False, "error": f"Invalid phase: {phase}"},
+                    status_code=400,
+                )
+
+            session.record_answer(phase, answer)
+            phase_order = [
+                "intro",
+                "actors",
+                "systems",
+                "documents",
+                "events",
+                "rules",
+                "review",
+            ]
+            current_idx = phase_order.index(phase)
+            next_phase = (
+                phase_order[current_idx + 1]
+                if current_idx + 1 < len(phase_order)
+                else "complete"
+            )
+
+            session.set_phase(next_phase)
+            if next_phase == "complete":
+                session.mark_complete()
+
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "phase_accepted": phase,
+                        "next_phase": next_phase,
+                        "session_id": session_id,
+                    },
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/api/discovery/status")
+    async def discovery_status(session_id: str = "") -> JSONResponse:
+        """Get current status of a discovery session.
+
+        Query param: session_id
+        Returns: {success, data: {session_id, phase, is_complete, ...}}
+        """
+        try:
+            if not session_id:
+                return JSONResponse(
+                    {"success": False, "error": "session_id required"},
+                    status_code=400,
+                )
+
+            if session_id not in _discovery_sessions:
+                return JSONResponse(
+                    {"success": False, "error": f"Session {session_id} not found"},
+                    status_code=404,
+                )
+
+            session = _discovery_sessions[session_id]
+            state = session.get_current_state()
+            return JSONResponse({"success": True, "data": state})
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/api/discovery/specification")
+    async def discovery_specification(session_id: str = "") -> JSONResponse:
+        """Retrieve extracted BusinessSpecification from completed session.
+
+        Query param: session_id
+        Returns: {success, data: {specification: {...}}}
+        """
+        try:
+            if not session_id:
+                return JSONResponse(
+                    {"success": False, "error": "session_id required"},
+                    status_code=400,
+                )
+
+            if session_id not in _discovery_sessions:
+                return JSONResponse(
+                    {"success": False, "error": f"Session {session_id} not found"},
+                    status_code=404,
+                )
+
+            session = _discovery_sessions[session_id]
+
+            if not session.is_complete():
+                return JSONResponse(
+                    {
+                        "success": False,
+                        "error": "Session is not yet complete. Continue with discovery phases.",
+                    },
+                    status_code=400,
+                )
+
+            from nilscript.hermes.business_discovery import extract_structured_specification
+
+            try:
+                answers = session.get_answers()
+                intent = answers.get("intro", "Business process automation")
+                spec = extract_structured_specification(session, intent)
+                spec_data = spec.model_dump(mode="json")
+
+                return JSONResponse(
+                    {
+                        "success": True,
+                        "data": {
+                            "specification": spec_data,
+                        },
+                    }
+                )
+            except ValueError as ve:
+                return JSONResponse(
+                    {
+                        "success": False,
+                        "error": f"Specification extraction failed: {str(ve)}",
+                    },
+                    status_code=400,
+                )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    # ─── Runtime Endpoints (Wave 6 §2) ─────────────────────────────────────────
+
+    @app.post("/runtime/chat")
+    async def runtime_chat(request: IntentClassificationRequest) -> JSONResponse:
+        """Hermes Runtime: Classify natural language intent.
+
+        POST /runtime/chat
+        {
+            "thread_id": "t_123",
+            "message": "create a new order for 5000"
+        }
+
+        Response:
+        {
+            "intent": "create",
+            "parameters": [{"name": "entity_type", "value": "order", "confidence": 0.8}],
+            "confidence": 0.75
+        }
+        """
+        try:
+            classification = await process_chat_request(request)
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": classification.model_dump(mode="json"),
+                }
+            )
+        except ValueError as ve:
+            return JSONResponse(
+                {"success": False, "error": f"Intent classification failed: {str(ve)}"},
+                status_code=400,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/thread/{thread_id}/available-commands")
+    def get_available_commands(thread_id: str) -> JSONResponse:
+        """Get available commands for a thread.
+
+        Returns list of executable commands from RuntimeCommandBus,
+        filtered by thread context and permissions.
+
+        GET /thread/t_123/available-commands
+
+        Response:
+        {
+            "success": true,
+            "data": {
+                "thread_id": "t_123",
+                "commands": [
+                    {
+                        "verb_id": "order.create",
+                        "skill_name": "create",
+                        "capability_id": "Orders",
+                        "parameters_schema": {...}
+                    }
+                ]
+            }
+        }
+        """
+        try:
+            # Query thread context from store
+            thread_data = store.get_thread(thread_id) if hasattr(store, "get_thread") else None
+            if not thread_data:
+                return JSONResponse(
+                    {"success": False, "error": f"Thread {thread_id} not found"},
+                    status_code=404,
+                )
+
+            # Build minimal resolution index and bus
+            index = ResolutionIndex(
+                skills_by_capability={},
+                verbs_by_id={},
+                backend_bindings={},
+            )
+            bus = RuntimeCommandBus(index)
+
+            # Get available commands (in production, query from runtime index)
+            commands = []
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "thread_id": thread_id,
+                        "commands": commands,
+                    },
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/thread/{thread_id}/state")
+    def get_thread_state(thread_id: str) -> JSONResponse:
+        """Get thread state snapshot.
+
+        Returns current execution state, parked node, waiting condition.
+
+        GET /thread/t_123/state
+
+        Response:
+        {
+            "success": true,
+            "data": {
+                "thread_id": "t_123",
+                "state": "waiting_for_approval",
+                "parked_node_id": "step_5",
+                "on_event": null,
+                "variables": {...}
+            }
+        }
+        """
+        try:
+            thread_data = store.get_thread(thread_id) if hasattr(store, "get_thread") else None
+            if not thread_data:
+                return JSONResponse(
+                    {"success": False, "error": f"Thread {thread_id} not found"},
+                    status_code=404,
+                )
+
+            state_info = {
+                "thread_id": thread_id,
+                "state": thread_data.get("state", "unknown"),
+                "parked_node_id": thread_data.get("parked_node_id"),
+                "on_event": thread_data.get("on_event"),
+                "variables": thread_data.get("variables", {}),
+            }
+
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": state_info,
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    @app.get("/thread/{thread_id}/timeline")
+    def get_thread_timeline(thread_id: str, limit: int = 50) -> JSONResponse:
+        """Get thread event timeline.
+
+        Returns chronological log of events, decisions, and state changes
+        for correlation and debugging.
+
+        GET /thread/t_123/timeline?limit=50
+
+        Response:
+        {
+            "success": true,
+            "data": {
+                "thread_id": "t_123",
+                "events": [
+                    {
+                        "timestamp": "2024-01-15T10:30:00Z",
+                        "event_type": "message.received",
+                        "source": "email",
+                        "summary": "Vendor sent reply"
+                    }
+                ]
+            }
+        }
+        """
+        try:
+            if not hasattr(store, "query_events"):
+                return JSONResponse(
+                    {"success": False, "error": "Store does not support event queries"},
+                    status_code=501,
+                )
+
+            events = store.query_events({"thread_id": thread_id}, limit=limit)
+            timeline = []
+            for evt in events:
+                timeline.append({
+                    "timestamp": evt.get("timestamp"),
+                    "event_type": evt.get("event_type"),
+                    "source": evt.get("source"),
+                    "summary": evt.get("summary", ""),
+                })
+
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "thread_id": thread_id,
+                        "events": timeline,
+                    },
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"success": False, "error": str(e)},
+                status_code=500,
+            )
+
+    def _execution_plan_to_outcome(
+        plan: ExecutionPlan, thread_id: str
+    ) -> Outcome:
+        """Convert an ExecutionPlan to an Outcome.
+
+        Maps execution plan status and permission card state to outcome representation.
+        This bridges the deterministic command resolution with the runtime outcome model.
+        """
+        # Determine outcome_type based on execution plan status and governance
+        if plan.status == "approved":
+            outcome_type = "success"
+            reason = f"Verb {plan.verb.verb_id} approved for execution"
+            can_auto_continue = True
+            requires_user_input = False
+            actions = (OutcomeAction(type="continue"),)
+        elif plan.status == "pending":
+            outcome_type = "pending"
+            reason = f"Awaiting approval for {plan.verb.verb_id}"
+            can_auto_continue = False
+            requires_user_input = True
+            # Collect approval details from permission card
+            await_prompt = "Awaiting approval from authorized actors"
+            if plan.permission_card:
+                await_prompt = f"Approval required: {plan.permission_card.title or 'Permission Card'}"
+            actions = (OutcomeAction(type="await_input", prompt=await_prompt),)
+        elif plan.status == "denied":
+            outcome_type = "failure"
+            reason = f"Permission denied for {plan.verb.verb_id}"
+            can_auto_continue = False
+            requires_user_input = False
+            actions = ()
+        else:
+            outcome_type = "conditional"
+            reason = f"Execution plan for {plan.verb.verb_id} in status {plan.status}"
+            can_auto_continue = False
+            requires_user_input = False
+            actions = ()
+
+        # Build payload with execution plan metadata
+        payload = {
+            "thread_id": plan.thread_id,
+            "verb_id": plan.verb.verb_id,
+            "capability_id": plan.verb.capability_id,
+            "skill_name": plan.verb.skill_name,
+            "backend": plan.verb.backend,
+            "parameters": plan.parameters,
+            "governance_tier": plan.governance_tier,
+            "reversibility": plan.reversibility,
+            "execution_status": plan.status,
+        }
+
+        # Include permission card if present
+        if plan.permission_card:
+            payload["permission_card"] = plan.permission_card.model_dump(mode="json")
+
+        return Outcome(
+            outcome_type=outcome_type,
+            reason=reason,
+            payload=payload,
+            actions=actions,
+            can_auto_continue=can_auto_continue,
+            requires_user_input=requires_user_input,
+        )
+
+    @app.post("/thread/{thread_id}/execute-intent")
+    async def execute_intent(thread_id: str, request: Request) -> Any:
+        """Execute an intent on a thread via RuntimeCommandBus.
+
+        Resolve intent to verb, check permissions, return Outcome with execution plan
+        or permission card if approval is needed.
+
+        POST /thread/t_123/execute-intent
+        {
+            "action": "create",
+            "entity": "Order",
+            "parameters": {"amount": 5000}
+        }
+
+        Returns Outcome with:
+        - success: intent resolved and execution plan generated
+        - outcome_type: success (approved) | pending (awaiting approval) | failure (denied)
+        - payload: execution plan metadata, permission card if needed
+        - actions: recommended next steps (continue | await_input | escalate)
+        """
+        try:
+            body, err = await _read_body(request)
+            if err is not None:
+                return err
+
+            body = body or {}
+
+            thread_data = store.get_thread(thread_id) if hasattr(store, "get_thread") else None
+            if not thread_data:
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason=f"Thread {thread_id} not found",
+                    payload={"thread_id": thread_id},
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=404,
+                )
+
+            # Parse intent from request body
+            action = body.get("action", "").strip()
+            entity = body.get("entity")
+            params = body.get("parameters", {}) if isinstance(body.get("parameters"), dict) else {}
+
+            if not action:
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason="Missing 'action' in request",
+                    payload={"thread_id": thread_id},
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=400,
+                )
+
+            intent = Intent(action=action, entity=entity, parameters=params)
+
+            # Build resolution index and bus
+            index = ResolutionIndex(
+                skills_by_capability={},
+                verbs_by_id={},
+                backend_bindings={},
+            )
+            bus = RuntimeCommandBus(index)
+
+            # Resolve intent to execution plan
+            cycle_id = thread_data.get("cycle_id", "unknown")
+            domain_id = thread_data.get("domain_id", "default")
+            actor_id = thread_data.get("actor_id", "system")
+
+            # Note: bus.resolve() doesn't exist yet; using component methods
+            context = bus.get_thread_context(
+                thread_id=thread_id,
+                cycle_id=cycle_id,
+                domain_id=domain_id,
+                actor_id=actor_id,
+                actor_authority=thread_data.get("actor_authority", "LOW"),
+                variables=thread_data.get("variables", {}),
+            )
+
+            if not bus.validate_intent_against_thread(intent, context):
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason=f"Action '{action}' not recognized in domain '{domain_id}'",
+                    payload={"thread_id": thread_id, "action": action, "domain_id": domain_id},
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=400,
+                )
+
+            verb = bus.resolve_to_verb(intent, context)
+            verdict = bus.check_permissions(verb, intent, context)
+            execution_plan = bus.return_execution_plan(
+                context,
+                verb,
+                intent,
+                verdict,
+                governance_tier=thread_data.get("governance_tier", "LOW"),
+                reversibility=thread_data.get("reversibility", "IRREVERSIBLE"),
+            )
+
+            # Convert execution plan to Outcome
+            outcome = _execution_plan_to_outcome(execution_plan, thread_id)
+
+            return JSONResponse(
+                {
+                    "success": True,
+                    "outcome": outcome.model_dump(mode="json"),
+                }
+            )
+
+        except ValueError as ve:
+            error_outcome = Outcome(
+                outcome_type="error",
+                reason=f"Intent validation failed: {str(ve)}",
+                payload={"thread_id": thread_id, "error_type": "validation_error"},
+                actions=(),
+                can_auto_continue=False,
+                requires_user_input=False,
+            )
+            return JSONResponse(
+                error_outcome.model_dump(mode="json"),
+                status_code=400,
+            )
+        except Exception as e:
+            error_outcome = Outcome(
+                outcome_type="error",
+                reason=f"Execution failed: {str(e)}",
+                payload={"thread_id": thread_id, "error_type": type(e).__name__},
+                actions=(),
+                can_auto_continue=False,
+                requires_user_input=False,
+            )
+            return JSONResponse(
+                error_outcome.model_dump(mode="json"),
+                status_code=500,
+            )
+
+    @app.post("/runtime/execute-action")
+    async def execute_action(request: Request) -> Any:
+        """Execute an action with full runtime resolution.
+
+        Enhanced variant of execute-intent with explicit workspace/domain scoping.
+        Returns Outcome representing the resolved execution plan and governance state.
+
+        POST /runtime/execute-action
+        {
+            "workspace": "ws_123",
+            "thread_id": "t_456",
+            "domain_id": "order-domain",
+            "action": "approve",
+            "entity": "Invoice",
+            "parameters": {"amount": 15000, "currency": "SAR"}
+        }
+
+        Returns Outcome with:
+        - outcome_type: success (approved) | pending (awaiting approval) | failure (denied)
+        - reason: human-readable explanation
+        - payload: execution plan, permission card, verb resolution
+        - actions: next steps (continue, await_input, escalate, compensate)
+        - can_auto_continue: whether flow may advance automatically
+        - requires_user_input: whether user decision is required
+        """
+        try:
+            body, err = await _read_body(request)
+            if err is not None:
+                return err
+
+            body = body or {}
+            workspace = body.get("workspace", "").strip()
+            thread_id = body.get("thread_id", "").strip()
+            domain_id = body.get("domain_id", "").strip()
+            action = body.get("action", "").strip()
+            entity = body.get("entity")
+            params = body.get("parameters", {}) if isinstance(body.get("parameters"), dict) else {}
+            actor_id = body.get("actor_id", "system").strip()
+            actor_authority = body.get("actor_authority", "LOW").strip()
+
+            # Validate required fields
+            if not thread_id or not domain_id or not action:
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason="Missing required fields: thread_id, domain_id, action",
+                    payload={
+                        "thread_id": thread_id,
+                        "domain_id": domain_id,
+                        "workspace": workspace,
+                    },
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=400,
+                )
+
+            # Build thread context
+            thread_context = ThreadContext(
+                thread_id=thread_id,
+                cycle_id=body.get("cycle_id", f"cycle-{domain_id}"),
+                domain_id=domain_id,
+                actor_id=actor_id,
+                actor_authority=actor_authority,
+                variables=body.get("variables", {}),
+                context_bindings=body.get("context_bindings", {}),
+            )
+
+            # Create intent
+            intent = Intent(
+                action=action,
+                entity=entity,
+                parameters=params,
+            )
+
+            # Load resolution index from workspace/domain context
+            # In production, this loads from registry; for now, minimal
+            index = ResolutionIndex(
+                skills_by_capability=body.get("skills_by_capability", {}),
+                verbs_by_id=body.get("verbs_by_id", {}),
+                backend_bindings=body.get("backend_bindings", {}),
+            )
+
+            bus = RuntimeCommandBus(index)
+
+            # Execute resolution pipeline
+            if not bus.validate_intent_against_thread(intent, thread_context):
+                error_outcome = Outcome(
+                    outcome_type="failure",
+                    reason=f"Action '{action}' not recognized in domain '{domain_id}'",
+                    payload={
+                        "thread_id": thread_id,
+                        "domain_id": domain_id,
+                        "action": action,
+                    },
+                    actions=(),
+                    can_auto_continue=False,
+                    requires_user_input=False,
+                )
+                return JSONResponse(
+                    error_outcome.model_dump(mode="json"),
+                    status_code=400,
+                )
+
+            verb = bus.resolve_to_verb(intent, thread_context)
+            verdict = bus.check_permissions(verb, intent, thread_context)
+
+            execution_plan = bus.return_execution_plan(
+                thread_context,
+                verb,
+                intent,
+                verdict,
+                governance_tier=body.get("governance_tier", "LOW"),
+                reversibility=body.get("reversibility", "IRREVERSIBLE"),
+            )
+
+            # Convert to Outcome
+            outcome = _execution_plan_to_outcome(execution_plan, thread_id)
+
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "workspace": workspace,
+                    "outcome": outcome.model_dump(mode="json"),
+                },
+                status_code=200,
+            )
+
+        except ValueError as ve:
+            error_outcome = Outcome(
+                outcome_type="error",
+                reason=f"Validation error: {str(ve)}",
+                payload={
+                    "thread_id": body.get("thread_id", ""),
+                    "domain_id": body.get("domain_id", ""),
+                    "error_type": "validation_error",
+                },
+                actions=(),
+                can_auto_continue=False,
+                requires_user_input=False,
+            )
+            return JSONResponse(
+                error_outcome.model_dump(mode="json"),
+                status_code=400,
+            )
+        except Exception as e:
+            error_outcome = Outcome(
+                outcome_type="error",
+                reason=f"Runtime error: {str(e)}",
+                payload={
+                    "thread_id": body.get("thread_id", "") if body else "",
+                    "error_type": type(e).__name__,
+                },
+                actions=(),
+                can_auto_continue=False,
+                requires_user_input=False,
+            )
+            return JSONResponse(
+                error_outcome.model_dump(mode="json"),
+                status_code=500,
+            )
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:

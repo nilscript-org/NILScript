@@ -1,0 +1,36 @@
+{
+  "nil": "domain/0.1",
+  "domain_id": "Procurement",
+  "workspace": "ws_acme",
+  "imports": [
+    {
+      "capability": "Resource",
+      "major": 1,
+      "alias": "resource"
+    },
+    {
+      "capability": "Procurement",
+      "major": 1,
+      "alias": "proc"
+    },
+    {
+      "capability": "Commerce",
+      "major": 1,
+      "alias": "commerce"
+    }
+  ],
+  "bindings": [
+    {
+      "capability": "Resource",
+      "backend": "odoo"
+    },
+    {
+      "capability": "Procurement",
+      "backend": "odoo"
+    },
+    {
+      "capability": "Commerce",
+      "backend": "odoo"
+    }
+  ]
+}

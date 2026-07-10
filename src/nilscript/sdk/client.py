@@ -22,6 +22,7 @@ from nilscript.sdk.sentences import (
     Envelope,
     Performative,
     ProposalBody,
+    ProposalState,
     ProposeBody,
     QueryBody,
     RollbackBody,
@@ -32,6 +33,22 @@ from nilscript.sdk.sentences import (
 from nilscript.sdk.transport import NilTransport
 
 _SAFE_PROPOSAL_ID = re.compile(PROPOSAL_ID_PATTERN)
+
+# The verdict vocabulary StatusBody.state accepts. A backend may report an UNDECIDED / never-recorded
+# proposal (a governance gate not yet decided) with a state OUTSIDE this set — the control-plane
+# decision store returns "unknown" (also "pending"). Those are NOT verdicts.
+_VALID_PROPOSAL_STATES = {s.value for s in ProposalState}
+
+
+def _normalize_status_state(body: Any) -> Any:
+    """Null a `state` that isn't a valid ProposalState so StatusBody parses it as UNDECIDED (None)
+    and the caller keeps waiting / PARKS — instead of an uncaught ValidationError crashing the run.
+    An undecided approval gate must wait for the human, never fail the whole cycle."""
+    if isinstance(body, dict):
+        state = body.get("state")
+        if isinstance(state, str) and state not in _VALID_PROPOSAL_STATES:
+            return {**body, "state": None}
+    return body
 
 PROPOSE_PATH = "/nil/v0.1/propose"
 COMMIT_PATH = "/nil/v0.1/commit"
@@ -132,7 +149,9 @@ class NilClient:
             answer, {Performative.STATUS, Performative.PROPOSAL}
         )
         if performative is Performative.STATUS:
-            return StatusBody.model_validate(body)
+            # Normalize an out-of-enum state to None here too (D2-sibling of status()): a backend
+            # that answers a commit with a non-ProposalState value must not crash the run.
+            return StatusBody.model_validate(_normalize_status_state(body))
         return ProposalBody.model_validate(body)
 
     async def query(
@@ -197,7 +216,9 @@ class NilClient:
             raise NilProtocolError("proposal id is not URL-safe; refusing to build the path")
         answer = await self._transport.get(f"{STATUS_PATH}/{proposal_id}")
         _, body = self._parse_sentence(answer, {Performative.STATUS})
-        return StatusBody.model_validate(body)
+        # Normalize an undecided/unknown gate state to None so a still-pending approval PARKS the run
+        # instead of crashing it on a non-enum state (business-threads debug: cyc_order 0-node fail).
+        return StatusBody.model_validate(_normalize_status_state(body))
 
     def _parse_proposal(self, answer: dict[str, Any]) -> ProposalBody:
         _, body = self._parse_sentence(answer, {Performative.PROPOSAL})

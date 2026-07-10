@@ -23,6 +23,7 @@ from nilscript.kernel.models import (
     NotifyNode,
     ParallelNode,
     QueryNode,
+    WaitForEventNode,
     WosoolProgram,
 )
 from nilscript.kernel.references import (
@@ -298,6 +299,8 @@ def _node_reference_sources(node: Any) -> list[str]:
     if isinstance(node, AwaitApprovalNode):
         ref = parse_reference(node.proposal)
         return [ref.source] if ref is not None else []
+    if isinstance(node, WaitForEventNode):
+        return iter_references(node.match)  # match values may reference earlier step outputs
     if isinstance(node, NotifyNode):
         return iter_references(node.message.model_dump())
     return []

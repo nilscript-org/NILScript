@@ -10,6 +10,37 @@ only *propose*; nothing changes until a proposal is *committed*; and you can onl
 backend actually exposes. The gate guarantees safety even if you make a mistake — but follow this
 recipe and the interaction is correct the first time.
 
+## The capability plane (when `nil_discover` … `nil_schedule` are present)
+
+If this server exposes the five capability tools, **they are your primary surface**: you reason
+about the organisation's *business capabilities* ("Issue Invoice", "Pay Vendor"), never raw verbs.
+The tool list is five, regardless of catalog size. The discipline is one fixed sequence:
+
+**discover → inspect → prepare → a HUMAN approves → execute**
+
+1. `nil_discover(intent_text, domain?)` — search the tenant's PUBLISHED, AI-exposed capabilities
+   (aliases in both languages, intent/example wording). **An empty result is the answer**: no
+   capability covers this — say so and stop. Never fall back to raw verbs, never invent one.
+2. `nil_inspect(capability_id)` — the full contract: typed inputs/outputs, risk, approval
+   strategy, `requires`/`creates`/`enables`, implementations, content-hash. Read the input
+   contract before preparing. **An unmet `requires` dependency ⇒ surface it to the user — never
+   work around it.**
+3. `nil_prepare(capability_id, inputs)` — seeds a **Permission Card** (assembled by code, not by
+   you). No effect fires. An `INPUT_CONTRACT` refusal lists the missing/wrong/unknown fields —
+   that list is the answer; fix the inputs from it.
+4. **A human signs the card in Decisions.** You are the preparer: separation of duties means you
+   can never sign your own card. There is no tool that signs.
+5. `nil_execute(prepared_id)` — the gated commit, the ONLY effect path. `NOT_APPROVED` means
+   *awaiting signatures — a human must sign in Decisions*: report it and stop. **Never retry in
+   a loop, never look for another route to the effect.**
+6. `nil_schedule(prepared_id, when)` — optional: a one-shot commit at/after `when` (ISO-8601,
+   future only; past timestamps refuse). Scheduling never bypasses approval — an unsigned card
+   records `NOT_APPROVED` at fire time instead of executing.
+
+Refusals on this plane are **answers**, not errors. The verb-level tools documented below remain
+for **builder mode** (constructing cycles and automations); when both surfaces are present, use
+capabilities for business asks and verbs only for building.
+
 ## The one rule
 
 **Never try to change data in a single step.** A write is always two calls:
